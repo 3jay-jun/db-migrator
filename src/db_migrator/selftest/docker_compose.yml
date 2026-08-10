@@ -1,0 +1,18 @@
+services:
+  source-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: source
+      POSTGRES_USER: source_user
+      POSTGRES_PASSWORD: source_pass
+    ports:
+      - "15432:5432"
+  target-mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: target
+      MARIADB_USER: target_user
+      MARIADB_PASSWORD: target_pass
+      MARIADB_ROOT_PASSWORD: root_pass
+    ports:
+      - "13306:3306"

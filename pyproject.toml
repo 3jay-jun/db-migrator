@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db-migrator"
+version = "0.1.0"
+description = "Safe PostgreSQL to MariaDB/MySQL migration helper."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "psycopg[binary]>=3.2",
+    "pymysql>=1.1",
+    "PyYAML>=6.0",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+test = [
+    "pyinstaller>=6.0",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+db-migrator = "db_migrator.cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["--basetemp=.tmp/pytest-temp"]
+cache_dir = ".tmp/pytest-cache"
+markers = [
+    "integration: tests that require external services such as Docker or live databases",
+]

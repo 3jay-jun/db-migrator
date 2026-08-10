@@ -1,0 +1,617 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Iterator
+from typing import Callable, Iterable, Protocol
+
+from db_migrator.adapters.base import DdlResult, ExecutionResult
+from db_migrator.config.models import SourceConfig, TargetConfig, WatermarkConfig
+from db_migrator.schema.common_types import CommonType
+from db_migrator.schema.models import (
+    ColumnSchema,
+    ForeignKeySchema,
+    PrimaryKey,
+    ReadCursor,
+    RowBatch,
+    RowData,
+    SchemaSnapshot,
+    TableRef,
+    TableSchema,
+    WriteResult,
+)
+from db_migrator.schema.type_mapping import common_type_to_mysql, mysql_type_to_common
+
+
+_MYSQL_RESERVED_WORDS = {
+    "add",
+    "alter",
+    "and",
+    "as",
+    "by",
+    "create",
+    "delete",
+    "from",
+    "group",
+    "index",
+    "insert",
+    "key",
+    "order",
+    "primary",
+    "select",
+    "table",
+    "update",
+    "where",
+}
+
+
+class MySqlAdapterError(RuntimeError):
+    pass
+
+
+class SourceTypeMapper(Protocol):
+    def __call__(self, source_type: str, *, is_generated: bool = False) -> CommonType:
+        """Map a source DBMS type into the common schema type."""
+
+
+class MySqlSourceAdapter:
+    def __init__(self, config: SourceConfig, source_type_mapper: SourceTypeMapper | None = None) -> None:
+        self._config = config
+        self._source_type_mapper = source_type_mapper or mysql_type_to_common
+
+    def test_connection(self) -> bool:
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("select 1 as ok")
+                    return int(cursor.fetchone()["ok"]) == 1
+        except Exception as exc:
+            raise MySqlAdapterError("MySQL/MariaDB connection test failed.") from exc
+
+    def scan_schema(self, schema: str) -> SchemaSnapshot:
+        try:
+            with self._connect() as connection:
+                try:
+                    columns = self._fetch_columns(connection, schema)
+                    primary_keys = self._fetch_primary_keys(connection, schema)
+                    foreign_keys = self._fetch_foreign_keys(connection, schema)
+                    estimated_rows = self._fetch_estimated_rows(connection, schema)
+                except Exception as exc:
+                    raise MySqlAdapterError(
+                        f"MySQL/MariaDB schema metadata query failed for schema '{schema}'. "
+                        f"Check source.schema and metadata permissions. detail={_safe_error_detail(exc)}"
+                    ) from exc
+        except MySqlAdapterError:
+            raise
+        except Exception as exc:
+            raise MySqlAdapterError(
+                "MySQL/MariaDB connection failed before schema scan. "
+                f"host={self._config.host} port={self._config.port} "
+                f"database={self._config.database} user={self._config.user} schema={schema}. "
+                f"detail={_safe_error_detail(exc)}"
+            ) from exc
+
+        grouped_columns: dict[str, list[ColumnSchema]] = defaultdict(list)
+        for row in columns:
+            table_name = str(row["table_name"])
+            source_type = _format_mysql_source_type(row)
+            is_generated = "GENERATED" in str(row["extra"]).upper()
+            common_type = self._source_type_mapper(source_type, is_generated=is_generated)
+            grouped_columns[table_name].append(
+                ColumnSchema(
+                    name=str(row["column_name"]),
+                    source_type=source_type,
+                    common_type=common_type,
+                    nullable=row["is_nullable"] == "YES",
+                    default=row["column_default"],
+                    is_generated=is_generated,
+                    generation_expression=row["generation_expression"],
+                    ordinal_position=int(row["ordinal_position"]),
+                    warnings=common_type.warnings,
+                )
+            )
+
+        tables = tuple(
+            TableSchema(
+                ref=TableRef(schema=schema, name=table_name),
+                columns=tuple(sorted(table_columns, key=lambda column: column.ordinal_position)),
+                primary_key=PrimaryKey(tuple(primary_keys[table_name])) if primary_keys[table_name] else None,
+                foreign_keys=tuple(foreign_keys[table_name]),
+                estimated_rows=estimated_rows.get(table_name),
+            )
+            for table_name, table_columns in sorted(grouped_columns.items())
+        )
+        return SchemaSnapshot(tables=tables)
+
+    def read_rows(
+        self,
+        table: TableRef,
+        columns: tuple[str, ...],
+        cursor: ReadCursor | None,
+        batch_size: int,
+        order_by: tuple[str, ...],
+    ) -> Iterator[RowBatch]:
+        if batch_size <= 0:
+            raise MySqlAdapterError("batch_size must be greater than zero.")
+
+        start_offset = cursor.offset if cursor is not None else 0
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+        table_sql = qualify_mysql_table_ref(table)
+        order_sql = _mysql_order_by_clause(order_by)
+        query = f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s OFFSET %s"
+
+        try:
+            with self._connect() as connection:
+                batch_number = 0
+                current_offset = start_offset
+                while True:
+                    with connection.cursor() as db_cursor:
+                        db_cursor.execute(query, (batch_size, current_offset))
+                        rows = tuple(dict(row) for row in db_cursor.fetchall())
+                    if not rows:
+                        break
+                    batch_number += 1
+                    yield RowBatch(
+                        table=table,
+                        rows=rows,
+                        batch_number=batch_number,
+                        start_offset=current_offset,
+                        next_cursor=ReadCursor(offset=current_offset + len(rows)),
+                    )
+                    current_offset += len(rows)
+        except Exception as exc:
+            raise MySqlAdapterError(f"MySQL/MariaDB row streaming failed for table: {table.name}") from exc
+
+    def count_rows(self, table: TableRef) -> int:
+        table_sql = qualify_mysql_table_ref(table)
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(*) AS row_count FROM {table_sql}")
+                    return int(cursor.fetchone()["row_count"])
+        except Exception as exc:
+            raise MySqlAdapterError(f"MySQL/MariaDB row count failed for table: {table.name}") from exc
+
+    def sample_rows(
+        self,
+        table: TableRef,
+        columns: tuple[str, ...],
+        sample_size: int,
+        order_by: tuple[str, ...],
+    ) -> tuple[RowData, ...]:
+        if sample_size <= 0:
+            return ()
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+        table_sql = qualify_mysql_table_ref(table)
+        order_sql = _mysql_order_by_clause(order_by)
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
+                    return tuple(dict(row) for row in cursor.fetchall())
+        except Exception as exc:
+            raise MySqlAdapterError(f"MySQL/MariaDB sample rows failed for table: {table.name}") from exc
+
+    def read_incremental_rows(
+        self,
+        table: TableRef,
+        columns: tuple[str, ...],
+        watermark: WatermarkConfig,
+        batch_size: int,
+    ) -> Iterator[RowBatch]:
+        if batch_size <= 0:
+            raise MySqlAdapterError("batch_size must be greater than zero.")
+
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+        table_sql = qualify_mysql_table_ref(table)
+        where_sql, params = _mysql_watermark_where_clause(watermark)
+        query = (
+            f"SELECT {column_sql} FROM {table_sql} {where_sql} "
+            f"ORDER BY {quote_mysql_identifier(watermark.column)} LIMIT %s OFFSET %s"
+        )
+
+        try:
+            with self._connect() as connection:
+                batch_number = 0
+                current_offset = 0
+                while True:
+                    with connection.cursor() as cursor:
+                        cursor.execute(query, (*params, batch_size, current_offset))
+                        rows = tuple(dict(row) for row in cursor.fetchall())
+                    if not rows:
+                        break
+                    batch_number += 1
+                    yield RowBatch(
+                        table=table,
+                        rows=rows,
+                        batch_number=batch_number,
+                        start_offset=current_offset,
+                        next_cursor=ReadCursor(offset=current_offset + len(rows)),
+                    )
+                    current_offset += len(rows)
+        except Exception as exc:
+            raise MySqlAdapterError(f"MySQL/MariaDB incremental row streaming failed for table: {table.name}") from exc
+
+    def _connect(self):
+        try:
+            import pymysql
+            from pymysql.cursors import DictCursor
+        except ImportError as exc:
+            raise MySqlAdapterError("pymysql is not installed. Install project dependencies first.") from exc
+
+        return pymysql.connect(
+            host=self._config.host,
+            port=self._config.port,
+            database=self._config.database,
+            user=self._config.user,
+            password=self._config.password or "",
+            charset="utf8mb4",
+            cursorclass=DictCursor,
+        )
+
+    def _fetch_columns(self, connection, schema: str) -> list[dict]:
+        query = """
+            select
+                table_name,
+                column_name,
+                data_type,
+                column_type,
+                character_maximum_length,
+                numeric_precision,
+                numeric_scale,
+                datetime_precision,
+                is_nullable,
+                column_default,
+                extra,
+                generation_expression,
+                ordinal_position
+            from information_schema.columns
+            where table_schema = %s
+            order by table_name, ordinal_position
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            return list(cursor.fetchall())
+
+    def _fetch_primary_keys(self, connection, schema: str) -> dict[str, list[str]]:
+        query = """
+            select
+                table_name,
+                column_name
+            from information_schema.key_column_usage
+            where table_schema = %s
+              and constraint_name = 'PRIMARY'
+            order by table_name, ordinal_position
+        """
+        primary_keys: dict[str, list[str]] = defaultdict(list)
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            for row in cursor.fetchall():
+                primary_keys[str(row["table_name"])].append(str(row["column_name"]))
+        return primary_keys
+
+    def _fetch_foreign_keys(self, connection, schema: str) -> dict[str, list[ForeignKeySchema]]:
+        query = """
+            select
+                constraint_name,
+                table_name,
+                column_name,
+                referenced_table_schema,
+                referenced_table_name,
+                referenced_column_name,
+                ordinal_position
+            from information_schema.key_column_usage
+            where table_schema = %s
+              and referenced_table_name is not null
+            order by table_name, constraint_name, ordinal_position
+        """
+        grouped: dict[tuple[str, str, str, str], dict[str, list[str]]] = {}
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            for row in cursor.fetchall():
+                key = (
+                    str(row["table_name"]),
+                    str(row["constraint_name"]),
+                    str(row["referenced_table_schema"]),
+                    str(row["referenced_table_name"]),
+                )
+                grouped.setdefault(key, {"columns": [], "referenced_columns": []})
+                grouped[key]["columns"].append(str(row["column_name"]))
+                grouped[key]["referenced_columns"].append(str(row["referenced_column_name"]))
+
+        foreign_keys: dict[str, list[ForeignKeySchema]] = defaultdict(list)
+        for (table_name, constraint_name, referenced_schema, referenced_table), values in grouped.items():
+            foreign_keys[table_name].append(
+                ForeignKeySchema(
+                    name=constraint_name,
+                    columns=tuple(values["columns"]),
+                    referenced_table=TableRef(schema=referenced_schema, name=referenced_table),
+                    referenced_columns=tuple(values["referenced_columns"]),
+                )
+            )
+        return foreign_keys
+
+    def _fetch_estimated_rows(self, connection, schema: str) -> dict[str, int]:
+        query = """
+            select table_name, table_rows
+            from information_schema.tables
+            where table_schema = %s
+              and table_type = 'BASE TABLE'
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            return {str(row["table_name"]): int(row["table_rows"] or 0) for row in cursor.fetchall()}
+
+
+class MySqlTargetAdapter:
+    def __init__(self, config: TargetConfig) -> None:
+        self._config = config
+        self._dml_connection = None
+
+    def test_connection(self) -> bool:
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("select 1")
+                    return cursor.fetchone()[0] == 1
+        except Exception as exc:
+            raise MySqlAdapterError("MySQL/MariaDB connection test failed.") from exc
+
+    def table_exists(self, table_schema: TableSchema) -> bool:
+        query = """
+            select count(*)
+            from information_schema.tables
+            where table_schema = %s
+              and table_name = %s
+        """
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(query, (self._config.database, table_schema.ref.name))
+                    return int(cursor.fetchone()[0]) > 0
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to check target table existence: {table_schema.ref.name}") from exc
+
+    def execute_ddl(self, ddl: str) -> ExecutionResult:
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(ddl)
+                connection.commit()
+            return ExecutionResult(success=True, message="DDL executed.")
+        except Exception as exc:
+            raise MySqlAdapterError(
+                "Failed to execute target DDL. "
+                f"target_database={self._config.database} ddl={_compact_sql(ddl)} detail={_safe_error_detail(exc)}"
+            ) from exc
+
+    def truncate_table(self, table_schema: TableSchema) -> ExecutionResult:
+        ddl = f"TRUNCATE TABLE {self._qualified_table_name(table_schema)}"
+        return self.execute_ddl(ddl)
+
+    def write_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...]) -> WriteResult:
+        if not rows:
+            return WriteResult(success=True, rows_written=0, message="No rows to write.")
+
+        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        placeholders = ", ".join(["%s"] * len(writable_columns))
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
+        table_sql = self._qualified_table_name(table_schema)
+        sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders})"
+        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, values)
+            return WriteResult(success=True, rows_written=len(rows), message="Batch written.")
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to write target batch for table: {table_schema.ref.name}") from exc
+
+    def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
+        if not keys:
+            return WriteResult(success=False, rows_written=0, message="Upsert requires primary or unique key columns.")
+        if not rows:
+            return WriteResult(success=True, rows_written=0, message="No rows to upsert.")
+
+        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        placeholders = ", ".join(["%s"] * len(writable_columns))
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
+        table_sql = self._qualified_table_name(table_schema)
+        update_columns = tuple(column for column in writable_columns if column not in keys)
+        update_sql = _mysql_upsert_update_sql(update_columns, keys)
+        sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_sql}"
+        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, values)
+            return WriteResult(success=True, rows_written=len(rows), message="Batch upserted.")
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to upsert target batch for table: {table_schema.ref.name}") from exc
+
+    def count_rows(self, table: TableRef) -> int:
+        table_sql = self._qualified_table_ref(table)
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
+                    return int(cursor.fetchone()[0])
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to count target rows for table: {table.name}") from exc
+
+    def sample_rows(
+        self,
+        table: TableRef,
+        columns: tuple[str, ...],
+        sample_size: int,
+        order_by: tuple[str, ...],
+    ) -> tuple[RowData, ...]:
+        if sample_size <= 0:
+            return ()
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+        table_sql = self._qualified_table_ref(table)
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    order_sql = _mysql_order_by_clause(order_by)
+                    cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
+                    rows = cursor.fetchall()
+            return tuple(dict(zip(columns, row, strict=True)) for row in rows)
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to sample target rows for table: {table.name}") from exc
+
+    def commit(self) -> None:
+        if self._dml_connection is not None:
+            self._dml_connection.commit()
+
+    def close(self) -> None:
+        if self._dml_connection is not None:
+            self._dml_connection.close()
+            self._dml_connection = None
+
+    def _connect(self):
+        try:
+            import pymysql
+        except ImportError as exc:
+            raise MySqlAdapterError("pymysql is not installed. Install project dependencies first.") from exc
+
+        return pymysql.connect(
+            host=self._config.host,
+            port=self._config.port,
+            database=self._config.database,
+            user=self._config.user,
+            password=self._config.password or "",
+            charset="utf8mb4",
+        )
+
+    def _ensure_dml_connection(self):
+        if self._dml_connection is None:
+            self._dml_connection = self._connect()
+        return self._dml_connection
+
+    def _qualified_table_name(self, table_schema: TableSchema) -> str:
+        return qualify_mysql_table_name(table_schema, target_database=self._config.database)
+
+    def _qualified_table_ref(self, table: TableRef) -> str:
+        return qualify_mysql_table_ref(table, target_database=self._config.database)
+
+
+class MySqlDdlGenerator:
+    def __init__(
+        self,
+        target_database: str | None = None,
+        target_type_mapper: Callable[[CommonType], str] | None = None,
+    ) -> None:
+        self._target_database = target_database
+        self._target_type_mapper = target_type_mapper or common_type_to_mysql
+
+    def generate_create_table(self, table_schema: TableSchema) -> DdlResult:
+        column_lines = [self._column_definition(column) for column in table_schema.columns]
+
+        if table_schema.primary_key is not None and table_schema.primary_key.columns:
+            columns = ", ".join(quote_mysql_identifier(column) for column in table_schema.primary_key.columns)
+            column_lines.append(f"  PRIMARY KEY ({columns})")
+
+        table_name = qualify_mysql_table_name(table_schema, target_database=self._target_database)
+        ddl_body = ",\n".join(column_lines)
+        ddl = f"CREATE TABLE {table_name} (\n{ddl_body}\n);"
+        warnings = _unique_warning_messages(
+            warning.message
+            for column in table_schema.columns
+            for warning in column.common_type.warnings + column.warnings
+        )
+        return DdlResult(table_name=table_name, ddl=ddl, warnings=warnings)
+
+    def _column_definition(self, column: ColumnSchema) -> str:
+        column_type = self._target_type_mapper(column.common_type)
+        null_sql = "NULL" if column.nullable else "NOT NULL"
+        return f"  {quote_mysql_identifier(column.name)} {column_type} {null_sql}"
+
+
+def qualify_mysql_table_name(table_schema: TableSchema, *, target_database: str | None = None) -> str:
+    return qualify_mysql_table_ref(table_schema.ref, target_database=target_database)
+
+
+def qualify_mysql_table_ref(table: TableRef, *, target_database: str | None = None) -> str:
+    database_name = target_database or table.schema
+    return ".".join(
+        [
+            quote_mysql_identifier(database_name),
+            quote_mysql_identifier(table.name),
+        ]
+    )
+
+
+def quote_mysql_identifier(identifier: str) -> str:
+    escaped_identifier = identifier.replace("`", "``")
+    return f"`{escaped_identifier}`"
+
+
+def _mysql_order_by_clause(columns: tuple[str, ...]) -> str:
+    if not columns:
+        return ""
+    column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+    return f" ORDER BY {column_sql}"
+
+
+def _format_mysql_source_type(row: dict) -> str:
+    column_type = row.get("column_type")
+    if column_type:
+        return str(column_type)
+    data_type = str(row["data_type"])
+    if data_type in {"varchar", "char"} and row["character_maximum_length"] is not None:
+        return f"{data_type}({row['character_maximum_length']})"
+    if data_type in {"decimal", "numeric"} and row["numeric_precision"] is not None and row["numeric_scale"] is not None:
+        return f"{data_type}({row['numeric_precision']},{row['numeric_scale']})"
+    if data_type in {"datetime", "timestamp", "time"} and row.get("datetime_precision") is not None:
+        return f"{data_type}({row['datetime_precision']})"
+    return data_type
+
+
+def _mysql_watermark_where_clause(watermark: WatermarkConfig) -> tuple[str, tuple[str, ...]]:
+    clauses = []
+    params = []
+    column = quote_mysql_identifier(watermark.column)
+    if watermark.start_value is not None:
+        clauses.append(f"{column} >= %s")
+        params.append(watermark.start_value)
+    if watermark.end_value is not None:
+        clauses.append(f"{column} < %s")
+        params.append(watermark.end_value)
+    if not clauses:
+        return "", ()
+    return "WHERE " + " AND ".join(clauses), tuple(params)
+
+
+def needs_mysql_identifier_warning(identifier: str) -> bool:
+    normalized = identifier.lower()
+    return normalized in _MYSQL_RESERVED_WORDS or normalized != identifier or not identifier.isidentifier()
+
+
+def _mysql_upsert_update_sql(update_columns: tuple[str, ...], keys: tuple[str, ...]) -> str:
+    columns = update_columns or keys[:1]
+    return ", ".join(
+        f"{quote_mysql_identifier(column)} = VALUES({quote_mysql_identifier(column)})"
+        for column in columns
+    )
+
+
+def _unique_warning_messages(warnings: Iterable[str]) -> tuple[str, ...]:
+    unique_warnings: list[str] = []
+    for warning in warnings:
+        if isinstance(warning, str) and warning not in unique_warnings:
+            unique_warnings.append(warning)
+    return tuple(unique_warnings)
+
+
+def _safe_error_detail(exc: Exception) -> str:
+    detail = str(exc).strip()
+    return detail or exc.__class__.__name__
+
+
+def _compact_sql(sql: str) -> str:
+    compact = " ".join(sql.split())
+    if len(compact) <= 500:
+        return compact
+    return compact[:497] + "..."

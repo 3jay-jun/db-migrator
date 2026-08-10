@@ -1,0 +1,6 @@
+target:
+  environment: production
+migration:
+  existing_table_policy: truncate_reload
+safety:
+  allow_destructive_on_production: false

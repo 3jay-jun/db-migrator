@@ -1,0 +1,18 @@
+job:
+  name: self-test
+source:
+  dbms: postgresql
+  host: localhost
+  port: 15432
+  database: source
+  schema: public
+  user: source_user
+  password: source_pass
+target:
+  dbms: mariadb
+  host: localhost
+  port: 13306
+  database: target
+  user: target_user
+  password: target_pass
+  environment: local

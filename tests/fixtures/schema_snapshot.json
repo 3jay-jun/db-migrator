@@ -1,0 +1,73 @@
+{
+  "tables": [
+    {
+      "schema": "public",
+      "name": "users",
+      "primary_key": ["id"],
+      "estimated_rows": 10,
+      "columns": [
+        {
+          "name": "id",
+          "source_type": "integer",
+          "nullable": false,
+          "ordinal_position": 1
+        },
+        {
+          "name": "email",
+          "source_type": "character varying(255)",
+          "nullable": false,
+          "ordinal_position": 2
+        },
+        {
+          "name": "profile",
+          "source_type": "jsonb",
+          "nullable": true,
+          "ordinal_position": 3
+        },
+        {
+          "name": "created_at",
+          "source_type": "timestamp with time zone",
+          "nullable": false,
+          "ordinal_position": 4
+        }
+      ]
+    },
+    {
+      "schema": "public",
+      "name": "orders",
+      "primary_key": ["id"],
+      "estimated_rows": 3,
+      "foreign_keys": [
+        {
+          "name": "orders_user_id_fkey",
+          "columns": ["user_id"],
+          "referenced_table": {
+            "schema": "public",
+            "name": "users"
+          },
+          "referenced_columns": ["id"]
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "source_type": "bigint",
+          "nullable": false,
+          "ordinal_position": 1
+        },
+        {
+          "name": "user_id",
+          "source_type": "integer",
+          "nullable": false,
+          "ordinal_position": 2
+        },
+        {
+          "name": "total_amount",
+          "source_type": "numeric(12,2)",
+          "nullable": false,
+          "ordinal_position": 3
+        }
+      ]
+    }
+  ]
+}
