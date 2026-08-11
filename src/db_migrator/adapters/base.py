@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
-from db_migrator.schema.models import ReadCursor, RowBatch, RowData, SchemaSnapshot, TableRef, TableSchema, WriteResult
+from db_migrator.schema.models import ReadCursor, RowBatch, RowData, SamplePosition, SchemaSnapshot, TableRef, TableSchema, WriteResult
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,19 @@ class SourceAdapter(Protocol):
     ) -> Iterator[RowBatch]:
         """Stream source rows in batches without materializing the full table."""
 
+    def count_rows(self, table: TableRef) -> int:
+        """Return the row count for one table."""
+
+    def sample_rows(
+        self,
+        table: TableRef,
+        columns: tuple[str, ...],
+        sample_size: int,
+        order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
+    ) -> tuple[RowData, ...]:
+        """Return deterministic sample rows for checksum validation."""
+
 
 class TargetAdapter(Protocol):
     def test_connection(self) -> bool:
@@ -53,3 +66,6 @@ class TargetAdapter(Protocol):
 
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
         """Upsert one row batch to the target table."""
+
+    def count_rows(self, table: TableRef) -> int:
+        """Return the row count for one table."""

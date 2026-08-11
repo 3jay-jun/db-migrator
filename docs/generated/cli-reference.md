@@ -12,7 +12,7 @@ Generated command reference for the current harness.
 | `db-migrator retry-failed` | Retry only failed tables from checkpoint state. |
 | `db-migrator validate` | Run row count and checksum sample validation. |
 | `db-migrator migrate-incremental` | Run v1.1 watermark + upsert incremental migration. |
-| `db-migrator self-test run` | Check Docker-based self-test prerequisites. |
+| `db-migrator self-test run` | Run Docker-based source seed, DDL, DML, and validation self-test. |
 | `db-migrator package-check` | Check PyInstaller availability. |
 
 Use `uv run db-migrator <command> --help` for exact options.

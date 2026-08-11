@@ -4,16 +4,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+from db_migrator.config.models import Dbms
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, SchemaWarning, TypePolicy
 from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, PrimaryKey, SchemaSnapshot, TableRef, TableSchema
-from db_migrator.schema.type_mapping import postgres_type_to_common
+from db_migrator.schema.type_mapping import mysql_type_to_common, postgres_type_to_common
 
 
 class SchemaSnapshotLoadError(ValueError):
     pass
 
 
-def load_schema_snapshot_from_json(snapshot_path: Path) -> SchemaSnapshot:
+def load_schema_snapshot_from_json(snapshot_path: Path, *, source_dbms: Dbms = Dbms.POSTGRESQL) -> SchemaSnapshot:
     if not snapshot_path.exists():
         raise SchemaSnapshotLoadError(f"Schema snapshot file does not exist: {snapshot_path}")
 
@@ -25,18 +26,18 @@ def load_schema_snapshot_from_json(snapshot_path: Path) -> SchemaSnapshot:
     if not isinstance(raw_snapshot, dict):
         raise SchemaSnapshotLoadError(f"Schema snapshot must contain a JSON object: {snapshot_path}")
 
-    return _parse_schema_snapshot(raw_snapshot, snapshot_path)
+    return _parse_schema_snapshot(raw_snapshot, snapshot_path, source_dbms=source_dbms)
 
 
-def _parse_schema_snapshot(raw_snapshot: dict[str, Any], snapshot_path: Path) -> SchemaSnapshot:
+def _parse_schema_snapshot(raw_snapshot: dict[str, Any], snapshot_path: Path, *, source_dbms: Dbms) -> SchemaSnapshot:
     raw_tables = raw_snapshot.get("tables")
     if not isinstance(raw_tables, list):
         raise SchemaSnapshotLoadError(f"Schema snapshot must contain a tables array: {snapshot_path}")
 
-    return SchemaSnapshot(tables=tuple(_parse_table(raw_table, snapshot_path) for raw_table in raw_tables))
+    return SchemaSnapshot(tables=tuple(_parse_table(raw_table, snapshot_path, source_dbms=source_dbms) for raw_table in raw_tables))
 
 
-def _parse_table(raw_table: Any, snapshot_path: Path) -> TableSchema:
+def _parse_table(raw_table: Any, snapshot_path: Path, *, source_dbms: Dbms) -> TableSchema:
     if not isinstance(raw_table, dict):
         raise SchemaSnapshotLoadError(f"Each table entry must be an object: {snapshot_path}")
 
@@ -55,20 +56,20 @@ def _parse_table(raw_table: Any, snapshot_path: Path) -> TableSchema:
 
     return TableSchema(
         ref=TableRef(schema=schema, name=table_name),
-        columns=tuple(_parse_column(raw_column, snapshot_path) for raw_column in raw_columns),
+        columns=tuple(_parse_column(raw_column, snapshot_path, source_dbms=source_dbms) for raw_column in raw_columns),
         primary_key=primary_key,
         foreign_keys=tuple(_parse_foreign_key(raw_fk, schema, table_name, snapshot_path) for raw_fk in raw_table.get("foreign_keys", [])),
         estimated_rows=raw_table.get("estimated_rows"),
     )
 
 
-def _parse_column(raw_column: Any, snapshot_path: Path) -> ColumnSchema:
+def _parse_column(raw_column: Any, snapshot_path: Path, *, source_dbms: Dbms) -> ColumnSchema:
     if not isinstance(raw_column, dict):
         raise SchemaSnapshotLoadError(f"Each column entry must be an object: {snapshot_path}")
 
     source_type = _required_string(raw_column, "source_type", snapshot_path)
     is_generated = bool(raw_column.get("is_generated", False))
-    common_type = _parse_common_type(raw_column.get("common_type"), source_type, is_generated)
+    common_type = _parse_common_type(raw_column.get("common_type"), source_type, is_generated, source_dbms=source_dbms)
     return ColumnSchema(
         name=_required_string(raw_column, "name", snapshot_path),
         source_type=source_type,
@@ -82,9 +83,9 @@ def _parse_column(raw_column: Any, snapshot_path: Path) -> ColumnSchema:
     )
 
 
-def _parse_common_type(raw_common_type: Any, source_type: str, is_generated: bool) -> CommonType:
+def _parse_common_type(raw_common_type: Any, source_type: str, is_generated: bool, *, source_dbms: Dbms) -> CommonType:
     if raw_common_type is None:
-        return postgres_type_to_common(source_type, is_generated=is_generated)
+        return _source_type_to_common(source_dbms, source_type, is_generated=is_generated)
 
     if not isinstance(raw_common_type, dict):
         raise SchemaSnapshotLoadError("common_type must be an object when provided.")
@@ -99,6 +100,14 @@ def _parse_common_type(raw_common_type: Any, source_type: str, is_generated: boo
         source_type=raw_common_type.get("source_type", source_type),
         warnings=warnings,
     )
+
+
+def _source_type_to_common(source_dbms: Dbms, source_type: str, *, is_generated: bool) -> CommonType:
+    if source_dbms is Dbms.POSTGRESQL:
+        return postgres_type_to_common(source_type, is_generated=is_generated)
+    if source_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+        return mysql_type_to_common(source_type, is_generated=is_generated)
+    raise SchemaSnapshotLoadError(f"Unsupported schema snapshot source DBMS: {source_dbms.value}")
 
 
 def _parse_warning(raw_warning: Any) -> SchemaWarning:

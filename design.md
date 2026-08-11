@@ -203,8 +203,9 @@ Dry-run report는 다음 순서를 따른다.
 
 1. Header
 2. Metric summary
-3. Warnings & Recommended Actions
-4. Table DDL Preview
+3. Migration Context
+4. Warnings & Recommended Actions
+5. Table DDL Preview
 
 ### Header
 
@@ -226,6 +227,23 @@ Metric card 3개를 기본으로 한다.
 
 - warning이 있으면 `Review`
 - warning이 없으면 `Apply DDL`
+
+### Migration Context
+
+Dry-run report에는 `이관 정보` 섹션을 metric summary 바로 아래에 배치한다. 이 섹션은 보고서 수신자가 어떤 source schema를 어떤 target database로 변환하려는 dry-run인지 한눈에 판단하기 위한 필수 정보다.
+
+필수 블록:
+
+- 원본 DB: DBMS, host/port, database, schema
+- 대상 DB: DBMS, host/port, database
+- Dry-run 기준: 실행 시각, 이관 모드, 기존 테이블 정책, DDL 실행 여부, 결과 요약
+
+금지:
+
+- username
+- password
+- connection string 원문
+- 기타 credential 또는 secret
 
 ### Warnings & Recommended Actions
 

@@ -70,6 +70,7 @@ class TargetSafetyGuard:
 
 def _is_destructive_policy(existing_table_policy: ExistingTablePolicy) -> bool:
     return existing_table_policy in {
+        ExistingTablePolicy.SYNC,
         ExistingTablePolicy.TRUNCATE_RELOAD,
         ExistingTablePolicy.OVERWRITE,
     }

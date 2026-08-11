@@ -1,0 +1,68 @@
+compose_file: ../../docker-compose.yml
+docker:
+  source:
+    dbms: mariadb
+    image: mariadb:11
+    host_port: 23306
+    container_port: 3306
+    database: source
+    schema: source
+    user: source_user
+    password: source_pass
+    root_password: root_pass
+    healthcheck: mariadb-admin ping -h 127.0.0.1 -u root -proot_pass --silent
+    container_environment:
+      MARIADB_DATABASE: source
+      MARIADB_USER: source_user
+      MARIADB_PASSWORD: source_pass
+      MARIADB_ROOT_PASSWORD: root_pass
+  target:
+    dbms: postgresql
+    image: postgres:16
+    host_port: 25432
+    container_port: 5432
+    database: target
+    user: target_user
+    password: target_pass
+    environment: local
+    healthcheck: pg_isready -U target_user -d target
+    container_environment:
+      POSTGRES_DB: target
+      POSTGRES_USER: target_user
+      POSTGRES_PASSWORD: target_pass
+source_seed:
+  service: source
+  schema_file: source/mariadb/schema.sql
+  seed_file: source/mariadb/seed.sql
+  schema_command:
+    - sh
+    - -c
+    - "mariadb --protocol=TCP -h 127.0.0.1 -u source_user -psource_pass source < {script_path}"
+  seed_command:
+    - sh
+    - -c
+    - "mariadb --protocol=TCP -h 127.0.0.1 -u source_user -psource_pass source --init-command='SET @large_rows={large_rows}' < {script_path}"
+migration_config:
+  job:
+    name: self-test-mariadb-to-pg
+  migration:
+    existing_table_policy: skip
+    apply_foreign_keys: true
+    batch_size: 5000
+    large_row_batch_size: 500
+    commit_interval: 5000
+    parallel_table_count: 1
+    throttle_sleep_ms: 0
+  safety:
+    is_production_protection: true
+    allow_destructive_on_production: false
+    require_dry_run_before_destructive: true
+  report:
+    output_dir: .tmp/selftest/reports
+  verification:
+    row_count: true
+    checksum_sample: true
+    checksum_sample_size: 200
+    checksum_datetime_precision: microseconds
+    checksum_timezone: UTC
+    checksum_float_precision: 12

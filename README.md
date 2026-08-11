@@ -2,7 +2,7 @@
 
 PostgreSQL 데이터를 MariaDB/MySQL로 안전하게 이관하기 위한 Python CLI 도구입니다.
 
-v1 범위는 `PostgreSQL -> MariaDB/MySQL` full migration이며, dry-run, DDL 생성/실행, batch DML 이관, checkpoint 기반 resume/retry, row count/checksum 검증, HTML/JSON/CSV 리포트를 제공합니다. v1.1 범위로 watermark 기반 증분 이관도 별도 명령으로 제공합니다.
+v1 범위는 `PostgreSQL -> MariaDB/MySQL` full migration이며, dry-run, DDL 생성/실행, batch DML 이관, keyset checkpoint 기반 resume/retry, row count/checksum 검증, HTML/JSON/CSV 리포트를 제공합니다. v1.1 범위로 watermark 기반 증분 이관도 별도 명령으로 제공합니다.
 
 ## 빠른 시작
 
@@ -77,6 +77,7 @@ uv run db-migrator apply-ddl --config config.yml --output-file reports/live/ddl-
 ```
 
 target DB에 `CREATE TABLE`을 실행합니다. `migration.existing_table_policy`가 `skip`이면 이미 존재하는 table은 건너뜁니다.
+외래키까지 적용하려면 `migration.apply_foreign_keys: true`를 명시하세요. 기본값은 `false`라서 table 생성과 FK 적용을 분리해 검토할 수 있습니다.
 
 5. 데이터 이관
 
@@ -84,7 +85,9 @@ target DB에 `CREATE TABLE`을 실행합니다. `migration.existing_table_policy
 uv run db-migrator migrate-data --config config.yml --checkpoint-db checkpoints/live.sqlite
 ```
 
-PostgreSQL에서 server-side cursor로 batch read하고, MySQL/MariaDB에 batch insert합니다. 성공 batch 위치는 SQLite checkpoint에 저장됩니다.
+PostgreSQL에서 batch read하고, MySQL/MariaDB에 batch write합니다. PK/unique key가 있는 table은 keyset cursor를 사용해 마지막 성공 key를 SQLite checkpoint에 저장하고, PK/unique key가 없으면 offset resume으로 fallback합니다. offset fallback table은 dry-run/report에 `high risk: offset resume only` warning이 표시됩니다.
+
+이미 같은 `job.name + table`의 완료 checkpoint가 있고 target row도 남아 있으면, 기본 `migrate-data`는 중복 삽입을 막기 위해 해당 table을 skip합니다. 같은 작업을 이어가려면 `resume` 또는 `retry-failed`를 사용하고, 처음부터 다시 맞추려면 `truncate_reload`, `sync`, 또는 새 `job.name`을 사용하세요.
 
 6. 중단 또는 실패 후 재개
 
@@ -93,7 +96,7 @@ uv run db-migrator resume --config config.yml --checkpoint-db checkpoints/live.s
 uv run db-migrator retry-failed --config config.yml --checkpoint-db checkpoints/live.sqlite
 ```
 
-`resume`은 checkpoint 기준으로 이어서 실행합니다. `retry-failed`는 실패한 table만 다시 실행합니다.
+`resume`은 checkpoint 기준으로 이어서 실행합니다. `retry-failed`는 실패한 table만 다시 실행합니다. target commit 성공 후 checkpoint 저장이 실패한 batch는 `checkpoint_failed_after_commit` 상태로 기록되며, 중복 쓰기 위험이 있으므로 강제 재개 대신 검증 후 재실행 정책을 선택해야 합니다.
 
 7. 이관 검증
 
@@ -101,7 +104,7 @@ uv run db-migrator retry-failed --config config.yml --checkpoint-db checkpoints/
 uv run db-migrator validate --config config.yml --output-dir reports/live-validation
 ```
 
-source/target row count와 sample checksum을 비교하고 검증 리포트를 생성합니다. 이 명령은 양쪽 DB에 조회 부하를 발생시킬 수 있습니다.
+source/target row count와 sample checksum을 비교하고 검증 리포트를 생성합니다. checksum sample은 PK/정렬 컬럼 기준 first N + last N을 비교합니다. PK가 있으면 PK 기준으로 source/target row를 매칭하고, PK가 없으면 위치 기반 비교로 fallback하므로 리포트 신뢰도 warning을 함께 확인하세요. 이 명령은 양쪽 DB에 조회 부하를 발생시킬 수 있습니다.
 
 ## 명령어 요약
 
@@ -115,7 +118,7 @@ source/target row count와 sample checksum을 비교하고 검증 리포트를 �
 | `retry-failed` | source 읽기, target 쓰기 | 실패 table만 재시도 |
 | `validate` | source/target 읽기 | row count/checksum 검증 |
 | `migrate-incremental` | source 읽기, target upsert | watermark 기반 증분 이관 |
-| `self-test run` | Docker 사전 점검 | Docker 기반 self-test 준비 확인 |
+| `self-test run` | Docker 컨테이너 실행, source/target 쓰기 | Docker 기반 end-to-end 이관 검증 |
 | `package-check` | DB 접속 없음 | PyInstaller 사용 가능 여부 확인 |
 
 각 명령의 옵션은 아래처럼 확인합니다.
@@ -142,20 +145,45 @@ uv run db-migrator migrate-data --help
 | `target.database` | MySQL/MariaDB DB명 | 비어 있는 검증용 DB 권장 |
 | `target.environment` | target 환경 | 첫 검증은 `staging` 또는 `local` |
 | `migration.existing_table_policy` | 기존 table 처리 | 첫 검증은 `skip` |
+| `migration.apply_foreign_keys` | CREATE TABLE 이후 FK 적용 여부 | 첫 검증은 `false` |
 | `migration.batch_size` | source read batch 크기 | `10000` |
 | `migration.commit_interval` | target commit 간격 | `10000` |
+| `migration.parallel_table_count` | table 단위 병렬 이관 worker 수 | `1` |
+| `migration.throttle_sleep_ms` | batch commit 후 대기 시간 | `0` |
+| `migration.large_row_batch_size` | 대형 row table 전용 batch 크기 | 필요 시 지정 |
 | `report.output_dir` | 리포트 출력 위치 | `./reports/live` |
 | `verification.checksum_sample_size` | checksum sample row 수 | `100` |
 | `verification.checksum_timezone` | timezone 있는 source datetime을 비교할 기준 timezone | 한국 서비스는 `Asia/Seoul` 권장 |
+| `verification.pk_range_checksum` | PK range checksum 옵션 | `false` |
 
 `existing_table_policy` 값:
 - `skip`: 기존 table은 건너뜀
 - `compare_only`: 비교만 수행
 - `append`: 기존 table에 insert
+- `sync`: source 기준으로 target row를 upsert/delete
 - `truncate_reload`: truncate 후 재적재
 - `overwrite`: overwrite 계열 작업
 
-운영 환경에서 destructive 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. 처음 검증은 `skip`으로 시작하세요.
+운영 환경에서 destructive 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. `sync`, `truncate_reload`, `overwrite`는 target 데이터를 삭제하거나 덮어쓸 수 있으므로 처음 검증은 `skip`으로 시작하세요.
+
+## 운영 기준 동기화
+
+target 데이터를 source 운영 기준으로 맞춰야 하면 `migration.existing_table_policy: sync`를 사용합니다.
+
+```yaml
+migration:
+  existing_table_policy: sync
+  parallel_table_count: 1
+  throttle_sleep_ms: 0
+```
+
+`sync` 정책은 source에 있는 row는 target에 upsert하고, source에 없는 target row는 삭제합니다. 즉 source가 SSOT이며, target의 불일치 데이터는 source 기준으로 정정됩니다.
+
+주의사항:
+- `sync`는 PK 또는 unique key가 있는 table에서만 실행됩니다. key가 없으면 row identity를 안정적으로 판단할 수 없어 실패 처리합니다.
+- target 삭제가 포함되는 destructive 정책입니다. 운영 target에서는 dry-run 리포트와 safety 설정을 먼저 확인하세요.
+- table 내부 batch는 병렬화하지 않습니다. `parallel_table_count`는 table 단위 병렬 처리만 수행해 checkpoint 순서를 단순하게 유지합니다.
+- `throttle_sleep_ms`가 0보다 크면 batch commit 후 지정 시간만큼 대기해 source/target 부하를 낮춥니다.
 
 ## 증분 이관
 
@@ -179,6 +207,123 @@ uv run db-migrator migrate-incremental --config config.yml --output-dir reports/
 ```
 
 현재 DELETE sync는 자동 실행하지 않고 리포트에 수동 후속 작업으로 남깁니다.
+
+## Docker Self-Test
+
+Docker 기반 self-test는 PostgreSQL source와 MariaDB target 컨테이너를 띄운 뒤 `dry-run -> apply-ddl -> migrate-data -> validate`를 end-to-end로 실행합니다.
+
+```powershell
+uv run db-migrator self-test run
+```
+
+실행 중에는 stage 로그와 batch commit 로그가 실시간으로 출력됩니다. 대용량 table은 `batch_committed` 로그의 `progress`, `rows/sec`, `eta`, `cursor`, `next_offset`으로 실제 이관 진행 여부를 확인하세요.
+
+예:
+
+```text
+INFO batch_committed table=bulk_events Batch committed for bulk_events. progress=50000/1000000 (5.0%) batch=10 rows/sec=12000 eta=1m19s cursor=keyset next_offset=50000
+INFO checkpoint_saved table=bulk_events Checkpoint saved for bulk_events. checkpoint_batch=10 cursor=keyset next_offset=50000
+```
+
+대형 table row 수는 `--large-rows`로 조절합니다. 기본값은 `100000`입니다.
+
+```powershell
+uv run db-migrator self-test run --large-rows 1000000
+```
+
+실패 원인을 컨테이너 안에서 확인하려면 cleanup을 막습니다.
+
+```powershell
+uv run db-migrator self-test run --large-rows 10000 --keep-containers
+```
+
+기본 scenario는 `src/db_migrator/selftest/scenarios/pg_to_mariadb`입니다. self-test runner는 DBMS별 seed 실행 방식을 코드에 하드코딩하지 않고, scenario의 `selftest.yml`에서 외부 주입받습니다.
+
+scenario 기본 구조:
+
+```text
+src/db_migrator/selftest/
+  docker-compose.yml
+  scenarios/<scenario-name>/
+    selftest.yml
+    source/<source-dbms>/schema.sql
+    source/<source-dbms>/seed.sql
+```
+
+`docker-compose.yml`은 `source`, `target` 두 서비스만 관리합니다. 사람이 scenario별로 작성하는 파일은 `selftest.yml` 하나이며, 이 파일에 Docker image/port/healthcheck/container env, source seed 명령, migration 옵션을 함께 둡니다. runner는 이 값을 읽어 임시 Docker env 파일과 migration config를 생성합니다.
+
+```yaml
+compose_file: ../../docker-compose.yml
+docker:
+  source:
+    dbms: postgresql
+    image: postgres:16
+    host_port: 15432
+    container_port: 5432
+    database: source
+    schema: public
+    user: source_user
+    password: source_pass
+    healthcheck: pg_isready -U source_user -d source
+    container_environment:
+      POSTGRES_DB: source
+      POSTGRES_USER: source_user
+      POSTGRES_PASSWORD: source_pass
+  target:
+    dbms: mariadb
+    image: mariadb:11
+    host_port: 13306
+    container_port: 3306
+    database: target
+    user: target_user
+    password: target_pass
+    root_password: root_pass
+    environment: local
+    healthcheck: mariadb-admin ping -h 127.0.0.1 -u root -proot_pass --silent
+    container_environment:
+      MARIADB_DATABASE: target
+      MARIADB_USER: target_user
+      MARIADB_PASSWORD: target_pass
+      MARIADB_ROOT_PASSWORD: root_pass
+source_seed:
+  service: source
+  schema_file: source/postgresql/schema.sql
+  seed_file: source/postgresql/seed.sql
+  schema_command: [...]
+  seed_command: [...]
+migration_config:
+  job:
+    name: self-test-pg-to-mariadb
+  migration:
+    existing_table_policy: skip
+    batch_size: 5000
+```
+
+새 DBMS 조합을 추가할 때는 runner 코드를 수정하지 말고 새 scenario 폴더에 `selftest.yml`과 SQL seed만 추가하고 `--scenario`로 선택하세요. Docker image가 요구하는 env 이름도 해당 scenario의 `container_environment`에 직접 둡니다. 중앙 `docker-compose.yml`은 `source`, `target` 두 서비스만 유지합니다. `--compose-file`은 중앙 compose 파일을 임시로 교체해야 할 때만 사용하는 고급 override입니다.
+
+현재 기본 scenario 검증 범위:
+- PK/FK/composite PK/unique key가 있는 업무성 table
+- PK가 없는 audit table의 offset fallback warning
+- `integer`, `bigint`, `numeric`, `boolean`, `date`, `timestamp`, `timestamptz`, `text`, `jsonb`, `bytea`, `uuid`
+- `large_row_batch_size`가 적용되는 TEXT/JSON/BYTEA 포함 table
+- `--large-rows`로 조절되는 대용량 `bulk_events` table
+
+역방향 MariaDB -> PostgreSQL self-test:
+
+```powershell
+uv run db-migrator self-test run --scenario mariadb_to_pg --large-rows 1000
+```
+
+대용량 검증:
+
+```powershell
+uv run db-migrator self-test run --scenario mariadb_to_pg --large-rows 100000
+uv run db-migrator self-test run --scenario mariadb_to_pg --large-rows 1000000
+```
+
+`mariadb_to_pg` scenario는 `source` 컨테이너의 MariaDB 데이터를 `target` 컨테이너의 PostgreSQL로 이관합니다. 사용 포트는 `source=23306`, `target=25432`입니다. 실패 원인 확인이 필요하면 `--keep-containers`를 붙여 컨테이너를 남긴 뒤 DB에 직접 접속해 확인하세요.
+
+Docker Desktop이 설치되어 있지 않거나 실행 중이 아니면 `Docker is not installed or not running. Self-test requires Docker Desktop.` 메시지로 중단됩니다.
 
 ## 자주 보는 에러
 

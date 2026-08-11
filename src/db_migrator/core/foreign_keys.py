@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from db_migrator.adapters.mysql import ExecutionResult, quote_mysql_identifier
 from db_migrator.adapters.postgres import quote_postgres_identifier
+from db_migrator.config.models import Dbms
 from db_migrator.schema.models import ForeignKeySchema, SchemaSnapshot, TableSchema
 
 
@@ -42,6 +43,14 @@ def generate_postgres_foreign_key_ddls(snapshot: SchemaSnapshot) -> tuple[Foreig
         for table in snapshot.tables
         for foreign_key in table.foreign_keys
     )
+
+
+def generate_foreign_key_ddls(snapshot: SchemaSnapshot, *, target_dbms: Dbms) -> tuple[ForeignKeyDdl, ...]:
+    if target_dbms is Dbms.POSTGRESQL:
+        return generate_postgres_foreign_key_ddls(snapshot)
+    if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+        return generate_mysql_foreign_key_ddls(snapshot)
+    raise ValueError(f"Unsupported target DBMS for foreign key DDL: {target_dbms.value}")
 
 
 def execute_foreign_key_ddls(

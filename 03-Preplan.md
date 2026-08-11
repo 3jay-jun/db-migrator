@@ -282,10 +282,17 @@ src/db_migrator/
     console_events.py
 
   selftest/
-    docker_compose.yml
-    sample_source.sql
-    sample_config.yml
     runner.py
+    docker-compose.yml
+    scenarios/
+      pg_to_mariadb/
+        selftest.yml
+        source/postgresql/schema.sql
+        source/postgresql/seed.sql
+      mariadb_to_pg/
+        selftest.yml
+        source/mariadb/schema.sql
+        source/mariadb/seed.sql
 
 tests/
   unit/
@@ -872,6 +879,8 @@ warning JSON 예시:
 
 Docker Compose 기반 self-test는 제품 실행의 필수 의존성이 아니다. 프로그램이 정상적으로 실제 DB 이관을 수행할 수 있는지 검증하기 위한 선택 기능이다.
 
+self-test runner는 DBMS별 컨테이너명이나 seed 실행 명령을 코드에 하드코딩하지 않는다. 중앙 `docker-compose.yml`은 `source`, `target` 두 서비스만 관리한다. 각 scenario의 `selftest.yml`은 Docker image/port/healthcheck/container env, source seed SQL 경로/명령, migration 옵션을 한 곳에 정의한다. runner는 이 값으로 임시 Docker env 파일과 migration config를 생성한다. 새 DBMS 조합은 runner 수정 없이 scenario 폴더를 추가해 확장한다.
+
 일반 사용자 실행:
 
 ```text
@@ -890,9 +899,9 @@ db-migrator self-test run
 
 ```text
 1. Docker 설치 여부 확인
-2. 테스트용 PostgreSQL/MariaDB 컨테이너 실행
-3. 샘플 schema/data 생성
-4. PostgreSQL -> MariaDB 이관 실행
+2. 선택된 scenario의 Docker Compose 컨테이너 실행
+3. scenario manifest에 정의된 명령으로 샘플 schema/data 생성
+4. scenario config 기준으로 DB 이관 실행
 5. row count/checksum 검증
 6. 결과 리포트 생성
 7. 컨테이너 종료 옵션 제공

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Callable, Iterable, Protocol
+from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
 from db_migrator.config.models import SourceConfig, TargetConfig, WatermarkConfig
-from db_migrator.schema.common_types import CommonType
+from db_migrator.schema.common_types import CommonType, CommonTypeKind
 from db_migrator.schema.models import (
     ColumnSchema,
+    CursorStrategy,
     ForeignKeySchema,
     PrimaryKey,
     ReadCursor,
     RowBatch,
     RowData,
+    SamplePosition,
     SchemaSnapshot,
     TableRef,
     TableSchema,
@@ -133,31 +138,37 @@ class MySqlSourceAdapter:
         if batch_size <= 0:
             raise MySqlAdapterError("batch_size must be greater than zero.")
 
-        start_offset = cursor.offset if cursor is not None else 0
+        start_cursor = cursor or ReadCursor.offset_cursor()
+        start_offset = start_cursor.offset
         column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
         table_sql = qualify_mysql_table_ref(table)
         order_sql = _mysql_order_by_clause(order_by)
-        query = f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s OFFSET %s"
+        where_sql, params = _mysql_keyset_where_clause(start_cursor)
+        offset_sql = "" if start_cursor.strategy is CursorStrategy.KEYSET else " LIMIT %s, 18446744073709551615"
+        query = f"SELECT {column_sql} FROM {table_sql}{where_sql}{order_sql}{offset_sql}"
+        execute_params = params if start_cursor.strategy is CursorStrategy.KEYSET else (*params, start_offset)
 
         try:
+            from pymysql.cursors import SSDictCursor
+
             with self._connect() as connection:
                 batch_number = 0
                 current_offset = start_offset
-                while True:
-                    with connection.cursor() as db_cursor:
-                        db_cursor.execute(query, (batch_size, current_offset))
-                        rows = tuple(dict(row) for row in db_cursor.fetchall())
-                    if not rows:
-                        break
-                    batch_number += 1
-                    yield RowBatch(
-                        table=table,
-                        rows=rows,
-                        batch_number=batch_number,
-                        start_offset=current_offset,
-                        next_cursor=ReadCursor(offset=current_offset + len(rows)),
-                    )
-                    current_offset += len(rows)
+                with connection.cursor(SSDictCursor) as db_cursor:
+                    db_cursor.execute(query, execute_params)
+                    while rows := tuple(dict(row) for row in db_cursor.fetchmany(batch_size)):
+                        batch_number += 1
+                        next_cursor = _next_read_cursor(start_cursor, rows, current_offset + len(rows))
+                        yield RowBatch(
+                            table=table,
+                            rows=rows,
+                            batch_number=batch_number,
+                            start_offset=current_offset,
+                            next_cursor=next_cursor,
+                            start_cursor=start_cursor,
+                        )
+                        current_offset += len(rows)
+                        start_cursor = next_cursor
         except Exception as exc:
             raise MySqlAdapterError(f"MySQL/MariaDB row streaming failed for table: {table.name}") from exc
 
@@ -177,12 +188,13 @@ class MySqlSourceAdapter:
         columns: tuple[str, ...],
         sample_size: int,
         order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
     ) -> tuple[RowData, ...]:
         if sample_size <= 0:
             return ()
         column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
         table_sql = qualify_mysql_table_ref(table)
-        order_sql = _mysql_order_by_clause(order_by)
+        order_sql = _mysql_order_by_clause(order_by, position=position)
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
@@ -204,30 +216,26 @@ class MySqlSourceAdapter:
         column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
         table_sql = qualify_mysql_table_ref(table)
         where_sql, params = _mysql_watermark_where_clause(watermark)
-        query = (
-            f"SELECT {column_sql} FROM {table_sql} {where_sql} "
-            f"ORDER BY {quote_mysql_identifier(watermark.column)} LIMIT %s OFFSET %s"
-        )
+        query = f"SELECT {column_sql} FROM {table_sql} {where_sql} ORDER BY {quote_mysql_identifier(watermark.column)}"
 
         try:
+            from pymysql.cursors import SSDictCursor
+
             with self._connect() as connection:
                 batch_number = 0
                 current_offset = 0
-                while True:
-                    with connection.cursor() as cursor:
-                        cursor.execute(query, (*params, batch_size, current_offset))
-                        rows = tuple(dict(row) for row in cursor.fetchall())
-                    if not rows:
-                        break
-                    batch_number += 1
-                    yield RowBatch(
-                        table=table,
-                        rows=rows,
-                        batch_number=batch_number,
-                        start_offset=current_offset,
-                        next_cursor=ReadCursor(offset=current_offset + len(rows)),
-                    )
-                    current_offset += len(rows)
+                with connection.cursor(SSDictCursor) as cursor:
+                    cursor.execute(query, params)
+                    while rows := tuple(dict(row) for row in cursor.fetchmany(batch_size)):
+                        batch_number += 1
+                        yield RowBatch(
+                            table=table,
+                            rows=rows,
+                            batch_number=batch_number,
+                            start_offset=current_offset,
+                            next_cursor=ReadCursor(offset=current_offset + len(rows)),
+                        )
+                        current_offset += len(rows)
         except Exception as exc:
             raise MySqlAdapterError(f"MySQL/MariaDB incremental row streaming failed for table: {table.name}") from exc
 
@@ -397,7 +405,7 @@ class MySqlTargetAdapter:
         column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
         table_sql = self._qualified_table_name(table_schema)
         sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders})"
-        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+        values = [_mysql_row_values(table_schema, row, writable_columns) for row in rows]
 
         try:
             connection = self._ensure_dml_connection()
@@ -420,7 +428,7 @@ class MySqlTargetAdapter:
         update_columns = tuple(column for column in writable_columns if column not in keys)
         update_sql = _mysql_upsert_update_sql(update_columns, keys)
         sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_sql}"
-        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+        values = [_mysql_row_values(table_schema, row, writable_columns) for row in rows]
 
         try:
             connection = self._ensure_dml_connection()
@@ -440,12 +448,63 @@ class MySqlTargetAdapter:
         except Exception as exc:
             raise MySqlAdapterError(f"Failed to count target rows for table: {table.name}") from exc
 
+    def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
+        temp_table = _mysql_sync_temp_table_name(table_schema)
+        key_sql = ", ".join(quote_mysql_identifier(key) for key in keys)
+        table_sql = self._qualified_table_name(table_schema)
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {temp_table}")
+                cursor.execute(f"CREATE TEMPORARY TABLE {temp_table} AS SELECT {key_sql} FROM {table_sql} WHERE 1 = 0")
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to prepare target sync keys for table: {table_schema.ref.name}") from exc
+
+    def record_sync_keys(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> None:
+        if not rows:
+            return
+        temp_table = _mysql_sync_temp_table_name(table_schema)
+        key_sql = ", ".join(quote_mysql_identifier(key) for key in keys)
+        placeholders = ", ".join(["%s"] * len(keys))
+        values = [tuple(row.get(key) for key in keys) for row in rows]
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.executemany(f"INSERT INTO {temp_table} ({key_sql}) VALUES ({placeholders})", values)
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to record target sync keys for table: {table_schema.ref.name}") from exc
+
+    def delete_rows_not_in_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> int:
+        temp_table = _mysql_sync_temp_table_name(table_schema)
+        table_sql = self._qualified_table_name(table_schema)
+        match_sql = " AND ".join(
+            f"{table_sql}.{quote_mysql_identifier(key)} = {temp_table}.{quote_mysql_identifier(key)}"
+            for key in keys
+        )
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DELETE FROM {table_sql} WHERE NOT EXISTS (SELECT 1 FROM {temp_table} WHERE {match_sql})")
+                return int(cursor.rowcount or 0)
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to delete target rows missing from source for table: {table_schema.ref.name}") from exc
+
+    def end_sync_keys(self, table_schema: TableSchema) -> None:
+        temp_table = _mysql_sync_temp_table_name(table_schema)
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {temp_table}")
+        except Exception as exc:
+            raise MySqlAdapterError(f"Failed to clean up target sync keys for table: {table_schema.ref.name}") from exc
+
     def sample_rows(
         self,
         table: TableRef,
         columns: tuple[str, ...],
         sample_size: int,
         order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
     ) -> tuple[RowData, ...]:
         if sample_size <= 0:
             return ()
@@ -454,7 +513,7 @@ class MySqlTargetAdapter:
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    order_sql = _mysql_order_by_clause(order_by)
+                    order_sql = _mysql_order_by_clause(order_by, position=position)
                     cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
                     rows = cursor.fetchall()
             return tuple(dict(zip(columns, row, strict=True)) for row in rows)
@@ -548,11 +607,54 @@ def quote_mysql_identifier(identifier: str) -> str:
     return f"`{escaped_identifier}`"
 
 
-def _mysql_order_by_clause(columns: tuple[str, ...]) -> str:
+def _mysql_order_by_clause(columns: tuple[str, ...], *, position: SamplePosition = SamplePosition.FIRST) -> str:
     if not columns:
         return ""
-    column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
+    direction = " DESC" if position is SamplePosition.LAST else ""
+    column_sql = ", ".join(f"{quote_mysql_identifier(column)}{direction}" for column in columns)
     return f" ORDER BY {column_sql}"
+
+
+def _mysql_keyset_where_clause(cursor: ReadCursor) -> tuple[str, tuple]:
+    if cursor.strategy is not CursorStrategy.KEYSET or not cursor.last_key_values:
+        return "", ()
+    columns = ", ".join(quote_mysql_identifier(column) for column in cursor.key_columns)
+    placeholders = ", ".join(["%s"] * len(cursor.last_key_values))
+    return f" WHERE ({columns}) > ({placeholders})", cursor.last_key_values
+
+
+def _next_read_cursor(start_cursor: ReadCursor, rows: tuple[RowData, ...], next_offset: int) -> ReadCursor:
+    if start_cursor.strategy is CursorStrategy.KEYSET:
+        last_row = rows[-1] if rows else {}
+        return ReadCursor.keyset_cursor(
+            key_columns=start_cursor.key_columns,
+            last_key_values=tuple(last_row.get(column) for column in start_cursor.key_columns),
+            offset=next_offset,
+        )
+    return ReadCursor.offset_cursor(next_offset)
+
+
+def _mysql_sync_temp_table_name(table_schema: TableSchema) -> str:
+    return quote_mysql_identifier(f"db_migrator_sync_{table_schema.ref.name}")
+
+
+def _mysql_row_values(table_schema: TableSchema, row: RowData, columns: tuple[str, ...]) -> tuple:
+    column_by_name = {column.name: column for column in table_schema.columns}
+    return tuple(_mysql_cell_value(row.get(column), column_by_name[column]) for column in columns)
+
+
+def _mysql_cell_value(value: object, column: ColumnSchema) -> object:
+    if value is None:
+        return None
+    if column.common_type.kind is CommonTypeKind.JSON:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if isinstance(value, (dict, list)) else value
+    if column.common_type.kind is CommonTypeKind.UUID:
+        return str(value) if isinstance(value, UUID) else value
+    if column.common_type.kind is CommonTypeKind.BINARY:
+        return bytes(value) if isinstance(value, memoryview) else value
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _format_mysql_source_type(row: dict) -> str:

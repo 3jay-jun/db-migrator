@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Protocol
+from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
 from db_migrator.config.models import WatermarkConfig
 from db_migrator.config.models import SourceConfig, TargetConfig
-from db_migrator.schema.common_types import CommonType
-from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, PrimaryKey, ReadCursor, RowBatch, RowData, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.common_types import CommonType, CommonTypeKind
+from db_migrator.schema.models import ColumnSchema, CursorStrategy, ForeignKeySchema, PrimaryKey, ReadCursor, RowBatch, RowData, SamplePosition, SchemaSnapshot, TableRef, TableSchema, WriteResult
 from db_migrator.schema.type_mapping import common_type_to_postgres, postgres_type_to_common
 
 
@@ -56,7 +59,8 @@ class PostgresTargetAdapter:
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(ddl)
+                    for statement in _split_postgres_ddl_statements(ddl):
+                        cursor.execute(statement)
                 connection.commit()
             return ExecutionResult(success=True, message="DDL executed.")
         except Exception as exc:
@@ -78,7 +82,7 @@ class PostgresTargetAdapter:
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in writable_columns)
         table_sql = _qualified_postgres_table_name(table_schema)
         sql = f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders})"
-        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+        values = [_postgres_row_values(table_schema, row, writable_columns) for row in rows]
 
         try:
             connection = self._ensure_dml_connection()
@@ -86,7 +90,9 @@ class PostgresTargetAdapter:
                 cursor.executemany(sql, values)
             return WriteResult(success=True, rows_written=len(rows), message="Batch written.")
         except Exception as exc:
-            raise PostgresAdapterError(f"Failed to write target batch for table: {table_schema.ref.name}") from exc
+            raise PostgresAdapterError(
+                f"Failed to write target batch for table: {table_schema.ref.name}. detail={_safe_error_detail(exc)}"
+            ) from exc
 
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
         if not keys:
@@ -105,7 +111,7 @@ class PostgresTargetAdapter:
             f"INSERT INTO {table_sql} ({column_sql}) VALUES ({placeholders}) "
             f"ON CONFLICT ({conflict_sql}) DO UPDATE SET {update_sql}"
         )
-        values = [tuple(row.get(column) for column in writable_columns) for row in rows]
+        values = [_postgres_row_values(table_schema, row, writable_columns) for row in rows]
 
         try:
             connection = self._ensure_dml_connection()
@@ -113,7 +119,9 @@ class PostgresTargetAdapter:
                 cursor.executemany(sql, values)
             return WriteResult(success=True, rows_written=len(rows), message="Batch upserted.")
         except Exception as exc:
-            raise PostgresAdapterError(f"Failed to upsert target batch for table: {table_schema.ref.name}") from exc
+            raise PostgresAdapterError(
+                f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={_safe_error_detail(exc)}"
+            ) from exc
 
     def count_rows(self, table: TableRef) -> int:
         table_sql = _qualified_postgres_table_ref(table)
@@ -126,18 +134,69 @@ class PostgresTargetAdapter:
         except Exception as exc:
             raise PostgresAdapterError(f"PostgreSQL row count failed for table: {table.name}") from exc
 
+    def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
+        temp_table = _postgres_sync_temp_table_name(table_schema)
+        key_sql = ", ".join(_quote_postgres_identifier(key) for key in keys)
+        table_sql = _qualified_postgres_table_name(table_schema)
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                cursor.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT {key_sql} FROM {table_sql} WHERE false")
+        except Exception as exc:
+            raise PostgresAdapterError(f"Failed to prepare target sync keys for table: {table_schema.ref.name}") from exc
+
+    def record_sync_keys(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> None:
+        if not rows:
+            return
+        temp_table = _postgres_sync_temp_table_name(table_schema)
+        key_sql = ", ".join(_quote_postgres_identifier(key) for key in keys)
+        placeholders = ", ".join(["%s"] * len(keys))
+        values = [tuple(row.get(key) for key in keys) for row in rows]
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.executemany(f"INSERT INTO {temp_table} ({key_sql}) VALUES ({placeholders})", values)
+        except Exception as exc:
+            raise PostgresAdapterError(f"Failed to record target sync keys for table: {table_schema.ref.name}") from exc
+
+    def delete_rows_not_in_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> int:
+        temp_table = _postgres_sync_temp_table_name(table_schema)
+        table_sql = _qualified_postgres_table_name(table_schema)
+        match_sql = " AND ".join(
+            f"{table_sql}.{_quote_postgres_identifier(key)} = {temp_table}.{_quote_postgres_identifier(key)}"
+            for key in keys
+        )
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DELETE FROM {table_sql} WHERE NOT EXISTS (SELECT 1 FROM {temp_table} WHERE {match_sql})")
+                return int(cursor.rowcount or 0)
+        except Exception as exc:
+            raise PostgresAdapterError(f"Failed to delete target rows missing from source for table: {table_schema.ref.name}") from exc
+
+    def end_sync_keys(self, table_schema: TableSchema) -> None:
+        temp_table = _postgres_sync_temp_table_name(table_schema)
+        try:
+            connection = self._ensure_dml_connection()
+            with connection.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
+        except Exception as exc:
+            raise PostgresAdapterError(f"Failed to clean up target sync keys for table: {table_schema.ref.name}") from exc
+
     def sample_rows(
         self,
         table: TableRef,
         columns: tuple[str, ...],
         sample_size: int,
         order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
     ) -> tuple[RowData, ...]:
         if sample_size <= 0:
             return ()
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
         table_sql = _qualified_postgres_table_ref(table)
-        order_sql = _postgres_order_by_clause(order_by)
+        order_sql = _postgres_order_by_clause(order_by, position=position)
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
@@ -193,7 +252,8 @@ class PostgresDdlGenerator:
 
         table_name = _qualified_postgres_table_name(table_schema)
         ddl_body = ",\n".join(column_lines)
-        ddl = f"CREATE TABLE {table_name} (\n{ddl_body}\n);"
+        schema_name = _quote_postgres_identifier(table_schema.ref.schema)
+        ddl = f"CREATE SCHEMA IF NOT EXISTS {schema_name};\nCREATE TABLE {table_name} (\n{ddl_body}\n);"
         warnings = _unique_warning_messages(
             warning.message
             for column in table_schema.columns
@@ -288,7 +348,8 @@ class PostgresSourceAdapter:
         if batch_size <= 0:
             raise PostgresAdapterError("batch_size must be greater than zero.")
 
-        start_offset = cursor.offset if cursor is not None else 0
+        start_cursor = cursor or ReadCursor.offset_cursor()
+        start_offset = start_cursor.offset
         try:
             with self._connect() as connection:
                 with connection.cursor(name=f"db_migrator_{table.name}") as server_cursor:
@@ -296,7 +357,10 @@ class PostgresSourceAdapter:
                     column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
                     table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
                     order_sql = _postgres_order_by_clause(order_by)
-                    server_cursor.execute(f"select {column_sql} from {table_sql}{order_sql} offset %s", (start_offset,))
+                    where_sql, params = _postgres_keyset_where_clause(start_cursor)
+                    offset_sql = "" if start_cursor.strategy is CursorStrategy.KEYSET else " offset %s"
+                    execute_params = params if start_cursor.strategy is CursorStrategy.KEYSET else (*params, start_offset)
+                    server_cursor.execute(f"select {column_sql} from {table_sql}{where_sql}{order_sql}{offset_sql}", execute_params)
 
                     batch_number = 0
                     current_offset = start_offset
@@ -304,13 +368,16 @@ class PostgresSourceAdapter:
                         row_batch = tuple(dict(row) for row in rows)
                         current_offset += len(row_batch)
                         batch_number += 1
+                        next_cursor = _next_read_cursor(start_cursor, row_batch, current_offset)
                         yield RowBatch(
                             table=table,
                             rows=row_batch,
                             batch_number=batch_number,
                             start_offset=current_offset - len(row_batch),
-                            next_cursor=ReadCursor(offset=current_offset),
+                            next_cursor=next_cursor,
+                            start_cursor=start_cursor,
                         )
+                        start_cursor = next_cursor
         except Exception as exc:
             raise PostgresAdapterError(f"PostgreSQL row streaming failed for table: {table.name}") from exc
 
@@ -331,6 +398,7 @@ class PostgresSourceAdapter:
         columns: tuple[str, ...],
         sample_size: int,
         order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
     ) -> tuple[RowData, ...]:
         if sample_size <= 0:
             return ()
@@ -339,7 +407,7 @@ class PostgresSourceAdapter:
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    order_sql = _postgres_order_by_clause(order_by)
+                    order_sql = _postgres_order_by_clause(order_by, position=position)
                     cursor.execute(f"select {column_sql} from {table_sql}{order_sql} limit %s", (sample_size,))
                     return tuple(dict(row) for row in cursor.fetchall())
         except Exception as exc:
@@ -554,11 +622,61 @@ def _qualified_postgres_table_ref(table: TableRef) -> str:
     )
 
 
-def _postgres_order_by_clause(columns: tuple[str, ...]) -> str:
+def _postgres_order_by_clause(columns: tuple[str, ...], *, position: SamplePosition = SamplePosition.FIRST) -> str:
     if not columns:
         return ""
-    column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
+    direction = " desc" if position is SamplePosition.LAST else ""
+    column_sql = ", ".join(f"{_quote_postgres_identifier(column)}{direction}" for column in columns)
     return f" order by {column_sql}"
+
+
+def _postgres_keyset_where_clause(cursor: ReadCursor) -> tuple[str, tuple[Any, ...]]:
+    if cursor.strategy is not CursorStrategy.KEYSET or not cursor.last_key_values:
+        return "", ()
+    columns = ", ".join(_quote_postgres_identifier(column) for column in cursor.key_columns)
+    placeholders = ", ".join(["%s"] * len(cursor.last_key_values))
+    return f" where ({columns}) > ({placeholders})", cursor.last_key_values
+
+
+def _next_read_cursor(start_cursor: ReadCursor, rows: tuple[RowData, ...], next_offset: int) -> ReadCursor:
+    if start_cursor.strategy is CursorStrategy.KEYSET:
+        last_row = rows[-1] if rows else {}
+        return ReadCursor.keyset_cursor(
+            key_columns=start_cursor.key_columns,
+            last_key_values=tuple(last_row.get(column) for column in start_cursor.key_columns),
+            offset=next_offset,
+        )
+    return ReadCursor.offset_cursor(next_offset)
+
+
+def _postgres_sync_temp_table_name(table_schema: TableSchema) -> str:
+    return _quote_postgres_identifier(f"db_migrator_sync_{table_schema.ref.name}")
+
+
+def _postgres_row_values(table_schema: TableSchema, row: RowData, columns: tuple[str, ...]) -> tuple[Any, ...]:
+    column_by_name = {column.name: column for column in table_schema.columns}
+    return tuple(_postgres_cell_value(row.get(column), column_by_name[column]) for column in columns)
+
+
+def _postgres_cell_value(value: object, column: ColumnSchema) -> object:
+    if value is None:
+        return None
+    if column.common_type.kind is CommonTypeKind.JSON:
+        try:
+            from psycopg.types.json import Jsonb
+        except ImportError as exc:
+            raise PostgresAdapterError("psycopg JSON adapter is unavailable. Install project dependencies first.") from exc
+        json_value = json.loads(value) if isinstance(value, str) else value
+        return Jsonb(json_value)
+    if column.common_type.kind is CommonTypeKind.BOOLEAN and isinstance(value, int):
+        return bool(value)
+    if column.common_type.kind is CommonTypeKind.UUID and isinstance(value, str):
+        return UUID(value)
+    if column.common_type.kind is CommonTypeKind.BINARY and isinstance(value, memoryview):
+        return bytes(value)
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _watermark_where_clause(watermark: WatermarkConfig) -> tuple[str, tuple[str, ...]]:
@@ -608,3 +726,7 @@ def _first_row_value(row: Any) -> Any:
     if isinstance(row, dict):
         return next(iter(row.values()))
     return row[0]
+
+
+def _split_postgres_ddl_statements(ddl: str) -> tuple[str, ...]:
+    return tuple(statement.strip() for statement in ddl.split(";") if statement.strip())

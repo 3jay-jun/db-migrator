@@ -1,0 +1,25 @@
+services:
+  source:
+    image: ${SELFTEST_SOURCE_IMAGE}
+    env_file:
+      - ${SELFTEST_SOURCE_ENV_FILE}
+    healthcheck:
+      test: ["CMD-SHELL", "${SELFTEST_SOURCE_HEALTHCHECK}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - ./:/selftest:ro
+    ports:
+      - "${SELFTEST_SOURCE_HOST_PORT}:${SELFTEST_SOURCE_CONTAINER_PORT}"
+  target:
+    image: ${SELFTEST_TARGET_IMAGE}
+    env_file:
+      - ${SELFTEST_TARGET_ENV_FILE}
+    healthcheck:
+      test: ["CMD-SHELL", "${SELFTEST_TARGET_HEALTHCHECK}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "${SELFTEST_TARGET_HOST_PORT}:${SELFTEST_TARGET_CONTAINER_PORT}"

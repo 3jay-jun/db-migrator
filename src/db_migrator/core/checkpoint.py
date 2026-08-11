@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from db_migrator.schema.models import RowBatch, TableRef
+from typing import Any
+
+from db_migrator.schema.models import CursorStrategy, ReadCursor, RowBatch, TableRef
 
 
 @dataclass(frozen=True)
@@ -16,7 +19,20 @@ class BatchCheckpoint:
     committed_rows: int
     next_offset: int | None
     status: str
+    cursor_strategy: str = CursorStrategy.OFFSET.value
+    key_columns: tuple[str, ...] = ()
+    last_key_values: tuple[Any, ...] = ()
     message: str | None = None
+
+    @property
+    def next_cursor(self) -> ReadCursor:
+        if self.cursor_strategy == CursorStrategy.KEYSET.value:
+            return ReadCursor.keyset_cursor(
+                key_columns=self.key_columns,
+                last_key_values=self.last_key_values,
+                offset=self.next_offset or 0,
+            )
+        return ReadCursor.offset_cursor(self.next_offset or 0)
 
 
 class CheckpointStore:
@@ -26,26 +42,50 @@ class CheckpointStore:
         self._initialize()
 
     def save_batch_success(self, job_id: str, batch: RowBatch) -> BatchCheckpoint:
-        next_offset = batch.next_cursor.offset if batch.next_cursor is not None else None
+        next_cursor = batch.next_cursor or ReadCursor.offset_cursor()
         checkpoint = BatchCheckpoint(
             job_id=job_id,
             table=batch.table,
             batch_number=batch.batch_number,
             committed_rows=batch.row_count,
-            next_offset=next_offset,
+            next_offset=next_cursor.offset,
             status="completed",
+            cursor_strategy=next_cursor.strategy.value,
+            key_columns=next_cursor.key_columns,
+            last_key_values=next_cursor.last_key_values,
         )
         self._insert_checkpoint(checkpoint)
         return checkpoint
 
     def save_batch_failure(self, job_id: str, batch: RowBatch, message: str) -> BatchCheckpoint:
+        failure_cursor = batch.failure_cursor
         checkpoint = BatchCheckpoint(
             job_id=job_id,
             table=batch.table,
             batch_number=batch.batch_number,
             committed_rows=0,
-            next_offset=batch.start_offset,
+            next_offset=failure_cursor.offset,
             status="failed",
+            cursor_strategy=failure_cursor.strategy.value,
+            key_columns=failure_cursor.key_columns,
+            last_key_values=failure_cursor.last_key_values,
+            message=message,
+        )
+        self._insert_checkpoint(checkpoint)
+        return checkpoint
+
+    def save_checkpoint_failure_after_commit(self, job_id: str, batch: RowBatch, message: str) -> BatchCheckpoint:
+        next_cursor = batch.next_cursor or ReadCursor.offset_cursor(batch.start_offset + batch.row_count)
+        checkpoint = BatchCheckpoint(
+            job_id=job_id,
+            table=batch.table,
+            batch_number=batch.batch_number,
+            committed_rows=batch.row_count,
+            next_offset=next_cursor.offset,
+            status="checkpoint_failed_after_commit",
+            cursor_strategy=next_cursor.strategy.value,
+            key_columns=next_cursor.key_columns,
+            last_key_values=next_cursor.last_key_values,
             message=message,
         )
         self._insert_checkpoint(checkpoint)
@@ -58,14 +98,19 @@ class CheckpointStore:
         batch_number: int,
         next_offset: int | None,
         message: str,
+        cursor: ReadCursor | None = None,
     ) -> BatchCheckpoint:
+        saved_cursor = cursor or ReadCursor.offset_cursor(next_offset or 0)
         checkpoint = BatchCheckpoint(
             job_id=job_id,
             table=table,
             batch_number=batch_number,
             committed_rows=0,
-            next_offset=next_offset,
+            next_offset=saved_cursor.offset,
             status="cancelled",
+            cursor_strategy=saved_cursor.strategy.value,
+            key_columns=saved_cursor.key_columns,
+            last_key_values=saved_cursor.last_key_values,
             message=message,
         )
         self._insert_checkpoint(checkpoint)
@@ -78,14 +123,19 @@ class CheckpointStore:
         batch_number: int,
         next_offset: int | None,
         committed_rows: int,
+        cursor: ReadCursor | None = None,
     ) -> BatchCheckpoint:
+        saved_cursor = cursor or ReadCursor.offset_cursor(next_offset or 0)
         checkpoint = BatchCheckpoint(
             job_id=job_id,
             table=table,
             batch_number=batch_number,
             committed_rows=committed_rows,
-            next_offset=next_offset,
+            next_offset=saved_cursor.offset,
             status="table_completed",
+            cursor_strategy=saved_cursor.strategy.value,
+            key_columns=saved_cursor.key_columns,
+            last_key_values=saved_cursor.last_key_values,
         )
         self._insert_checkpoint(checkpoint)
         return checkpoint
@@ -94,7 +144,8 @@ class CheckpointStore:
         with sqlite3.connect(self._db_path) as connection:
             rows = connection.execute(
                 """
-                select job_id, schema_name, table_name, batch_number, committed_rows, next_offset, status, message
+                select job_id, schema_name, table_name, batch_number, committed_rows, next_offset, status,
+                       cursor_strategy, key_columns_json, last_key_values_json, message
                 from batch_checkpoints
                 where job_id = ?
                 order by schema_name, table_name, batch_number
@@ -109,7 +160,10 @@ class CheckpointStore:
                 committed_rows=row[4],
                 next_offset=row[5],
                 status=row[6],
-                message=row[7],
+                cursor_strategy=row[7],
+                key_columns=_loads_tuple(row[8]),
+                last_key_values=_loads_tuple(row[9]),
+                message=row[10],
             )
             for row in rows
         ]
@@ -118,7 +172,8 @@ class CheckpointStore:
         with sqlite3.connect(self._db_path) as connection:
             row = connection.execute(
                 """
-                select job_id, schema_name, table_name, batch_number, committed_rows, next_offset, status, message
+                select job_id, schema_name, table_name, batch_number, committed_rows, next_offset, status,
+                       cursor_strategy, key_columns_json, last_key_values_json, message
                 from batch_checkpoints
                 where job_id = ?
                   and schema_name = ?
@@ -137,7 +192,10 @@ class CheckpointStore:
             committed_rows=row[4],
             next_offset=row[5],
             status=row[6],
-            message=row[7],
+            cursor_strategy=row[7],
+            key_columns=_loads_tuple(row[8]),
+            last_key_values=_loads_tuple(row[9]),
+            message=row[10],
         )
 
     def failed_tables(self, job_id: str) -> tuple[TableRef, ...]:
@@ -174,11 +232,17 @@ class CheckpointStore:
                     committed_rows integer not null,
                     next_offset integer,
                     status text not null,
+                    cursor_strategy text not null default 'offset',
+                    key_columns_json text not null default '[]',
+                    last_key_values_json text not null default '[]',
                     message text,
                     saved_at text not null
                 )
                 """
             )
+            _ensure_column(connection, "batch_checkpoints", "cursor_strategy", "text not null default 'offset'")
+            _ensure_column(connection, "batch_checkpoints", "key_columns_json", "text not null default '[]'")
+            _ensure_column(connection, "batch_checkpoints", "last_key_values_json", "text not null default '[]'")
             connection.execute(
                 """
                 create index if not exists idx_batch_checkpoints_job_table
@@ -198,10 +262,13 @@ class CheckpointStore:
                     committed_rows,
                     next_offset,
                     status,
+                    cursor_strategy,
+                    key_columns_json,
+                    last_key_values_json,
                     message,
                     saved_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     checkpoint.job_id,
@@ -211,7 +278,25 @@ class CheckpointStore:
                     checkpoint.committed_rows,
                     checkpoint.next_offset,
                     checkpoint.status,
+                    checkpoint.cursor_strategy,
+                    json.dumps(checkpoint.key_columns, ensure_ascii=False),
+                    json.dumps(checkpoint.last_key_values, ensure_ascii=False, default=str),
                     checkpoint.message,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    columns = {row[1] for row in connection.execute(f"pragma table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        connection.execute(f"alter table {table_name} add column {column_name} {definition}")
+
+
+def _loads_tuple(raw_value: str | None) -> tuple[Any, ...]:
+    if not raw_value:
+        return ()
+    value = json.loads(raw_value)
+    if not isinstance(value, list):
+        return ()
+    return tuple(value)

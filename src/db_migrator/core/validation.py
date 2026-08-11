@@ -10,8 +10,9 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from db_migrator.config.models import VerificationConfig
+from db_migrator.reports.metadata import ReportEndpoint
 from db_migrator.schema.common_types import CommonTypeKind
-from db_migrator.schema.models import RowData, TableRef, TableSchema
+from db_migrator.schema.models import RowData, SamplePosition, TableRef, TableSchema
 
 
 class ValidationStatus:
@@ -57,20 +58,14 @@ class MatchedSampleRow:
     target_values: dict[str, str]
 
 
-@dataclass(frozen=True)
-class ValidationEndpoint:
-    dbms: str
-    host: str
-    port: int
-    database: str
-    schema: str | None = None
+ValidationEndpoint = ReportEndpoint
 
 
 @dataclass(frozen=True)
 class ValidationMetadata:
     generated_at: str
-    source: ValidationEndpoint | None = None
-    target: ValidationEndpoint | None = None
+    source: ReportEndpoint | None = None
+    target: ReportEndpoint | None = None
     checksum_sample_size: int | None = None
     checksum_timezone: str | None = None
     checksum_datetime_precision: str | None = None
@@ -123,7 +118,13 @@ class ValidationReader(Protocol):
     def count_rows(self, side: str, table: TableRef) -> int:
         """Return row count for one side."""
 
-    def sample_rows(self, side: str, table_schema: TableSchema, sample_size: int) -> tuple[RowData, ...]:
+    def sample_rows(
+        self,
+        side: str,
+        table_schema: TableSchema,
+        sample_size: int,
+        position: SamplePosition = SamplePosition.FIRST,
+    ) -> tuple[RowData, ...]:
         """Return deterministic sample rows for checksum verification."""
 
 
@@ -186,8 +187,8 @@ def _validate_checksum(
     profile: NormalizationProfile,
 ) -> ChecksumValidationResult:
     try:
-        source_rows = reader.sample_rows("source", table, sample_size)
-        target_rows = reader.sample_rows("target", table, sample_size)
+        source_rows = _combined_sample_rows(reader, "source", table, sample_size)
+        target_rows = _combined_sample_rows(reader, "target", table, sample_size)
         source_checksum = checksum_rows(_rows_for_checksum(table, source_rows, profile), profile)
         target_checksum = checksum_rows(_rows_for_checksum(table, target_rows, profile), profile)
     except Exception as exc:
@@ -218,6 +219,40 @@ def _validate_checksum(
         differences=differences,
         matched_samples=matched_samples,
     )
+
+
+def _combined_sample_rows(
+    reader: ValidationReader,
+    side: str,
+    table: TableSchema,
+    sample_size: int,
+) -> tuple[RowData, ...]:
+    first_rows = _sample_rows(reader, side, table, sample_size, SamplePosition.FIRST)
+    last_rows = _sample_rows(reader, side, table, sample_size, SamplePosition.LAST)
+    if not _has_primary_key(table):
+        return first_rows + last_rows
+
+    rows_by_key = {_row_key(table, row, _profile_for_dedupe(table)): row for row in first_rows}
+    for row in last_rows:
+        rows_by_key.setdefault(_row_key(table, row, _profile_for_dedupe(table)), row)
+    return tuple(rows_by_key[key] for key in sorted(rows_by_key))
+
+
+def _sample_rows(
+    reader: ValidationReader,
+    side: str,
+    table: TableSchema,
+    sample_size: int,
+    position: SamplePosition,
+) -> tuple[RowData, ...]:
+    try:
+        return reader.sample_rows(side, table, sample_size, position)
+    except TypeError:
+        return reader.sample_rows(side, table, sample_size)
+
+
+def _profile_for_dedupe(table: TableSchema) -> NormalizationProfile:
+    return _profile_for_table(table, NormalizationProfile(datetime_precision="microseconds", float_precision=12))
 
 
 def checksum_rows(rows: tuple[RowData, ...], profile: NormalizationProfile) -> str:

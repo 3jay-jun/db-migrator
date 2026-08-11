@@ -30,6 +30,7 @@ class ExistingTablePolicy(StrEnum):
     SKIP = "skip"
     COMPARE_ONLY = "compare_only"
     APPEND = "append"
+    SYNC = "sync"
     TRUNCATE_RELOAD = "truncate_reload"
     OVERWRITE = "overwrite"
 
@@ -61,10 +62,12 @@ class TargetConfig(BaseModel):
 class MigrationConfig(BaseModel):
     mode: MigrationMode = MigrationMode.DRY_RUN
     existing_table_policy: ExistingTablePolicy = ExistingTablePolicy.SKIP
+    apply_foreign_keys: bool = False
     batch_size: int = Field(default=10_000, gt=0)
     large_row_batch_size: int | None = Field(default=None, gt=0)
     commit_interval: int = Field(default=10_000, gt=0)
     parallel_table_count: int = Field(default=1, gt=0)
+    throttle_sleep_ms: int = Field(default=0, ge=0)
     checkpoint_resume: bool = True
     dry_run_report_path: str | None = None
 
@@ -87,6 +90,7 @@ class VerificationConfig(BaseModel):
     checksum_datetime_precision: str = "microseconds"
     checksum_timezone: str | None = None
     checksum_float_precision: int = Field(default=12, gt=0)
+    pk_range_checksum: bool = False
 
 
 class WatermarkConfig(BaseModel):

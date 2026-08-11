@@ -30,6 +30,14 @@ db-migrator = "db_migrator.cli.main:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+db_migrator = [
+    "selftest/*.yml",
+    "selftest/docker-compose.yml",
+    "selftest/scenarios/*/*.yml",
+    "selftest/scenarios/*/source/*/*.sql",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

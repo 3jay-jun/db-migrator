@@ -12,6 +12,7 @@ from db_migrator.adapters.postgres import PostgresAdapterError
 from db_migrator.adapters.mysql import MySqlAdapterError
 from db_migrator.adapters.base import SourceAdapter
 from db_migrator.adapters.registry import AdapterRegistryError, default_adapter_registry
+from db_migrator.cli.console_events import ConsoleEventPublisher
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
 from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables
@@ -21,9 +22,11 @@ from db_migrator.core.health import run_health_checks
 from db_migrator.core.incremental import migrate_incremental_tables
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation_readers import SourceTargetValidationReader
-from db_migrator.reports.dry_run import build_dry_run_report, write_dry_run_report
+from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, write_dry_run_report
 from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.incremental_report import write_incremental_report
+from db_migrator.reports.metadata import ReportEndpoint
+from db_migrator.config.models import Dbms
 from db_migrator.schema.models import SchemaSnapshot
 from db_migrator.schema.snapshot_io import SchemaSnapshotLoadError, load_schema_snapshot_from_json
 from db_migrator.selftest.package_check import check_pyinstaller_available
@@ -69,16 +72,34 @@ def dry_run(
         app_config = load_config(config)
         source = _registry.create_source(app_config.source)
         if schema_file is not None:
-            snapshot = load_schema_snapshot_from_json(schema_file)
+            snapshot = load_schema_snapshot_from_json(schema_file, source_dbms=app_config.source.dbms)
         else:
             snapshot = source.scan_schema(app_config.source.schema_name)
         report = build_dry_run_report(
             snapshot,
             target_dbms=app_config.target.dbms,
             target_database=app_config.target.database,
+            metadata=DryRunMetadata(
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                source=ReportEndpoint(
+                    dbms=app_config.source.dbms.value,
+                    host=app_config.source.host,
+                    port=app_config.source.port,
+                    database=app_config.source.database,
+                    schema=app_config.source.schema_name,
+                ),
+                target=ReportEndpoint(
+                    dbms=app_config.target.dbms.value,
+                    host=app_config.target.host,
+                    port=app_config.target.port,
+                    database=app_config.target.database,
+                ),
+                migration_mode=app_config.migration.mode.value,
+                existing_table_policy=app_config.migration.existing_table_policy.value,
+            ),
             registry=_registry,
         )
-    except (ConfigLoadError, SchemaSnapshotLoadError, PostgresAdapterError, AdapterRegistryError) as exc:
+    except (ConfigLoadError, SchemaSnapshotLoadError, PostgresAdapterError, MySqlAdapterError, AdapterRegistryError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     resolved_output_dir = output_dir or Path(app_config.report.output_dir)
@@ -98,7 +119,7 @@ def apply_ddl(
         app_config = load_config(config)
         source = _registry.create_source(app_config.source)
         target = _registry.create_target(app_config.target)
-        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file)
+        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
         resolved_output_file = output_file or Path(app_config.report.output_dir) / "ddl-execution.json"
         summary = execute_schema_ddl(
             config=app_config,
@@ -123,28 +144,22 @@ def migrate_data(
     schema_file: Path | None = typer.Option(None, "--schema-file"),
     checkpoint_db: Path = typer.Option(Path("checkpoints/migration.sqlite"), "--checkpoint-db"),
 ) -> None:
-    event_queue: Queue[MigrationEvent] = Queue()
-
     try:
         app_config = load_config(config)
         source = _registry.create_source(app_config.source)
         target = _registry.create_target(app_config.target)
-        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file)
+        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
         result = migrate_tables(
             job_id=app_config.job.name,
             tables=snapshot.tables,
             source=source,
             target=target,
             checkpoint_store=CheckpointStore(checkpoint_db),
-            event_publisher=QueueEventPublisher(event_queue),
+            event_publisher=ConsoleEventPublisher(console),
             migration_config=app_config.migration,
         )
     except (ConfigLoadError, SchemaSnapshotLoadError, PostgresAdapterError, MySqlAdapterError, AdapterRegistryError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-
-    while not event_queue.empty():
-        event = event_queue.get()
-        console.print(f"[{event.level}] {event.message}")
 
     console.print(f"job_id={result.job_id} tables={len(result.tables)} rows_written={result.rows_written}")
 
@@ -187,7 +202,7 @@ def validate(
         app_config = load_config(config)
         source = _registry.create_source(app_config.source)
         target = _registry.create_target(app_config.target)
-        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file)
+        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
         report = validate_tables(
             job_id=app_config.job.name,
             tables=snapshot.tables,
@@ -233,7 +248,7 @@ def migrate_incremental(
             raise typer.BadParameter("incremental.enabled must be true to run migrate-incremental.")
         source = _registry.create_source(app_config.source)
         target = _registry.create_target(app_config.target)
-        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file)
+        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
         report = migrate_incremental_tables(
             job_id=app_config.job.name,
             tables=snapshot.tables,
@@ -252,9 +267,20 @@ def migrate_incremental(
 
 @_self_test_app.command("run")
 def self_test_run(
-    compose_file: Path = typer.Option(Path("src/db_migrator/selftest/docker_compose.yml"), "--compose-file"),
+    compose_file: Path | None = typer.Option(None, "--compose-file"),
+    scenario: str = typer.Option("pg_to_mariadb", "--scenario"),
+    large_rows: int = typer.Option(100_000, "--large-rows", min=0),
+    keep_containers: bool = typer.Option(False, "--keep-containers"),
+    work_dir: Path = typer.Option(Path(".tmp/selftest"), "--work-dir"),
 ) -> None:
-    result = run_self_test(compose_file)
+    result = run_self_test(
+        compose_file,
+        scenario=scenario,
+        large_rows=large_rows,
+        keep_containers=keep_containers,
+        work_dir=work_dir,
+        event_publisher=ConsoleEventPublisher(console),
+    )
     if not result.success:
         raise typer.BadParameter(result.message)
     console.print(result.message)
@@ -284,14 +310,12 @@ def _run_checkpointed_migration(
     checkpoint_db: Path,
     retry_failed_only: bool,
 ) -> None:
-    event_queue: Queue[MigrationEvent] = Queue()
-
     try:
         app_config = load_config(config)
         source = _registry.create_source(app_config.source)
         target = _registry.create_target(app_config.target)
         checkpoint_store = CheckpointStore(checkpoint_db)
-        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file)
+        snapshot = _load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
         resume_plan = (
             build_retry_failed_plan(app_config.job.name, checkpoint_store)
             if retry_failed_only
@@ -303,21 +327,17 @@ def _run_checkpointed_migration(
             source=source,
             target=target,
             checkpoint_store=checkpoint_store,
-            event_publisher=QueueEventPublisher(event_queue),
+            event_publisher=ConsoleEventPublisher(console),
             migration_config=app_config.migration,
             resume_plan=resume_plan,
         )
     except (ConfigLoadError, SchemaSnapshotLoadError, PostgresAdapterError, MySqlAdapterError, AdapterRegistryError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    while not event_queue.empty():
-        event = event_queue.get()
-        console.print(f"[{event.level}] {event.message}")
-
     console.print(f"job_id={result.job_id} tables={len(result.tables)} rows_written={result.rows_written}")
 
 
-def _load_snapshot(schema_name: str, source: SourceAdapter, schema_file: Path | None) -> SchemaSnapshot:
+def _load_snapshot(schema_name: str, source: SourceAdapter, schema_file: Path | None, *, source_dbms: Dbms) -> SchemaSnapshot:
     if schema_file is not None:
-        return load_schema_snapshot_from_json(schema_file)
+        return load_schema_snapshot_from_json(schema_file, source_dbms=source_dbms)
     return source.scan_schema(schema_name)

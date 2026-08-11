@@ -5,6 +5,7 @@ import pytest
 from db_migrator.adapters.mysql import ExecutionResult
 from db_migrator.config.models import (
     AppConfig,
+    Dbms,
     ExistingTablePolicy,
     MigrationConfig,
     SafetyConfig,
@@ -119,3 +120,23 @@ def test_execute_schema_ddl_truncates_existing_table_after_dry_run_requirement(t
 
     assert summary.allowed is True
     assert executor.truncated_tables == ["users", "orders"]
+
+
+def test_execute_schema_ddl_can_apply_postgres_foreign_keys(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    config = AppConfig(
+        target=TargetConfig(dbms=Dbms.POSTGRESQL, port=5432),
+        migration=MigrationConfig(apply_foreign_keys=True),
+    )
+    executor = FakeDdlExecutor()
+
+    summary = execute_schema_ddl(
+        config=config,
+        snapshot=snapshot,
+        executor=executor,
+        report_output_path=tmp_path / "ddl-execution.json",
+    )
+
+    assert len(summary.foreign_keys) == 1
+    assert summary.foreign_keys[0].action == "add_foreign_key"
+    assert 'ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_user_id_fkey"' in executor.executed_ddls[-1]

@@ -65,9 +65,16 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
     assert "--color-primary: oklch(0.000 0.000 0)" in html
     assert "이슈 및 권장 조치" in html
     assert "정상 이관 샘플" in html
-    assert "이관 전 source" in html
-    assert "이관 후 target" in html
+    assert "이관 전 원본" in html
+    assert "이관 후 대상" in html
     assert "총 테이블 수" in html
+    assert "총 원본 행 수" in html
+    assert "총 매칭 행 수" in html
+    assert "총 오류 수" in html
+    assert "테이블별 검증 요약" in html
+    assert "원본 행 수" in html
+    assert "대상 행 수" in html
+    assert "매칭 행 수" in html
     assert "전체 상태" in html
     assert "검증 대상 및 기준" in html
     assert "POSTGRESQL" in html
@@ -80,12 +87,21 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
     assert "일치 1, 불일치 0, 실패 0, 건너뜀 0" in html
     assert "일치" in html
     assert "id=1" in html
-    assert "검증 이슈가 없습니다. Source와 target이 일치합니다." in html
+    assert "검증 이슈가 없습니다. 원본과 대상이 일치합니다." in html
 
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["metadata"]["source"]["database"] == "source_db"
     assert summary["metadata"]["target"]["database"] == "target_db"
+    assert summary["summary"]["total_source_rows"] == 1
+    assert summary["summary"]["total_matched_rows"] == 1
+    assert summary["summary"]["total_error_count"] == 0
+    assert summary["table_summaries"][0]["matched_rows"] == 1
     assert summary["tables"][0]["checksum"]["matched_samples"][0]["row_identity"] == "id=1"
+
+    tables_csv = (tmp_path / "tables.csv").read_text(encoding="utf-8")
+    assert "매칭_행수" in tables_csv
+    assert "오류_수" in tables_csv
+    assert "값차이_수" in tables_csv
 
 
 def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
@@ -101,7 +117,7 @@ def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
 
     html = (tmp_path / "summary.html").read_text(encoding="utf-8")
     assert "행 수" in html
-    assert "checksum" in html
+    assert "체크섬" in html
     assert "colspan=\"6\"" in html
     assert "issue-summary" in html
     assert "difference-panel" in html
@@ -110,11 +126,14 @@ def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
     assert "email" in html
     assert "source@example.com" in html
     assert "target@example.com" in html
-    assert "Target에 1행이 부족합니다." in html
+    assert "대상에 1행이 부족합니다." in html
     assert "email의 값 변환을 확인하세요." in html
+    assert "테이블별 검증 요약" in html
+    assert "2" in html
+    assert "1" in html
 
     differences_csv = (tmp_path / "differences.csv").read_text(encoding="utf-8")
-    assert "row_identity" in differences_csv
+    assert "행_식별값" in differences_csv
     assert "row_number" not in differences_csv
     assert "source@example.com" in differences_csv
     assert "target@example.com" in differences_csv

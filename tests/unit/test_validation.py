@@ -11,7 +11,7 @@ from db_migrator.core.validation import (
     validate_tables,
 )
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
-from db_migrator.schema.models import ColumnSchema, PrimaryKey, TableRef, TableSchema
+from db_migrator.schema.models import ColumnSchema, PrimaryKey, SamplePosition, TableRef, TableSchema
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -19,11 +19,19 @@ class FakeValidationReader:
     def __init__(self, counts: dict[tuple[str, str], int], samples: dict[tuple[str, str], tuple[dict, ...]]) -> None:
         self.counts = counts
         self.samples = samples
+        self.sample_calls: list[tuple[str, str, SamplePosition]] = []
 
     def count_rows(self, side: str, table) -> int:
         return self.counts[(side, table.name)]
 
-    def sample_rows(self, side: str, table_schema, sample_size: int) -> tuple[dict, ...]:
+    def sample_rows(
+        self,
+        side: str,
+        table_schema,
+        sample_size: int,
+        position: SamplePosition = SamplePosition.FIRST,
+    ) -> tuple[dict, ...]:
+        self.sample_calls.append((side, table_schema.ref.name, position))
         return self.samples[(side, table_schema.ref.name)][:sample_size]
 
 
@@ -80,6 +88,10 @@ def test_validate_tables_matches_equal_counts_and_samples() -> None:
     assert report.tables[0].checksum.matched_samples[0].row_identity == "id=1"
     assert report.tables[0].checksum.matched_samples[0].source_values["total_amount"] == "10.00"
     assert report.tables[0].checksum.matched_samples[0].target_values["total_amount"] == "10.00"
+    assert ("source", "orders", SamplePosition.FIRST) in reader.sample_calls
+    assert ("source", "orders", SamplePosition.LAST) in reader.sample_calls
+    assert ("target", "orders", SamplePosition.FIRST) in reader.sample_calls
+    assert ("target", "orders", SamplePosition.LAST) in reader.sample_calls
 
 
 def test_validate_tables_normalizes_boolean_tinyint_values() -> None:

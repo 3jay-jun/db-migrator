@@ -19,7 +19,10 @@ def write_validation_report(report: ValidationReport, output_dir: Path) -> None:
 
 
 def _write_json(report: ValidationReport, output_path: Path) -> None:
-    output_path.write_text(json.dumps(asdict(report), ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = asdict(report)
+    payload["summary"] = _summary_metrics(report)
+    payload["table_summaries"] = [_table_metrics(table) for table in report.tables]
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _write_csv(report: ValidationReport, output_path: Path) -> None:
@@ -27,18 +30,24 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
         writer = csv.writer(csv_file)
         writer.writerow(
             [
-                "schema",
-                "table",
-                "status",
-                "source_rows",
-                "target_rows",
-                "row_count_status",
-                "checksum_status",
-                "source_checksum",
-                "target_checksum",
+                "스키마",
+                "테이블",
+                "상태",
+                "원본_행수",
+                "대상_행수",
+                "행수검증_상태",
+                "체크섬_상태",
+                "매칭_행수",
+                "행수_차이",
+                "오류_수",
+                "값차이_수",
+                "정상샘플_수",
+                "원본_체크섬",
+                "대상_체크섬",
             ]
         )
         for table in report.tables:
+            metrics = _table_metrics(table)
             writer.writerow(
                 [
                     table.table.schema,
@@ -48,6 +57,11 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
                     table.row_count.target_rows,
                     table.row_count.status,
                     table.checksum.status,
+                    metrics["matched_rows"],
+                    metrics["row_count_delta"],
+                    metrics["error_count"],
+                    metrics["difference_count"],
+                    metrics["matched_sample_count"],
                     table.checksum.source_checksum,
                     table.checksum.target_checksum,
                 ]
@@ -55,11 +69,12 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
 
 
 def _write_html(report: ValidationReport, output_path: Path) -> None:
+    summary = _summary_metrics(report)
     issue_rows = "\n".join(_issue_rows(table) for table in report.tables if table.status != ValidationStatus.MATCHED)
     if not issue_rows:
         issue_rows = """
           <tr>
-            <td colspan="6" class="empty-state">검증 이슈가 없습니다. Source와 target이 일치합니다.</td>
+            <td colspan="6" class="empty-state">검증 이슈가 없습니다. 원본과 대상이 일치합니다.</td>
           </tr>
         """
     matched_sample_rows = "\n".join(_matched_sample_row(table) for table in report.tables if table.checksum.matched_samples)
@@ -69,6 +84,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
             <td colspan="4" class="empty-state">표시할 정상 이관 샘플이 없습니다.</td>
           </tr>
         """
+    table_summary_rows = "\n".join(_table_summary_row(table) for table in report.tables)
     html = f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -411,13 +427,16 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       <div>
         <div class="eyebrow">검증 리포트</div>
         <h1>DB Migrator 검증 리포트</h1>
-        <p>Source와 target의 행 수와 checksum 샘플 결과를 검토하는 리포트입니다.</p>
+        <p>원본과 대상의 행 수와 체크섬 샘플 결과를 검토하는 리포트입니다.</p>
       </div>
       <div class="summary-grid">
         <div class="metric"><span>작업 ID</span><strong>{escape(report.job_id)}</strong></div>
         <div class="metric"><span>전체 상태</span><strong>{escape(_status_label(report.status))}</strong></div>
         <div class="metric"><span>총 테이블 수</span><strong>{len(report.tables)}</strong></div>
-        <div class="metric"><span>이슈 수</span><strong>{_issue_count(report)}</strong></div>
+        <div class="metric"><span>총 원본 행 수</span><strong>{_format_optional_int(summary["total_source_rows"])}</strong></div>
+        <div class="metric"><span>총 매칭 행 수</span><strong>{_format_optional_int(summary["total_matched_rows"])}</strong></div>
+        <div class="metric"><span>총 오류 수</span><strong>{summary["total_error_count"]}</strong></div>
+        <div class="metric"><span>값 차이 수</span><strong>{summary["total_difference_count"]}</strong></div>
       </div>
     </header>
 
@@ -431,8 +450,30 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
     </section>
 
     <section>
+      <h2>테이블별 검증 요약</h2>
+      <p>각 테이블의 원본/대상 행 수, 매칭 행 수, 오류 수, 체크섬 샘플 차이를 한눈에 확인합니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 12%;">스키마</th>
+            <th style="width: 18%;">테이블명</th>
+            <th style="width: 10%;">상태</th>
+            <th style="width: 12%;">원본 행 수</th>
+            <th style="width: 12%;">대상 행 수</th>
+            <th style="width: 12%;">매칭 행 수</th>
+            <th style="width: 10%;">오류 수</th>
+            <th style="width: 14%;">값 차이/정상 샘플</th>
+          </tr>
+        </thead>
+        <tbody>
+{table_summary_rows}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
       <h2>이슈 및 권장 조치</h2>
-      <p>문제가 있는 테이블만 표시합니다. Checksum 불일치는 테이블명을 클릭하면 전체 폭으로 값 차이를 펼쳐 볼 수 있습니다.</p>
+      <p>문제가 있는 테이블만 표시합니다. 체크섬 불일치는 테이블명을 클릭하면 전체 폭으로 값 차이를 펼쳐 볼 수 있습니다.</p>
       <table>
         <thead>
           <tr>
@@ -509,8 +550,8 @@ def _verification_block(report: ValidationReport) -> str:
         [
             ("실행 시각", report.metadata.generated_at),
             ("샘플 크기", _format_optional_int(report.metadata.checksum_sample_size)),
-            ("Timezone 기준", report.metadata.checksum_timezone or "-"),
-            ("Datetime 정밀도", report.metadata.checksum_datetime_precision or "-"),
+            ("시간대 기준", report.metadata.checksum_timezone or "-"),
+            ("일시 정밀도", report.metadata.checksum_datetime_precision or "-"),
             ("결과 요약", _status_summary(counts)),
         ]
     )
@@ -552,21 +593,85 @@ def _status_summary(counts: dict[str, int]) -> str:
     )
 
 
+def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
+    table_metrics = [_table_metrics(table) for table in report.tables]
+    total_source_rows = _sum_optional_int(metric["source_rows"] for metric in table_metrics)
+    total_target_rows = _sum_optional_int(metric["target_rows"] for metric in table_metrics)
+    return {
+        "table_count": len(report.tables),
+        "matched_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.MATCHED),
+        "mismatched_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.MISMATCHED),
+        "failed_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.FAILED),
+        "skipped_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.SKIPPED),
+        "total_source_rows": total_source_rows,
+        "total_target_rows": total_target_rows,
+        "total_matched_rows": _sum_optional_int(metric["matched_rows"] for metric in table_metrics),
+        "total_row_count_delta": None if total_source_rows is None or total_target_rows is None else total_source_rows - total_target_rows,
+        "total_error_count": sum(int(metric["error_count"]) for metric in table_metrics),
+        "total_difference_count": sum(int(metric["difference_count"]) for metric in table_metrics),
+        "total_matched_sample_count": sum(int(metric["matched_sample_count"]) for metric in table_metrics),
+    }
+
+
+def _table_metrics(table) -> dict[str, int | str | None]:
+    source_rows = table.row_count.source_rows
+    target_rows = table.row_count.target_rows
+    matched_rows = _matched_row_count(table)
+    row_count_delta = None if source_rows is None or target_rows is None else source_rows - target_rows
+    return {
+        "schema": table.table.schema,
+        "table": table.table.name,
+        "status": table.status,
+        "source_rows": source_rows,
+        "target_rows": target_rows,
+        "matched_rows": matched_rows,
+        "row_count_delta": row_count_delta,
+        "error_count": _table_error_count(table),
+        "difference_count": len(table.checksum.differences),
+        "matched_sample_count": len(table.checksum.matched_samples),
+        "row_count_status": table.row_count.status,
+        "checksum_status": table.checksum.status,
+    }
+
+
+def _matched_row_count(table) -> int | None:
+    source_rows = table.row_count.source_rows
+    target_rows = table.row_count.target_rows
+    if source_rows is None or target_rows is None:
+        return None
+    if table.row_count.status == ValidationStatus.MATCHED:
+        return source_rows
+    return min(source_rows, target_rows)
+
+
+def _table_error_count(table) -> int:
+    return int(table.row_count.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}) + int(
+        table.checksum.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}
+    )
+
+
+def _sum_optional_int(values) -> int | None:
+    resolved_values = list(values)
+    if any(value is None for value in resolved_values):
+        return None
+    return sum(int(value) for value in resolved_values)
+
+
 def _write_errors(report: ValidationReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["schema", "table", "validation", "status", "message"])
+        writer.writerow(["스키마", "테이블", "검증항목", "상태", "메시지"])
         for table in report.tables:
             if table.row_count.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
                 writer.writerow([table.table.schema, table.table.name, "row_count", table.row_count.status, table.row_count.message])
             if table.checksum.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
-                writer.writerow([table.table.schema, table.table.name, "checksum", table.checksum.status, table.checksum.message])
+                writer.writerow([table.table.schema, table.table.name, "체크섬", table.checksum.status, table.checksum.message])
 
 
 def _write_differences(report: ValidationReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["schema", "table", "row_identity", "column", "source_value", "target_value"])
+        writer.writerow(["스키마", "테이블", "행_식별값", "컬럼", "원본_값", "대상_값"])
         for table in report.tables:
             for difference in table.checksum.differences:
                 writer.writerow(
@@ -583,6 +688,22 @@ def _write_differences(report: ValidationReport, output_path: Path) -> None:
 
 def _issue_count(report: ValidationReport) -> int:
     return sum(1 for table in report.tables if table.status != ValidationStatus.MATCHED)
+
+
+def _table_summary_row(table) -> str:
+    metrics = _table_metrics(table)
+    return f"""
+          <tr>
+            <td>{escape(str(metrics["schema"]))}</td>
+            <td class="message">{escape(str(metrics["table"]))}</td>
+            <td><span class="badge {escape(str(metrics["status"]))}">{escape(_status_label(str(metrics["status"])))}</span></td>
+            <td>{_format_optional_int(metrics["source_rows"])}</td>
+            <td>{_format_optional_int(metrics["target_rows"])}</td>
+            <td>{_format_optional_int(metrics["matched_rows"])}</td>
+            <td>{metrics["error_count"]}</td>
+            <td>{metrics["difference_count"]} / {metrics["matched_sample_count"]}</td>
+          </tr>
+    """
 
 
 def _issue_rows(table) -> str:
@@ -678,8 +799,8 @@ def _row_count_detail(table) -> str:
     if table.row_count.message:
         return escape(table.row_count.message)
     return (
-        f"source 행 수={_format_optional_int(table.row_count.source_rows)} "
-        f"target 행 수={_format_optional_int(table.row_count.target_rows)}"
+        f"원본 행 수={_format_optional_int(table.row_count.source_rows)} "
+        f"대상 행 수={_format_optional_int(table.row_count.target_rows)}"
     )
 
 
@@ -688,47 +809,47 @@ def _checksum_detail(table) -> str:
         return escape(table.checksum.message)
     if table.checksum.differences:
         difference_count = len(table.checksum.differences)
-        return f"checksum 샘플에서 값 차이 {difference_count}건이 발견되었습니다."
+        return f"체크섬 샘플에서 값 차이 {difference_count}건이 발견되었습니다."
     return (
-        f"source checksum=<code>{escape(_short_checksum(table.checksum.source_checksum))}</code> "
-        f"target checksum=<code>{escape(_short_checksum(table.checksum.target_checksum))}</code>"
+        f"원본 체크섬=<code>{escape(_short_checksum(table.checksum.source_checksum))}</code> "
+        f"대상 체크섬=<code>{escape(_short_checksum(table.checksum.target_checksum))}</code>"
     )
 
 
 def _row_count_action(table) -> str:
     if table.row_count.status == ValidationStatus.FAILED:
-        return "Source/target 행 수 조회 권한을 확인한 뒤 validate를 다시 실행하세요."
+        return "원본/대상 행 수 조회 권한을 확인한 뒤 validate를 다시 실행하세요."
     source_rows = table.row_count.source_rows
     target_rows = table.row_count.target_rows
     if source_rows is None or target_rows is None:
-        return "Source/target 행 수 조회 결과를 확인한 뒤 validate를 다시 실행하세요."
+        return "원본/대상 행 수 조회 결과를 확인한 뒤 validate를 다시 실행하세요."
     if source_rows > target_rows:
         missing_rows = source_rows - target_rows
-        return f"Target에 {missing_rows}행이 부족합니다. 해당 테이블을 migrate-data 또는 resume으로 다시 이관한 뒤 validate를 재실행하세요."
+        return f"대상에 {missing_rows}행이 부족합니다. 해당 테이블을 migrate-data 또는 resume으로 다시 이관한 뒤 validate를 재실행하세요."
     if target_rows > source_rows:
         extra_rows = target_rows - source_rows
-        return f"Target에 {extra_rows}행이 더 많습니다. 중복 데이터나 기존 target 잔여 데이터를 확인한 뒤 재시도하세요."
-    return "행 수는 일치합니다. checksum 상세에서 값 단위 차이를 확인하세요."
+        return f"대상에 {extra_rows}행이 더 많습니다. 중복 데이터나 기존 대상 잔여 데이터를 확인한 뒤 재시도하세요."
+    return "행 수는 일치합니다. 체크섬 상세에서 값 단위 차이를 확인하세요."
 
 
 def _checksum_action(table) -> str:
     if table.checksum.status == ValidationStatus.FAILED:
         return "샘플 조회 권한, 지원하지 않는 컬럼 값, 정규화 설정을 확인하세요."
     if not table.checksum.differences:
-        return "Checksum은 다르지만 샘플 값에서 컬럼 차이를 찾지 못했습니다. checksum_sample_size를 늘린 뒤 validate를 재실행하세요."
+        return "체크섬은 다르지만 샘플 값에서 컬럼 차이를 찾지 못했습니다. 체크섬 샘플 크기를 늘린 뒤 검증을 재실행하세요."
 
     columns = _difference_columns(table)
     if _has_row_presence_difference(table):
         return f"{columns} 기준 샘플 행 구성이 다릅니다. 기본키와 행 수를 확인한 뒤 해당 테이블을 다시 검증하세요."
     if _has_missing_column_difference(table):
-        return f"{columns} 컬럼이 한쪽에 없습니다. SELECT 컬럼 목록, generated column, target DDL을 확인하세요."
+        return f"{columns} 컬럼이 한쪽에 없습니다. 조회 컬럼 목록, 생성 컬럼, 대상 DDL을 확인하세요."
     if _has_temporal_difference(table):
         return f"{columns}의 timezone 또는 초 이하 정밀도를 확인하세요. 타입 매핑/정규화 설정을 맞춘 뒤 영향 행을 재이관하세요."
     if _has_numeric_difference(table):
-        return f"{columns}의 숫자 정밀도, scale, 반올림 여부를 확인하세요. target 컬럼 타입을 맞춘 뒤 영향 행을 재이관하세요."
+        return f"{columns}의 숫자 정밀도, 소수 자릿수, 반올림 여부를 확인하세요. 대상 컬럼 타입을 맞춘 뒤 영향 행을 재이관하세요."
     if _has_json_difference(table):
-        return f"{columns}의 JSON 직렬화 방식을 확인하세요. json/jsonb 의미 차이와 정규화된 payload를 비교하세요."
-    return f"{columns}의 값 변환을 확인하세요. 정규화 후에도 source/target 샘플 값이 다릅니다."
+        return f"{columns}의 JSON 직렬화 방식을 확인하세요. json/jsonb 의미 차이와 정규화된 페이로드를 비교하세요."
+    return f"{columns}의 값 변환을 확인하세요. 정규화 후에도 원본/대상 샘플 값이 다릅니다."
 
 
 def _format_optional_int(value: int | None) -> str:
@@ -753,7 +874,7 @@ def _status_label(status: str) -> str:
 def _validation_label(validation: str) -> str:
     return {
         "row_count": "행 수",
-        "checksum": "Checksum",
+        "checksum": "체크섬",
     }.get(validation, validation)
 
 
@@ -851,10 +972,10 @@ def _difference_panel(table) -> str:
         <table>
           <thead>
             <tr>
-              <th style="width: 28%;">row identity</th>
+              <th style="width: 28%;">행 식별값</th>
               <th style="width: 18%;">컬럼명</th>
-              <th style="width: 27%;">source 값</th>
-              <th style="width: 27%;">target 값</th>
+              <th style="width: 27%;">원본 값</th>
+              <th style="width: 27%;">대상 값</th>
             </tr>
           </thead>
           <tbody>
@@ -899,9 +1020,9 @@ def _matched_sample_panel(table) -> str:
         <table>
           <thead>
             <tr>
-              <th style="width: 22%;">row identity</th>
-              <th style="width: 39%;">이관 전 source</th>
-              <th style="width: 39%;">이관 후 target</th>
+              <th style="width: 22%;">행 식별값</th>
+              <th style="width: 39%;">이관 전 원본</th>
+              <th style="width: 39%;">이관 후 대상</th>
             </tr>
           </thead>
           <tbody>

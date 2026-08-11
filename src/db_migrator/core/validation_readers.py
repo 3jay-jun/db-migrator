@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from db_migrator.core.dml_migration import stable_order_columns
-from db_migrator.schema.models import RowData, TableRef, TableSchema
+from db_migrator.schema.models import RowData, SamplePosition, TableRef, TableSchema
 
 
 class ValidationRowReader(Protocol):
@@ -16,6 +16,7 @@ class ValidationRowReader(Protocol):
         columns: tuple[str, ...],
         sample_size: int,
         order_by: tuple[str, ...],
+        position: SamplePosition = SamplePosition.FIRST,
     ) -> tuple[RowData, ...]:
         """Return deterministic sample rows for checksum validation."""
 
@@ -32,11 +33,17 @@ class SourceTargetValidationReader:
             return self._target.count_rows(table)
         raise ValueError(f"Unknown validation side: {side}")
 
-    def sample_rows(self, side: str, table_schema: TableSchema, sample_size: int) -> tuple[RowData, ...]:
+    def sample_rows(
+        self,
+        side: str,
+        table_schema: TableSchema,
+        sample_size: int,
+        position: SamplePosition = SamplePosition.FIRST,
+    ) -> tuple[RowData, ...]:
         columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
         order_by = stable_order_columns(table_schema, columns)
         if side == "source":
-            return self._source.sample_rows(table_schema.ref, columns, sample_size, order_by)
+            return self._source.sample_rows(table_schema.ref, columns, sample_size, order_by, position)
         if side == "target":
-            return self._target.sample_rows(table_schema.ref, columns, sample_size, order_by)
+            return self._target.sample_rows(table_schema.ref, columns, sample_size, order_by, position)
         raise ValueError(f"Unknown validation side: {side}")
