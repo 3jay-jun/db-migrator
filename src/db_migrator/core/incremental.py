@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from db_migrator.config.models import IncrementalConfig, MigrationConfig, WatermarkConfig
 from db_migrator.schema.models import RowBatch, RowData, TableRef, TableSchema, WriteResult
@@ -34,6 +34,7 @@ class IncrementalTableResult:
     rows_upserted: int
     batches_upserted: int
     watermark_column: str | None
+    target_table: TableRef | None = None
     message: str | None = None
 
 
@@ -56,6 +57,7 @@ def migrate_incremental_tables(
     target: IncrementalTargetWriter,
     migration_config: MigrationConfig,
     incremental_config: IncrementalConfig,
+    target_table_resolver: Callable[[TableRef], TableRef] | None = None,
 ) -> IncrementalMigrationReport:
     results = tuple(
         _migrate_one_incremental_table(
@@ -64,6 +66,7 @@ def migrate_incremental_tables(
             target=target,
             migration_config=migration_config,
             incremental_config=incremental_config,
+            target_table_resolver=target_table_resolver,
         )
         for table in tables
     )
@@ -77,7 +80,9 @@ def _migrate_one_incremental_table(
     target: IncrementalTargetWriter,
     migration_config: MigrationConfig,
     incremental_config: IncrementalConfig,
+    target_table_resolver: Callable[[TableRef], TableRef] | None,
 ) -> IncrementalTableResult:
+    target_table = target_table_resolver(table.ref) if target_table_resolver is not None else None
     watermark = incremental_config.watermarks.get(table.ref.name)
     if watermark is None:
         return IncrementalTableResult(
@@ -86,6 +91,7 @@ def _migrate_one_incremental_table(
             rows_upserted=0,
             batches_upserted=0,
             watermark_column=None,
+            target_table=target_table,
             message="Watermark column is not configured.",
         )
 
@@ -97,6 +103,7 @@ def _migrate_one_incremental_table(
             rows_upserted=0,
             batches_upserted=0,
             watermark_column=watermark.column,
+            target_table=target_table,
             message="Upsert requires primary key or unique index.",
         )
 
@@ -117,6 +124,7 @@ def _migrate_one_incremental_table(
                     rows_upserted=rows_upserted,
                     batches_upserted=batches_upserted,
                     watermark_column=watermark.column,
+                    target_table=target_table,
                     message=write_result.message,
                 )
             rows_upserted += write_result.rows_written
@@ -131,6 +139,7 @@ def _migrate_one_incremental_table(
             rows_upserted=rows_upserted,
             batches_upserted=batches_upserted,
             watermark_column=watermark.column,
+            target_table=target_table,
             message=str(exc),
         )
 
@@ -140,6 +149,7 @@ def _migrate_one_incremental_table(
         rows_upserted=rows_upserted,
         batches_upserted=batches_upserted,
         watermark_column=watermark.column,
+        target_table=target_table,
     )
 
 

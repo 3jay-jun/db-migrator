@@ -1,4 +1,4 @@
-# DB Migrator
+# Jigration
 
 PostgreSQL 데이터를 MariaDB/MySQL로 안전하게 이관하기 위한 Python CLI 도구입니다.
 
@@ -14,6 +14,17 @@ uv run pytest
 ```
 
 `uv`가 없다면 Python 3.11+ 가상환경을 만들고 프로젝트를 `test` extra와 함께 설치하세요.
+
+## Windows GUI
+
+PySide6 기반 네이티브 GUI도 제공합니다. GUI는 CLI와 같은 application service를 사용하므로 이관 로직은 중복 구현하지 않습니다.
+
+```powershell
+uv sync --extra gui --extra test
+uv run jigration-gui
+```
+
+Windows onedir zip 빌드 방법은 `docs/gui.md`를 참고하세요.
 
 ## config.yml 작성
 
@@ -87,7 +98,7 @@ uv run db-migrator migrate-data --config config.yml --checkpoint-db checkpoints/
 
 PostgreSQL에서 batch read하고, MySQL/MariaDB에 batch write합니다. PK/unique key가 있는 table은 keyset cursor를 사용해 마지막 성공 key를 SQLite checkpoint에 저장하고, PK/unique key가 없으면 offset resume으로 fallback합니다. offset fallback table은 dry-run/report에 `high risk: offset resume only` warning이 표시됩니다.
 
-이미 같은 `job.name + table`의 완료 checkpoint가 있고 target row도 남아 있으면, 기본 `migrate-data`는 중복 삽입을 막기 위해 해당 table을 skip합니다. 같은 작업을 이어가려면 `resume` 또는 `retry-failed`를 사용하고, 처음부터 다시 맞추려면 `truncate_reload`, `sync`, 또는 새 `job.name`을 사용하세요.
+이미 같은 `job.name + table`의 완료 checkpoint가 있고 target row도 남아 있으면, 기본 `migrate-data`는 중복 삽입을 막기 위해 해당 table을 skip합니다. 같은 작업을 이어가려면 `resume` 또는 `retry-failed`를 사용하고, 처음부터 다시 맞추려면 `sync`, `overwrite`, 또는 새 `job.name`을 사용하세요.
 
 6. 중단 또는 실패 후 재개
 
@@ -158,13 +169,11 @@ uv run db-migrator migrate-data --help
 
 `existing_table_policy` 값:
 - `skip`: 기존 table은 건너뜀
-- `compare_only`: 비교만 수행
 - `append`: 기존 table에 insert
 - `sync`: source 기준으로 target row를 upsert/delete
-- `truncate_reload`: truncate 후 재적재
-- `overwrite`: overwrite 계열 작업
+- `overwrite`: 기존 target table을 drop 후 다시 생성
 
-운영 환경에서 destructive 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. `sync`, `truncate_reload`, `overwrite`는 target 데이터를 삭제하거나 덮어쓸 수 있으므로 처음 검증은 `skip`으로 시작하세요.
+운영 환경에서 destructive 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. `sync`, `overwrite`는 target 데이터를 삭제하거나 덮어쓸 수 있으므로 처음 검증은 `skip`으로 시작하세요. `overwrite` DDL 실행 기록은 리포트 디렉터리의 `overwrite-audit.sqlite`에 남습니다.
 
 ## 운영 기준 동기화
 
@@ -196,6 +205,18 @@ incremental:
   watermarks:
     users:
       column: updated_at
+      start_value: "2026-01-01T00:00:00"
+      end_value: "2026-02-01T00:00:00"
+```
+
+GUI에서는 테이블별 target명과 watermark 설정을 `tables` 섹션에 저장합니다. source 읽기는 원본 테이블을 사용하고, target DDL/DML/검증 리포트는 매핑된 target 테이블명을 사용합니다.
+
+```yaml
+tables:
+  public.users:
+    target_table: app_users
+    incremental:
+      watermark_column: updated_at
       start_value: "2026-01-01T00:00:00"
       end_value: "2026-02-01T00:00:00"
 ```

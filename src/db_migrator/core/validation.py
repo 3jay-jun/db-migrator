@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from db_migrator.config.models import VerificationConfig
@@ -89,6 +89,7 @@ class TableValidationResult:
     table: TableRef
     row_count: RowCountValidationResult
     checksum: ChecksumValidationResult
+    target_table: TableRef | None = None
 
     @property
     def status(self) -> str:
@@ -135,6 +136,7 @@ def validate_tables(
     reader: ValidationReader,
     verification: VerificationConfig,
     metadata: ValidationMetadata | None = None,
+    target_table_resolver: Callable[[TableRef], TableRef] | None = None,
 ) -> ValidationReport:
     profile = NormalizationProfile(
         datetime_precision=verification.checksum_datetime_precision,
@@ -144,7 +146,7 @@ def validate_tables(
     return ValidationReport(
         job_id=job_id,
         metadata=metadata or _default_metadata(verification),
-        tables=tuple(_validate_one_table(table, reader, verification, profile) for table in tables),
+        tables=tuple(_validate_one_table(table, reader, verification, profile, target_table_resolver) for table in tables),
     )
 
 
@@ -162,11 +164,13 @@ def _validate_one_table(
     reader: ValidationReader,
     verification: VerificationConfig,
     profile: NormalizationProfile,
+    target_table_resolver: Callable[[TableRef], TableRef] | None,
 ) -> TableValidationResult:
     table_profile = _profile_for_table(table, profile)
     row_count = _validate_row_count(table, reader) if verification.row_count else _skipped_row_count(table)
     checksum = _validate_checksum(table, reader, verification.checksum_sample_size, table_profile) if verification.checksum_sample else _skipped_checksum(table, table_profile)
-    return TableValidationResult(table=table.ref, row_count=row_count, checksum=checksum)
+    target_table = target_table_resolver(table.ref) if target_table_resolver is not None else None
+    return TableValidationResult(table=table.ref, row_count=row_count, checksum=checksum, target_table=target_table)
 
 
 def _validate_row_count(table: TableSchema, reader: ValidationReader) -> RowCountValidationResult:

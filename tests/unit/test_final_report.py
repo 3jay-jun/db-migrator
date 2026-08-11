@@ -61,7 +61,7 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
     assert (tmp_path / "differences.csv").exists()
 
     html = (tmp_path / "summary.html").read_text(encoding="utf-8")
-    assert "DB Migrator 검증 리포트" in html
+    assert "Jigration 검증 리포트" in html
     assert "--color-primary: oklch(0.000 0.000 0)" in html
     assert "이슈 및 권장 조치" in html
     assert "정상 이관 샘플" in html

@@ -27,7 +27,7 @@ def _write_tables_csv(report: IncrementalMigrationReport, output_path: Path) -> 
             writer.writerow(
                 [
                     table.table.schema,
-                    table.table.name,
+                    _table_label(table),
                     table.status,
                     table.rows_upserted,
                     table.batches_upserted,
@@ -39,7 +39,7 @@ def _write_tables_csv(report: IncrementalMigrationReport, output_path: Path) -> 
 
 def _write_html(report: IncrementalMigrationReport, output_path: Path) -> None:
     rows = "\n".join(
-        f"<tr><td>{table.table.schema}</td><td>{table.table.name}</td><td>{table.status}</td>"
+        f"<tr><td>{table.table.schema}</td><td>{_table_label(table)}</td><td>{table.status}</td>"
         f"<td>{table.rows_upserted}</td><td>{table.watermark_column}</td></tr>"
         for table in report.tables
     )
@@ -47,10 +47,10 @@ def _write_html(report: IncrementalMigrationReport, output_path: Path) -> None:
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <title>DB Migrator Incremental Report</title>
+  <title>Jigration Incremental Report</title>
 </head>
 <body>
-  <h1>DB Migrator Incremental Report</h1>
+  <h1>Jigration Incremental Report</h1>
   <p>job_id={report.job_id} rows_upserted={report.rows_upserted}</p>
   <p>delete_sync_supported={str(report.delete_sync_supported).lower()}</p>
   <table>
@@ -70,3 +70,13 @@ def _write_delete_policy(report: IncrementalMigrationReport, output_path: Path) 
         "DELETE sync is not supported automatically. Review and handle deletes manually.\n",
         encoding="utf-8",
     )
+
+
+def _table_label(table) -> str:
+    source_label = f"{table.table.schema}.{table.table.name}"
+    if table.target_table is None:
+        return table.table.name
+    target_label = f"{table.target_table.schema}.{table.target_table.name}"
+    if source_label == target_label:
+        return table.table.name
+    return f"{source_label} -> {target_label}"

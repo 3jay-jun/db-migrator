@@ -44,7 +44,7 @@ def test_dry_run_report_writes_summary_files(tmp_path) -> None:
     assert summary["metadata"]["target"]["database"] == "target_db"
 
     html = (tmp_path / "summary.html").read_text(encoding="utf-8")
-    assert "DB Migrator Dry-run 리포트" in html
+    assert "Jigration Dry-run 리포트" in html
     assert "이관 정보" in html
     assert "원본 DB" in html
     assert "대상 DB" in html

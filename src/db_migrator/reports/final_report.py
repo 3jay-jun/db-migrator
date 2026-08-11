@@ -50,8 +50,8 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
             metrics = _table_metrics(table)
             writer.writerow(
                 [
-                    table.table.schema,
-                    table.table.name,
+                    metrics["schema"],
+                    metrics["table"],
                     table.status,
                     table.row_count.source_rows,
                     table.row_count.target_rows,
@@ -89,7 +89,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <title>DB Migrator 검증 리포트</title>
+  <title>Jigration 검증 리포트</title>
   <style>
     :root {{
       color-scheme: light;
@@ -426,7 +426,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
     <header>
       <div>
         <div class="eyebrow">검증 리포트</div>
-        <h1>DB Migrator 검증 리포트</h1>
+        <h1>Jigration 검증 리포트</h1>
         <p>원본과 대상의 행 수와 체크섬 샘플 결과를 검토하는 리포트입니다.</p>
       </div>
       <div class="summary-grid">
@@ -620,7 +620,9 @@ def _table_metrics(table) -> dict[str, int | str | None]:
     row_count_delta = None if source_rows is None or target_rows is None else source_rows - target_rows
     return {
         "schema": table.table.schema,
-        "table": table.table.name,
+        "table": _table_label(table),
+        "source_table": _qualified_table_label(table.table),
+        "target_table": _qualified_table_label(table.target_table) if table.target_table is not None else None,
         "status": table.status,
         "source_rows": source_rows,
         "target_rows": target_rows,
@@ -632,6 +634,21 @@ def _table_metrics(table) -> dict[str, int | str | None]:
         "row_count_status": table.row_count.status,
         "checksum_status": table.checksum.status,
     }
+
+
+def _table_label(table) -> str:
+    source_label = _qualified_table_label(table.table)
+    target_table = table.target_table
+    if target_table is None:
+        return table.table.name
+    target_label = _qualified_table_label(target_table)
+    if source_label == target_label:
+        return table.table.name
+    return f"{source_label} -> {target_label}"
+
+
+def _qualified_table_label(table_ref) -> str:
+    return f"{table_ref.schema}.{table_ref.name}"
 
 
 def _matched_row_count(table) -> int | None:
@@ -662,10 +679,11 @@ def _write_errors(report: ValidationReport, output_path: Path) -> None:
         writer = csv.writer(csv_file)
         writer.writerow(["스키마", "테이블", "검증항목", "상태", "메시지"])
         for table in report.tables:
+            metrics = _table_metrics(table)
             if table.row_count.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
-                writer.writerow([table.table.schema, table.table.name, "row_count", table.row_count.status, table.row_count.message])
+                writer.writerow([metrics["schema"], metrics["table"], "row_count", table.row_count.status, table.row_count.message])
             if table.checksum.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
-                writer.writerow([table.table.schema, table.table.name, "체크섬", table.checksum.status, table.checksum.message])
+                writer.writerow([metrics["schema"], metrics["table"], "체크섬", table.checksum.status, table.checksum.message])
 
 
 def _write_differences(report: ValidationReport, output_path: Path) -> None:
@@ -673,11 +691,12 @@ def _write_differences(report: ValidationReport, output_path: Path) -> None:
         writer = csv.writer(csv_file)
         writer.writerow(["스키마", "테이블", "행_식별값", "컬럼", "원본_값", "대상_값"])
         for table in report.tables:
+            metrics = _table_metrics(table)
             for difference in table.checksum.differences:
                 writer.writerow(
                     [
-                        table.table.schema,
-                        table.table.name,
+                        metrics["schema"],
+                        metrics["table"],
                         difference.row_identity,
                         difference.column,
                         difference.source_value,
@@ -708,11 +727,12 @@ def _table_summary_row(table) -> str:
 
 def _issue_rows(table) -> str:
     rows = []
+    metrics = _table_metrics(table)
     if table.row_count.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
         rows.append(
             _issue_row(
-                schema=table.table.schema,
-                table=table.table.name,
+                schema=str(metrics["schema"]),
+                table=str(metrics["table"]),
                 validation="row_count",
                 status=table.row_count.status,
                 detail=_row_count_detail(table),
@@ -722,8 +742,8 @@ def _issue_rows(table) -> str:
     if table.checksum.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}:
         rows.append(
             _issue_row(
-                schema=table.table.schema,
-                table=table.table.name,
+                schema=str(metrics["schema"]),
+                table=str(metrics["table"]),
                 validation="checksum",
                 status=table.checksum.status,
                 detail=_checksum_detail(table),
@@ -987,13 +1007,14 @@ def _difference_panel(table) -> str:
 
 
 def _matched_sample_row(table) -> str:
+    metrics = _table_metrics(table)
     return f"""
           <tr>
             <td colspan="4">
               <details>
                 <summary class="matched-summary">
-                  <span>{escape(table.table.schema)}</span>
-                  <span class="summary-table">{escape(table.table.name)}</span>
+                  <span>{escape(str(metrics["schema"]))}</span>
+                  <span class="summary-table">{escape(str(metrics["table"]))}</span>
                   <span><span class="badge {escape(table.status)}">{escape(_status_label(table.status))}</span></span>
                   <span>정상 샘플 {len(table.checksum.matched_samples)}건. 클릭하면 이관 전 -> 이관 후 값을 비교합니다.</span>
                 </summary>

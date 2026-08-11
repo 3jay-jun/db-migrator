@@ -54,6 +54,7 @@ class TargetConfig(BaseModel):
     host: str = "localhost"
     port: int = Field(default=3306, gt=0, le=65535)
     database: str = Field(default="target", min_length=1)
+    schema_name: str | None = Field(default=None, alias="schema", min_length=1)
     user: str = Field(default="migration_user", min_length=1)
     password: str | None = None
     environment: TargetEnvironment = TargetEnvironment.STAGING
@@ -105,6 +106,18 @@ class IncrementalConfig(BaseModel):
     delete_sync: bool = False
 
 
+class TableIncrementalConfig(BaseModel):
+    watermark_column: str | None = Field(default=None, min_length=1)
+    start_value: str | None = None
+    end_value: str | None = None
+
+
+class TableRunConfig(BaseModel):
+    target_schema: str | None = Field(default=None, min_length=1)
+    target_table: str | None = Field(default=None, min_length=1)
+    incremental: TableIncrementalConfig = Field(default_factory=TableIncrementalConfig)
+
+
 class AppConfig(BaseModel):
     job: JobConfig = Field(default_factory=JobConfig)
     source: SourceConfig = Field(default_factory=SourceConfig)
@@ -114,3 +127,4 @@ class AppConfig(BaseModel):
     report: ReportConfig = Field(default_factory=ReportConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     incremental: IncrementalConfig = Field(default_factory=IncrementalConfig)
+    tables: dict[str, TableRunConfig] = Field(default_factory=dict)

@@ -396,6 +396,10 @@ class MySqlTargetAdapter:
         ddl = f"TRUNCATE TABLE {self._qualified_table_name(table_schema)}"
         return self.execute_ddl(ddl)
 
+    def drop_table(self, table_schema: TableSchema) -> ExecutionResult:
+        ddl = f"DROP TABLE {self._qualified_table_name(table_schema)}"
+        return self.execute_ddl(ddl)
+
     def write_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...]) -> WriteResult:
         if not rows:
             return WriteResult(success=True, rows_written=0, message="No rows to write.")

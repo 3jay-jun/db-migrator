@@ -132,7 +132,7 @@ def _write_html(report: DryRunReport, output_path: Path) -> None:
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <title>DB Migrator Dry-run 리포트</title>
+  <title>Jigration Dry-run 리포트</title>
   <style>
     :root {{
       color-scheme: light;
@@ -379,7 +379,7 @@ def _write_html(report: DryRunReport, output_path: Path) -> None:
     <header>
       <div>
         <div class="eyebrow">Dry-run 리포트</div>
-        <h1>DB Migrator Dry-run 리포트</h1>
+        <h1>Jigration Dry-run 리포트</h1>
         <p>Target DDL을 실행하기 전에 스키마 변환 위험과 조치사항을 검토하는 리포트입니다.</p>
       </div>
       <div class="summary-grid">

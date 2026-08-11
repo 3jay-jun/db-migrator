@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -21,6 +22,7 @@ class FakeDdlExecutor:
         self.existing_tables = existing_tables or set()
         self.executed_ddls: list[str] = []
         self.truncated_tables: list[str] = []
+        self.dropped_tables: list[str] = []
 
     def table_exists(self, table_schema) -> bool:
         return table_schema.ref.name in self.existing_tables
@@ -32,6 +34,10 @@ class FakeDdlExecutor:
     def truncate_table(self, table_schema) -> ExecutionResult:
         self.truncated_tables.append(table_schema.ref.name)
         return ExecutionResult(success=True, message="truncated")
+
+    def drop_table(self, table_schema) -> ExecutionResult:
+        self.dropped_tables.append(table_schema.ref.name)
+        return ExecutionResult(success=True, message="dropped")
 
 
 def test_execute_schema_ddl_creates_missing_tables(tmp_path: Path) -> None:
@@ -120,6 +126,32 @@ def test_execute_schema_ddl_truncates_existing_table_after_dry_run_requirement(t
 
     assert summary.allowed is True
     assert executor.truncated_tables == ["users", "orders"]
+
+
+def test_execute_schema_ddl_overwrites_existing_table_and_writes_audit_log(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    config = AppConfig(
+        safety=SafetyConfig(allow_destructive_on_production=True),
+        migration=MigrationConfig(existing_table_policy=ExistingTablePolicy.OVERWRITE),
+    )
+    executor = FakeDdlExecutor(existing_tables={"users"})
+
+    summary = execute_schema_ddl(
+        config=config,
+        snapshot=snapshot,
+        executor=executor,
+        report_output_path=tmp_path / "ddl-execution.json",
+    )
+
+    assert summary.allowed is True
+    assert executor.dropped_tables == ["users"]
+    assert len(executor.executed_ddls) == 2
+    with sqlite3.connect(tmp_path / "overwrite-audit.sqlite") as connection:
+        runs = connection.execute("select job_id, status, table_count from overwrite_runs").fetchall()
+        actions = connection.execute("select source_table, action, status from overwrite_table_actions").fetchall()
+    assert runs == [("db-migration-job", "completed", 2)]
+    assert ("users", "drop", "completed") in actions
+    assert ("users", "create", "completed") in actions
 
 
 def test_execute_schema_ddl_can_apply_postgres_foreign_keys(tmp_path: Path) -> None:
