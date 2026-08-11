@@ -17,10 +17,12 @@ from db_migrator.adapters.mysql import MySqlAdapterError
 from db_migrator.adapters.registry import AdapterRegistryError, default_adapter_registry
 from db_migrator.adapters.postgres import PostgresAdapterError
 from db_migrator.config.loader import ConfigLoadError, load_config
+from db_migrator.config.models import IndexApplyTiming
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
 from db_migrator.core.dml_migration import migrate_tables
 from db_migrator.core.events import EventLevel, EventPublisher, EventType, MigrationEvent, QueueEventPublisher
+from db_migrator.core.indexes import execute_index_ddls
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation import ValidationStatus
 from db_migrator.core.validation_readers import SourceTargetValidationReader
@@ -29,6 +31,7 @@ from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.metadata import ReportEndpoint
 from db_migrator.schema.dependency import plan_table_creation_order
 from db_migrator.schema.models import SchemaSnapshot, TableSchema
+from db_migrator.schema.table_mapping import TableMappingResolver
 
 
 DOCKER_MISSING_MESSAGE = "Docker is not installed or not running. Self-test requires Docker Desktop."
@@ -352,6 +355,7 @@ def _run_migration_flow(
     target = registry.create_target(app_config.target)
     _publish_selftest_event(event_publisher, app_config.job.name, EventType.CONNECTION_TESTED, "Scanning source schema.")
     snapshot = source.scan_schema(app_config.source.schema_name)
+    target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
     ordered_tables = _dependency_ordered_tables(snapshot.tables)
     _publish_selftest_event(
         event_publisher,
@@ -368,6 +372,8 @@ def _run_migration_flow(
 
     dry_run_report = build_dry_run_report(
         snapshot,
+        source_snapshot=snapshot,
+        source_dbms=app_config.source.dbms,
         target_dbms=app_config.target.dbms,
         target_database=app_config.target.database,
         metadata=DryRunMetadata(
@@ -414,6 +420,15 @@ def _run_migration_flow(
         migration_config=app_config.migration,
     )
 
+    execute_index_ddls(
+        config=app_config,
+        snapshot=target_snapshot,
+        executor=target,
+        phase=IndexApplyTiming.POST_DATA,
+        report_output_path=report_root / "index-execution-post-data.json",
+    )
+    _publish_selftest_event(event_publisher, app_config.job.name, EventType.PLAN_CREATED, "Target indexes executed.")
+
     validation_report = validate_tables(
         job_id=app_config.job.name,
         tables=ordered_tables,
@@ -434,6 +449,8 @@ def _run_migration_flow(
                 port=app_config.target.port,
                 database=app_config.target.database,
             ),
+            migration_mode=app_config.migration.mode.value,
+            existing_table_policy=app_config.migration.existing_table_policy.value,
             checksum_sample_size=app_config.verification.checksum_sample_size,
             checksum_timezone=app_config.verification.checksum_timezone,
             checksum_datetime_precision=app_config.verification.checksum_datetime_precision,

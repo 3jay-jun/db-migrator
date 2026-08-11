@@ -7,6 +7,7 @@ from html import escape
 from pathlib import Path
 
 from db_migrator.core.validation import ValidationReport, ValidationStatus
+from db_migrator.reports.labels import display_timestamp, option_label, result_label
 
 
 def write_validation_report(report: ValidationReport, output_dir: Path) -> None:
@@ -16,6 +17,7 @@ def write_validation_report(report: ValidationReport, output_dir: Path) -> None:
     _write_html(report, output_dir / "summary.html")
     _write_errors(report, output_dir / "errors.csv")
     _write_differences(report, output_dir / "differences.csv")
+    _write_schema_objects(report, output_dir / "schema-objects.csv")
 
 
 def _write_json(report: ValidationReport, output_path: Path) -> None:
@@ -71,17 +73,21 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
 def _write_html(report: ValidationReport, output_path: Path) -> None:
     summary = _summary_metrics(report)
     issue_rows = "\n".join(_issue_rows(table) for table in report.tables if table.status != ValidationStatus.MATCHED)
+    schema_object_rows = "\n".join(
+        _schema_object_row(schema_object)
+        for schema_object in report.schema_objects
+        if _is_schema_object_action_required(schema_object.status)
+    )
+    if not schema_object_rows:
+        schema_object_rows = """
+          <tr>
+            <td colspan="6" class="empty-state">스키마 객체 관련 이슈 및 조치사항이 없습니다.</td>
+          </tr>
+        """
     if not issue_rows:
         issue_rows = """
           <tr>
-            <td colspan="6" class="empty-state">검증 이슈가 없습니다. 원본과 대상이 일치합니다.</td>
-          </tr>
-        """
-    matched_sample_rows = "\n".join(_matched_sample_row(table) for table in report.tables if table.checksum.matched_samples)
-    if not matched_sample_rows:
-        matched_sample_rows = """
-          <tr>
-            <td colspan="4" class="empty-state">표시할 정상 이관 샘플이 없습니다.</td>
+            <td colspan="6" class="empty-state">테이블 관련 이슈 및 조치사항이 없습니다.</td>
           </tr>
         """
     table_summary_rows = "\n".join(_table_summary_row(table) for table in report.tables)
@@ -357,6 +363,39 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       outline: 2px solid var(--color-primary);
       outline-offset: 2px;
     }}
+    details.table-summary-details {{
+      width: 100%;
+    }}
+    .table-summary {{
+      display: grid;
+      grid-template-columns: 10% 16% 10% 12% 12% 12% 14% 14%;
+      align-items: start;
+      min-height: 48px;
+      cursor: pointer;
+      list-style: none;
+    }}
+    .table-summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .table-summary > span {{
+      padding: var(--space-150) var(--space-200);
+      color: var(--color-text-normal);
+      font-size: 14px;
+      line-height: 20px;
+      word-break: break-word;
+    }}
+    .table-summary > .summary-table {{
+      color: var(--color-primary);
+      font-weight: 700;
+    }}
+    .table-summary:hover > span {{
+      background: var(--color-canvas-200);
+    }}
+    .table-summary:focus-visible {{
+      border-radius: var(--radius-200);
+      outline: 2px solid var(--color-primary);
+      outline-offset: 2px;
+    }}
     .difference-panel {{
       margin: 0 var(--space-200) var(--space-200);
       border: 1px solid var(--color-border);
@@ -371,31 +410,6 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       padding: var(--space-100) var(--space-150);
       font-size: 13px;
       line-height: 19px;
-    }}
-    .matched-summary {{
-      display: grid;
-      grid-template-columns: 16% 24% 18% 42%;
-      align-items: start;
-      min-height: 48px;
-      cursor: pointer;
-      list-style: none;
-    }}
-    .matched-summary::-webkit-details-marker {{
-      display: none;
-    }}
-    .matched-summary > span {{
-      padding: var(--space-150) var(--space-200);
-      color: var(--color-text-normal);
-      font-size: 14px;
-      line-height: 20px;
-      word-break: break-word;
-    }}
-    .matched-summary > .summary-table {{
-      color: var(--color-primary);
-      font-weight: 700;
-    }}
-    .matched-summary:hover > span {{
-      background: var(--color-canvas-200);
     }}
     .matched-panel {{
       margin: 0 var(--space-200) var(--space-200);
@@ -427,16 +441,15 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       <div>
         <div class="eyebrow">검증 리포트</div>
         <h1>Jigration 검증 리포트</h1>
-        <p>원본과 대상의 행 수와 체크섬 샘플 결과를 검토하는 리포트입니다.</p>
+        <p>이관 결과가 성공인지, 실패했다면 어느 테이블의 어떤 검증이 실패했는지 확인하는 리포트입니다.</p>
       </div>
       <div class="summary-grid">
-        <div class="metric"><span>작업 ID</span><strong>{escape(report.job_id)}</strong></div>
-        <div class="metric"><span>전체 상태</span><strong>{escape(_status_label(report.status))}</strong></div>
+        <div class="metric"><span>검증 결과</span><strong>{escape(result_label(report.status))}</strong></div>
         <div class="metric"><span>총 테이블 수</span><strong>{len(report.tables)}</strong></div>
-        <div class="metric"><span>총 원본 행 수</span><strong>{_format_optional_int(summary["total_source_rows"])}</strong></div>
-        <div class="metric"><span>총 매칭 행 수</span><strong>{_format_optional_int(summary["total_matched_rows"])}</strong></div>
-        <div class="metric"><span>총 오류 수</span><strong>{summary["total_error_count"]}</strong></div>
-        <div class="metric"><span>값 차이 수</span><strong>{summary["total_difference_count"]}</strong></div>
+        <div class="metric"><span>전체 데이터 수</span><strong>{_format_optional_int(summary["total_source_rows"])}</strong></div>
+        <div class="metric"><span>총 이관 수</span><strong>{_format_optional_int(summary["total_target_rows"])}</strong></div>
+        <div class="metric"><span>이슈 테이블 수</span><strong>{_issue_count(report)}</strong></div>
+        <div class="metric"><span>스키마 객체 이슈 수</span><strong>{summary["schema_object_issue_count"]}</strong></div>
       </div>
     </header>
 
@@ -451,18 +464,18 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
 
     <section>
       <h2>테이블별 검증 요약</h2>
-      <p>각 테이블의 원본/대상 행 수, 매칭 행 수, 오류 수, 체크섬 샘플 차이를 한눈에 확인합니다.</p>
+      <p>각 테이블의 전체 데이터 수, 이관 수, 성공 여부와 다음 조치를 한 줄로 확인합니다. 행을 펼치면 검산 샘플을 비교할 수 있습니다.</p>
       <table>
         <thead>
           <tr>
-            <th style="width: 12%;">스키마</th>
-            <th style="width: 18%;">테이블명</th>
-            <th style="width: 10%;">상태</th>
-            <th style="width: 12%;">원본 행 수</th>
-            <th style="width: 12%;">대상 행 수</th>
-            <th style="width: 12%;">매칭 행 수</th>
-            <th style="width: 10%;">오류 수</th>
-            <th style="width: 14%;">값 차이/정상 샘플</th>
+            <th style="width: 10%;">스키마</th>
+            <th style="width: 16%;">테이블명</th>
+            <th style="width: 10%;">검증 결과</th>
+            <th style="width: 12%;">전체 데이터 수</th>
+            <th style="width: 12%;">이관 수</th>
+            <th style="width: 12%;">행 수 차이</th>
+            <th style="width: 14%;">대표 이슈</th>
+            <th style="width: 14%;">다음 조치</th>
           </tr>
         </thead>
         <tbody>
@@ -473,7 +486,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
 
     <section>
       <h2>이슈 및 권장 조치</h2>
-      <p>문제가 있는 테이블만 표시합니다. 체크섬 불일치는 테이블명을 클릭하면 전체 폭으로 값 차이를 펼쳐 볼 수 있습니다.</p>
+      <p>문제가 있는 테이블과 스키마 객체만 표시합니다. 조치할 항목이 없으면 이슈 없음으로 표시합니다.</p>
       <table>
         <thead>
           <tr>
@@ -492,19 +505,21 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
     </section>
 
     <section>
-      <h2>정상 이관 샘플</h2>
-      <p>테이블별로 정상 매칭된 데이터를 최대 3개 표시합니다. 이관 전과 이관 후가 같은 값으로 정규화되어 들어갔는지 빠르게 확인하는 용도입니다.</p>
+      <h2>스키마 객체 검증</h2>
+      <p>이관 후 대상의 인덱스, 함수, 트리거, 뷰 존재 여부와 인덱스 정의 차이를 확인합니다.</p>
       <table>
         <thead>
           <tr>
-            <th style="width: 16%;">스키마</th>
-            <th style="width: 24%;">테이블명</th>
-            <th style="width: 18%;">상태</th>
-            <th style="width: 42%;">정상 샘플</th>
+            <th style="width: 14%;">객체 유형</th>
+            <th style="width: 24%;">객체명</th>
+            <th style="width: 12%;">상태</th>
+            <th style="width: 18%;">기대 정의</th>
+            <th style="width: 18%;">대상 정의</th>
+            <th style="width: 14%;">권장 조치</th>
           </tr>
         </thead>
         <tbody>
-{matched_sample_rows}
+{schema_object_rows}
         </tbody>
       </table>
     </section>
@@ -545,14 +560,13 @@ def _endpoint_block(title: str, endpoint) -> str:
 
 
 def _verification_block(report: ValidationReport) -> str:
-    counts = _status_counts(report)
     rows = _context_rows(
         [
-            ("실행 시각", report.metadata.generated_at),
-            ("샘플 크기", _format_optional_int(report.metadata.checksum_sample_size)),
+            ("실행 시각", display_timestamp(report.metadata.generated_at, report.metadata.checksum_timezone)),
+            ("실행 방식", option_label(report.metadata.migration_mode)),
+            ("기존 테이블 처리", option_label(report.metadata.existing_table_policy)),
             ("시간대 기준", report.metadata.checksum_timezone or "-"),
-            ("일시 정밀도", report.metadata.checksum_datetime_precision or "-"),
-            ("결과 요약", _status_summary(counts)),
+            ("일시 비교 정밀도", option_label(report.metadata.checksum_datetime_precision)),
         ]
     )
     return f"""
@@ -610,6 +624,8 @@ def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
         "total_error_count": sum(int(metric["error_count"]) for metric in table_metrics),
         "total_difference_count": sum(int(metric["difference_count"]) for metric in table_metrics),
         "total_matched_sample_count": sum(int(metric["matched_sample_count"]) for metric in table_metrics),
+        "schema_object_count": len(report.schema_objects),
+        "schema_object_issue_count": sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status)),
     }
 
 
@@ -705,6 +721,23 @@ def _write_differences(report: ValidationReport, output_path: Path) -> None:
                 )
 
 
+def _write_schema_objects(report: ValidationReport, output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["객체유형", "객체명", "상태", "기대정의", "대상정의", "권장조치"])
+        for schema_object in report.schema_objects:
+            writer.writerow(
+                [
+                    schema_object.object_type,
+                    schema_object.object_name,
+                    schema_object.status,
+                    schema_object.source_detail,
+                    schema_object.target_detail,
+                    schema_object.action,
+                ]
+            )
+
+
 def _issue_count(report: ValidationReport) -> int:
     return sum(1 for table in report.tables if table.status != ValidationStatus.MATCHED)
 
@@ -713,16 +746,102 @@ def _table_summary_row(table) -> str:
     metrics = _table_metrics(table)
     return f"""
           <tr>
-            <td>{escape(str(metrics["schema"]))}</td>
-            <td class="message">{escape(str(metrics["table"]))}</td>
-            <td><span class="badge {escape(str(metrics["status"]))}">{escape(_status_label(str(metrics["status"])))}</span></td>
-            <td>{_format_optional_int(metrics["source_rows"])}</td>
-            <td>{_format_optional_int(metrics["target_rows"])}</td>
-            <td>{_format_optional_int(metrics["matched_rows"])}</td>
-            <td>{metrics["error_count"]}</td>
-            <td>{metrics["difference_count"]} / {metrics["matched_sample_count"]}</td>
+            <td colspan="8">
+              <details class="table-summary-details">
+                <summary class="table-summary">
+                  <span>{escape(str(metrics["schema"]))}</span>
+                  <span class="summary-table">{escape(str(metrics["table"]))}</span>
+                  <span><span class="badge {escape(str(metrics["status"]))}">{escape(result_label(str(metrics["status"])))}</span></span>
+                  <span>{_format_optional_int(metrics["source_rows"])}</span>
+                  <span>{_format_optional_int(metrics["target_rows"])}</span>
+                  <span>{escape(_row_count_delta_label(table))}</span>
+                  <span>{escape(_representative_issue(table))}</span>
+                  <span class="action">{escape(_next_action(table))}</span>
+                </summary>
+                {_matched_sample_panel(table)}
+              </details>
+            </td>
           </tr>
     """
+
+
+def _row_count_delta_label(table) -> str:
+    source_rows = table.row_count.source_rows
+    target_rows = table.row_count.target_rows
+    if source_rows is None or target_rows is None:
+        return "확인 불가"
+    delta = source_rows - target_rows
+    if delta == 0:
+        return "0"
+    if delta > 0:
+        return f"대상 {delta}행 부족"
+    return f"대상 {abs(delta)}행 초과"
+
+
+def _representative_issue(table) -> str:
+    if table.row_count.status == ValidationStatus.FAILED and table.row_count.message:
+        return table.row_count.message
+    if table.row_count.status == ValidationStatus.MISMATCHED:
+        return _row_count_delta_label(table)
+    if table.checksum.status == ValidationStatus.FAILED and table.checksum.message:
+        return table.checksum.message
+    if table.checksum.differences:
+        difference = table.checksum.differences[0]
+        return f"{difference.row_identity} / {difference.column}"
+    if table.status == ValidationStatus.MATCHED:
+        return "이슈 없음"
+    return "상세 확인 필요"
+
+
+def _next_action(table) -> str:
+    if table.row_count.status in {ValidationStatus.FAILED, ValidationStatus.MISMATCHED}:
+        return _row_count_action(table)
+    if table.checksum.status in {ValidationStatus.FAILED, ValidationStatus.MISMATCHED}:
+        return _checksum_action(table)
+    if table.row_count.status == ValidationStatus.SKIPPED or table.checksum.status == ValidationStatus.SKIPPED:
+        return "건너뛴 검증 항목이 필요한지 확인하세요."
+    return "추가 조치가 필요하지 않습니다."
+
+
+def _schema_object_row(schema_object) -> str:
+    return f"""
+          <tr>
+            <td>{escape(schema_object.object_type)}</td>
+            <td class="message">{escape(schema_object.object_name)}</td>
+            <td><span class="badge {_schema_object_badge_class(schema_object.status)}">{escape(_schema_object_status_label(schema_object.status))}</span></td>
+            <td>{escape(schema_object.source_detail)}</td>
+            <td>{escape(schema_object.target_detail)}</td>
+            <td class="action">{escape(schema_object.action)}</td>
+          </tr>
+    """
+
+
+def _schema_object_badge_class(status: str) -> str:
+    if status == "matched":
+        return "matched"
+    if status == "manual_review":
+        return "skipped"
+    if status == "target_only":
+        return "skipped"
+    return "mismatched"
+
+
+def _schema_object_status_label(status: str) -> str:
+    return {
+        "matched": "일치",
+        "missing": "누락",
+        "mismatched": "불일치",
+        "manual_review": "수동 검토",
+        "target_only": "대상만 있음",
+    }.get(status, status)
+
+
+def _is_schema_object_issue(status: str) -> bool:
+    return status in {"missing", "mismatched", "target_only"}
+
+
+def _is_schema_object_action_required(status: str) -> bool:
+    return status != "matched"
 
 
 def _issue_rows(table) -> str:
@@ -829,10 +948,10 @@ def _checksum_detail(table) -> str:
         return escape(table.checksum.message)
     if table.checksum.differences:
         difference_count = len(table.checksum.differences)
-        return f"체크섬 샘플에서 값 차이 {difference_count}건이 발견되었습니다."
+        return f"검산 샘플에서 값 차이 {difference_count}건이 발견되었습니다."
     return (
-        f"원본 체크섬=<code>{escape(_short_checksum(table.checksum.source_checksum))}</code> "
-        f"대상 체크섬=<code>{escape(_short_checksum(table.checksum.target_checksum))}</code>"
+        f"원본 샘플 해시=<code>{escape(_short_checksum(table.checksum.source_checksum))}</code> "
+        f"대상 샘플 해시=<code>{escape(_short_checksum(table.checksum.target_checksum))}</code>"
     )
 
 
@@ -849,14 +968,14 @@ def _row_count_action(table) -> str:
     if target_rows > source_rows:
         extra_rows = target_rows - source_rows
         return f"대상에 {extra_rows}행이 더 많습니다. 중복 데이터나 기존 대상 잔여 데이터를 확인한 뒤 재시도하세요."
-    return "행 수는 일치합니다. 체크섬 상세에서 값 단위 차이를 확인하세요."
+    return "행 수는 일치합니다. 샘플 값 상세에서 값 단위 차이를 확인하세요."
 
 
 def _checksum_action(table) -> str:
     if table.checksum.status == ValidationStatus.FAILED:
         return "샘플 조회 권한, 지원하지 않는 컬럼 값, 정규화 설정을 확인하세요."
     if not table.checksum.differences:
-        return "체크섬은 다르지만 샘플 값에서 컬럼 차이를 찾지 못했습니다. 체크섬 샘플 크기를 늘린 뒤 검증을 재실행하세요."
+        return "샘플 해시는 다르지만 검산 샘플에서 컬럼 차이를 찾지 못했습니다. 검산 범위를 넓혀 검증을 재실행하세요."
 
     columns = _difference_columns(table)
     if _has_row_presence_difference(table):
@@ -894,7 +1013,7 @@ def _status_label(status: str) -> str:
 def _validation_label(validation: str) -> str:
     return {
         "row_count": "행 수",
-        "checksum": "체크섬",
+        "checksum": "검산 샘플",
     }.get(validation, validation)
 
 
@@ -1006,26 +1125,19 @@ def _difference_panel(table) -> str:
     """
 
 
-def _matched_sample_row(table) -> str:
-    metrics = _table_metrics(table)
-    return f"""
-          <tr>
-            <td colspan="4">
-              <details>
-                <summary class="matched-summary">
-                  <span>{escape(str(metrics["schema"]))}</span>
-                  <span class="summary-table">{escape(str(metrics["table"]))}</span>
-                  <span><span class="badge {escape(table.status)}">{escape(_status_label(table.status))}</span></span>
-                  <span>정상 샘플 {len(table.checksum.matched_samples)}건. 클릭하면 이관 전 -> 이관 후 값을 비교합니다.</span>
-                </summary>
-                {_matched_sample_panel(table)}
-              </details>
-            </td>
-          </tr>
-    """
-
-
 def _matched_sample_panel(table) -> str:
+    if not table.checksum.matched_samples:
+        return """
+      <div class="matched-panel">
+        <table>
+          <tbody>
+            <tr>
+              <td colspan="3" class="empty-state">표시할 검산 샘플이 없습니다.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    """
     rows = "\n".join(
         f"""
           <tr>
@@ -1042,8 +1154,8 @@ def _matched_sample_panel(table) -> str:
           <thead>
             <tr>
               <th style="width: 22%;">행 식별값</th>
-              <th style="width: 39%;">이관 전 원본</th>
-              <th style="width: 39%;">이관 후 대상</th>
+              <th style="width: 39%;">원본 값</th>
+              <th style="width: 39%;">대상 값</th>
             </tr>
           </thead>
           <tbody>

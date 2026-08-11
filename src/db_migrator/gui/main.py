@@ -11,8 +11,8 @@ from db_migrator.application import CommandResult, MigrationApplicationService, 
 from db_migrator.application.events import event_to_view
 from db_migrator.application.safety import evaluate_dry_run_gate
 from db_migrator.config.loader import ConfigLoadError, load_config
-from db_migrator.config.models import AppConfig, Dbms, ExistingTablePolicy, TableRunConfig
-from db_migrator.core.events import EventPublisher, MigrationEvent
+from db_migrator.config.models import AppConfig, Dbms, ExistingTablePolicy, IndexApplyTiming, MigrationMode, TableRunConfig
+from db_migrator.core.events import EventPublisher, FileEventPublisher, MigrationEvent
 
 
 def main() -> None:
@@ -88,12 +88,21 @@ if Signal is not None:
         ExistingTablePolicy.SYNC: "동기화",
         ExistingTablePolicy.OVERWRITE: "덮어쓰기",
     }
+    GUI_MIGRATION_MODE_LABELS = {
+        MigrationMode.DDL_AND_DML: "기본 이관",
+        MigrationMode.DDL_ONLY: "테이블 이관",
+        MigrationMode.MANUAL_DDL: "수동 이관(DDL)",
+        MigrationMode.MANUAL: "수동 이관(DDL + DML)",
+    }
+    GUI_MIGRATION_MODES_BY_LABEL = {label: mode for mode, label in GUI_MIGRATION_MODE_LABELS.items()}
 
     class WorkerEventPublisher:
         def __init__(self, emit_event: Callable[[MigrationEvent], None]) -> None:
             self._emit_event = emit_event
+            self._file_events = FileEventPublisher()
 
         def publish(self, event: MigrationEvent) -> None:
+            self._file_events.publish(event)
             self._emit_event(event)
 
 
@@ -122,6 +131,8 @@ if Signal is not None:
             self._thread: QThread | None = None
             self._worker: CommandWorker | None = None
             self._running_label: str | None = None
+            self._manual_apply_foreign_keys = False
+            self._syncing_foreign_key_option = False
             self._last_dry_run_report: Path | None = None
             self._last_report_html: Path | None = None
             self._buttons: list[QPushButton] = []
@@ -171,12 +182,7 @@ if Signal is not None:
             self._buttons.append(self.review_button)
             self._table_actions.append(self.review_button)
             actions.addWidget(self.review_button)
-            self.manual_ddl_button = QPushButton("수동 DDL 보기")
-            self.manual_ddl_button.clicked.connect(self._show_manual_ddl)
-            self._buttons.append(self.manual_ddl_button)
-            self._table_actions.append(self.manual_ddl_button)
-            actions.addWidget(self.manual_ddl_button)
-            self.migrate_button = QPushButton("이관 실행")
+            self.migrate_button = QPushButton("실행")
             self.migrate_button.clicked.connect(self._run_migration_from_mode)
             self._buttons.append(self.migrate_button)
             self._table_actions.append(self.migrate_button)
@@ -273,9 +279,11 @@ if Signal is not None:
         def _options_group(self) -> QGroupBox:
             group = QGroupBox("이관 옵션")
             form = QFormLayout(group)
-            self.migration_mode = _combo(["전체 이관", "DDL만 적용", "데이터만 이관", "검증만 실행", "증분 이관"])
+            self.migration_mode = _combo(list(GUI_MIGRATION_MODES_BY_LABEL))
             self.existing_table_policy = _policy_combo()
             self.apply_foreign_keys = QCheckBox("테이블 생성 후 외래키 적용")
+            self.migration_mode.currentTextChanged.connect(self._sync_foreign_key_option)
+            self.apply_foreign_keys.toggled.connect(self._remember_manual_foreign_key_option)
             self.batch_size = _spin(1, 10_000_000)
             self.commit_interval = _spin(1, 10_000_000)
             self.parallel_table_count = _spin(1, 64)
@@ -377,30 +385,44 @@ if Signal is not None:
 
         def _run_migration_from_mode(self) -> None:
             mode = self.migration_mode.currentText()
-            if mode == "전체 이관":
+            if mode == "기본 이관":
                 self._run_full_selected_migration()
-            elif mode == "DDL만 적용":
+            elif mode == "테이블 이관":
                 self._run_apply_ddl()
-            elif mode == "데이터만 이관":
-                self._run_migrate_data()
-            elif mode == "검증만 실행":
-                self._run_validate()
-            elif mode == "증분 이관":
-                self._run_incremental()
+            elif mode == "수동 이관(DDL)":
+                self._show_manual_ddl()
+            elif mode == "수동 이관(DDL + DML)":
+                self._run_manual_migration()
 
         def _run_apply_ddl(self) -> None:
-            if not self._save_form_to_config() or not self._confirm_write_operation("DDL 적용"):
+            if not self._save_form_to_config() or not self._confirm_write_operation("테이블 이관"):
                 return
             config, schema_file, output_dir, _, selected_tables = self._command_context()
             dry_run_report = self._last_dry_run_report
             self._run(
-                "DDL 적용",
+                "테이블 이관",
                 lambda _publisher: self._run_preflight_then(
                     lambda: self._service.run_apply_ddl(
                         config=config,
                         schema_file=schema_file,
                         output_file=output_dir / "ddl-execution.json",
                         dry_run_report_path=dry_run_report,
+                        selected_tables=selected_tables,
+                    )
+                ),
+            )
+
+        def _run_manual_migration(self) -> None:
+            if not self._save_form_to_config() or not self._ensure_tables_selected():
+                return
+            config, schema_file, output_dir, _, selected_tables = self._command_context()
+            self._run(
+                "수동 이관(DDL + DML)",
+                lambda _publisher: self._run_preflight_then(
+                    lambda: self._service.run_generate_manual_migration(
+                        config=config,
+                        schema_file=schema_file,
+                        output_dir=output_dir,
                         selected_tables=selected_tables,
                     )
                 ),
@@ -427,13 +449,13 @@ if Signal is not None:
             )
 
         def _run_full_selected_migration(self) -> None:
-            if not self._save_form_to_config() or not self._confirm_write_operation("전체 이관"):
+            if not self._save_form_to_config() or not self._confirm_write_operation("기본 이관"):
                 return
             config, schema_file, output_dir, checkpoint_db, selected_tables = self._command_context()
             dry_run_report = self._last_dry_run_report
             auto_validate = self.auto_validate.isChecked()
             self._run(
-                "전체 이관",
+                "기본 이관",
                 lambda publisher: self._run_preflight_then(
                     lambda: self._run_full_sequence(
                         publisher,
@@ -543,6 +565,15 @@ if Signal is not None:
             )
             if not ddl_result.success:
                 return ddl_result
+            pre_index_result = self._service.run_apply_indexes(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "index-execution-pre-data.json",
+                phase=IndexApplyTiming.PRE_DATA,
+                selected_tables=selected_tables,
+            )
+            if not pre_index_result.success:
+                return pre_index_result
             data_result = self._service.run_migrate_data(
                 config=config,
                 schema_file=schema_file,
@@ -550,8 +581,17 @@ if Signal is not None:
                 event_publisher=publisher,
                 selected_tables=selected_tables,
             )
-            if not data_result.success or not auto_validate:
+            if not data_result.success:
                 return data_result
+            post_index_result = self._service.run_apply_indexes(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "index-execution-post-data.json",
+                phase=IndexApplyTiming.POST_DATA,
+                selected_tables=selected_tables,
+            )
+            if not post_index_result.success or not auto_validate:
+                return post_index_result
             return self._service.run_validate(
                 config=config,
                 schema_file=schema_file,
@@ -598,8 +638,17 @@ if Signal is not None:
                 event_publisher=publisher,
                 selected_tables=selected_tables,
             )
-            if not data_result.success or not auto_validate:
+            if not data_result.success:
                 return data_result
+            post_index_result = self._service.run_apply_indexes(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "index-execution-post-data.json",
+                phase=IndexApplyTiming.POST_DATA,
+                selected_tables=selected_tables,
+            )
+            if not post_index_result.success or not auto_validate:
+                return post_index_result
             return self._service.run_validate(
                 config=config,
                 schema_file=schema_file,
@@ -616,14 +665,32 @@ if Signal is not None:
             selected_tables: set[str] | None,
             auto_validate: bool,
         ) -> CommandResult:
+            pre_index_result = self._service.run_apply_indexes(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "index-execution-pre-data.json",
+                phase=IndexApplyTiming.PRE_DATA,
+                selected_tables=selected_tables,
+            )
+            if not pre_index_result.success:
+                return pre_index_result
             incremental_result = self._service.run_incremental(
                 config=config,
                 schema_file=schema_file,
                 output_dir=output_dir,
                 selected_tables=selected_tables,
             )
-            if not incremental_result.success or not auto_validate:
+            if not incremental_result.success:
                 return incremental_result
+            post_index_result = self._service.run_apply_indexes(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "index-execution-post-data.json",
+                phase=IndexApplyTiming.POST_DATA,
+                selected_tables=selected_tables,
+            )
+            if not post_index_result.success or not auto_validate:
+                return post_index_result
             return self._service.run_validate(
                 config=config,
                 schema_file=schema_file,
@@ -758,7 +825,10 @@ if Signal is not None:
             self.target_password.setText(config.target.password or "")
             policy = config.migration.existing_table_policy
             self._set_existing_table_policy(policy if policy in GUI_EXISTING_TABLE_POLICIES else ExistingTablePolicy.SKIP)
+            self._manual_apply_foreign_keys = config.migration.apply_foreign_keys
             self.apply_foreign_keys.setChecked(config.migration.apply_foreign_keys)
+            self.migration_mode.setCurrentText(GUI_MIGRATION_MODE_LABELS.get(config.migration.mode, "기본 이관"))
+            self._sync_foreign_key_option()
             self.batch_size.setValue(config.migration.batch_size)
             self.commit_interval.setValue(config.migration.commit_interval)
             self.parallel_table_count.setValue(config.migration.parallel_table_count)
@@ -786,8 +856,9 @@ if Signal is not None:
             config.target.user = self.target_user.text().strip()
             config.target.password = self.target_password.text() or None
             config.target.environment = AppConfig().target.environment
+            config.migration.mode = self._selected_migration_mode()
             config.migration.existing_table_policy = self._selected_existing_table_policy()
-            config.migration.apply_foreign_keys = self.apply_foreign_keys.isChecked()
+            config.migration.apply_foreign_keys = self._effective_apply_foreign_keys()
             config.migration.batch_size = self.batch_size.value()
             config.migration.commit_interval = self.commit_interval.value()
             config.migration.parallel_table_count = self.parallel_table_count.value()
@@ -805,6 +876,39 @@ if Signal is not None:
                 QMessageBox.warning(self, "설정 파일 저장 실패", str(exc))
                 return False
             return True
+
+        def _remember_manual_foreign_key_option(self, checked: bool) -> None:
+            if self._syncing_foreign_key_option or not self.apply_foreign_keys.isEnabled():
+                return
+            self._manual_apply_foreign_keys = checked
+
+        def _sync_foreign_key_option(self, _mode: str | None = None) -> None:
+            mode = self.migration_mode.currentText()
+            self._syncing_foreign_key_option = True
+            try:
+                if mode == "기본 이관":
+                    self.apply_foreign_keys.setChecked(True)
+                    self.apply_foreign_keys.setEnabled(False)
+                    self.apply_foreign_keys.setToolTip("기본 이관은 테이블 생성 후 외래키를 자동 적용합니다.")
+                    return
+                if mode == "테이블 이관":
+                    self.apply_foreign_keys.setEnabled(True)
+                    self.apply_foreign_keys.setChecked(self._manual_apply_foreign_keys)
+                    self.apply_foreign_keys.setToolTip("필요한 경우 테이블 생성 이후 외래키 DDL을 함께 적용합니다.")
+                    return
+                self.apply_foreign_keys.setChecked(False)
+                self.apply_foreign_keys.setEnabled(False)
+                self.apply_foreign_keys.setToolTip("현재 실행 방식에서는 외래키 적용을 사용하지 않습니다.")
+            finally:
+                self._syncing_foreign_key_option = False
+
+        def _effective_apply_foreign_keys(self) -> bool:
+            mode = self.migration_mode.currentText()
+            if mode == "기본 이관":
+                return True
+            if mode == "테이블 이관":
+                return self.apply_foreign_keys.isChecked()
+            return False
 
         def _populate_tables(self, tables: tuple[TableSelection, ...]) -> None:
             self.table_list.clear()
@@ -1025,6 +1129,9 @@ if Signal is not None:
         def _selected_existing_table_policy(self) -> ExistingTablePolicy:
             value = self.existing_table_policy.currentData()
             return ExistingTablePolicy(str(value or ExistingTablePolicy.SKIP.value))
+
+        def _selected_migration_mode(self) -> MigrationMode:
+            return GUI_MIGRATION_MODES_BY_LABEL.get(self.migration_mode.currentText(), MigrationMode.DDL_AND_DML)
 
         def _confirm_overwrite_operation(self, operation: str, app_config: AppConfig) -> bool:
             selected = sorted(self._selected_tables() or [])

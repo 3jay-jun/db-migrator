@@ -524,7 +524,7 @@ def _preflight_table_result(
         target_rows = _target_row_count(target, table.ref)
         if target_rows == 0:
             message = "Completed checkpoint is stale because target table is empty. Re-running from the beginning."
-            event_publisher.publish(_table_skipped_event(job_id, table, message, status="stale_checkpoint_ignored"))
+            event_publisher.publish(_checkpoint_stale_event(job_id, table, message))
             return None
         if target_rows is not None and target_rows < checkpoint.committed_rows:
             message = (
@@ -544,6 +544,17 @@ def _target_row_count(target: TargetBatchWriter, table: TableRef) -> int | None:
     if not callable(count_rows):
         return None
     return int(count_rows(table))
+
+
+def _checkpoint_stale_event(job_id: str, table: TableSchema, message: str) -> MigrationEvent:
+    return MigrationEvent(
+        job_id=job_id,
+        level=EventLevel.WARNING,
+        type=EventType.CHECKPOINT_STALE,
+        message=f"Checkpoint stale: {table.ref.name}. {message}",
+        table=table.ref.name,
+        payload={"status": "stale_checkpoint_ignored"},
+    )
 
 
 def _table_skipped_event(job_id: str, table: TableSchema, message: str, *, status: str) -> MigrationEvent:

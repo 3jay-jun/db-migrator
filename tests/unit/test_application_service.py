@@ -9,7 +9,7 @@ from db_migrator.application.service import MigrationApplicationService
 from db_migrator.config.loader import load_config
 from db_migrator.core.events import EventLevel, EventType, MigrationEvent, ProgressSnapshot, QueueEventPublisher
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
-from db_migrator.schema.models import ColumnSchema, PrimaryKey, ReadCursor, RowBatch, SchemaSnapshot, TableRef, TableSchema, WriteResult
+from db_migrator.schema.models import ColumnSchema, IndexSchema, PrimaryKey, ReadCursor, RowBatch, SchemaSnapshot, TableRef, TableSchema, WriteResult
 
 
 def test_service_dry_run_writes_report_with_shared_orchestration(tmp_path: Path) -> None:
@@ -92,6 +92,20 @@ safety:
     assert result.table_count == 2
 
 
+def test_service_apply_indexes_executes_post_data_auto_candidates(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(tmp_path)
+
+    result = service.run_apply_indexes(config=config_path, output_file=tmp_path / "indexes.json")
+
+    assert result.success is True
+    assert "CREATE INDEX" in registry.target.executed_ddls[-1]
+    assert "`target_db`.`users`" in registry.target.executed_ddls[-1]
+    assert "`idx_users_email`" in registry.target.executed_ddls[-1]
+    assert (tmp_path / "indexes.json").exists()
+
+
 def test_service_migrate_data_publishes_events_and_returns_rows(tmp_path: Path) -> None:
     service = MigrationApplicationService(FakeRegistry())
     config_path = _write_config(tmp_path)
@@ -129,6 +143,36 @@ tables:
     assert result.success is True
     assert "`app_users`" in result.details["sql"]
     assert "`users`" not in result.details["sql"]
+    assert registry.target.executed_ddls == []
+
+
+def test_service_manual_migration_exports_ddl_csv_and_load_script(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_generate_manual_migration(
+        config=config_path,
+        output_dir=tmp_path / "reports",
+        selected_tables={"public.users"},
+    )
+
+    manual_dir = tmp_path / "reports" / "manual-migration"
+    assert result.success is True
+    assert result.output_dir == manual_dir
+    assert (manual_dir / "ddl.sql").exists()
+    assert (manual_dir / "load-data.sql").exists()
+    assert (manual_dir / "data" / "public.app_users.csv").exists()
+    assert "`app_users`" in (manual_dir / "ddl.sql").read_text(encoding="utf-8")
+    assert "LOAD DATA LOCAL INFILE" in (manual_dir / "load-data.sql").read_text(encoding="utf-8")
+    assert "id" in (manual_dir / "data" / "public.app_users.csv").read_text(encoding="utf-8")
     assert registry.target.executed_ddls == []
 
 
@@ -309,6 +353,7 @@ def _snapshot() -> SchemaSnapshot:
             TableSchema(
                 ref=TableRef(schema="public", name="users"),
                 primary_key=PrimaryKey(columns=("id",)),
+                indexes=(IndexSchema(name="idx_users_email", columns=("id",)),),
                 columns=(
                     ColumnSchema(
                         name="id",

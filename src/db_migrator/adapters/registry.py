@@ -45,6 +45,16 @@ class DbmsAdapterRegistry:
         except DbmsCapabilityError as exc:
             raise AdapterRegistryError(str(exc)) from exc
 
+    def create_source_ddl_generator(self, dbms: Dbms) -> DdlGenerator:
+        try:
+            provider = self.providers[dbms]
+        except KeyError as exc:
+            raise AdapterRegistryError(f"Unsupported source DDL DBMS: {dbms.value}") from exc
+        try:
+            return provider.create_source_ddl_generator()
+        except DbmsCapabilityError as exc:
+            raise AdapterRegistryError(str(exc)) from exc
+
 
 def default_adapter_registry() -> DbmsAdapterRegistry:
     return DbmsAdapterRegistry(

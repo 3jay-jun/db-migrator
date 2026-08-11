@@ -131,4 +131,14 @@ def test_write_incremental_report_outputs_delete_policy(tmp_path: Path) -> None:
     assert (tmp_path / "summary.json").exists()
     assert (tmp_path / "tables.csv").exists()
     assert (tmp_path / "summary.html").exists()
-    assert "DELETE sync is not supported" in (tmp_path / "delete_policy.txt").read_text(encoding="utf-8")
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert "Jigration 증분 이관 리포트" in html
+    assert "증분 이관 결과" in html
+    assert "반영 행 수" in html
+    assert "대상 테이블 수" in html
+    assert "건너뛴 테이블 수" in html
+    assert "증분 기준 컬럼" in html
+    assert "job_id=" not in html
+    assert "delete_sync_supported=" not in html
+    assert "Jigration Incremental Report" not in html
+    assert "자동 삭제 동기화는 지원하지 않습니다." in (tmp_path / "delete_policy.txt").read_text(encoding="utf-8")

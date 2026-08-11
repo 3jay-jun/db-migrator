@@ -33,7 +33,10 @@ class TableMappingResolver:
         )
 
     def target_snapshot_for(self, source_snapshot: SchemaSnapshot) -> SchemaSnapshot:
-        return SchemaSnapshot(tables=tuple(self.target_schema_for(table) for table in source_snapshot.tables))
+        return SchemaSnapshot(
+            tables=tuple(self.target_schema_for(table) for table in source_snapshot.tables),
+            non_table_objects=source_snapshot.non_table_objects,
+        )
 
     def incremental_watermarks(self) -> dict[str, WatermarkConfig]:
         watermarks = dict(self._config.incremental.watermarks)

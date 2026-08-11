@@ -14,11 +14,14 @@ from db_migrator.schema.models import (
     ColumnSchema,
     CursorStrategy,
     ForeignKeySchema,
+    IndexSchema,
     PrimaryKey,
     ReadCursor,
     RowBatch,
     RowData,
     SamplePosition,
+    SchemaObjectKind,
+    SchemaObjectSummary,
     SchemaSnapshot,
     TableRef,
     TableSchema,
@@ -78,8 +81,10 @@ class MySqlSourceAdapter:
                 try:
                     columns = self._fetch_columns(connection, schema)
                     primary_keys = self._fetch_primary_keys(connection, schema)
+                    indexes = self._fetch_indexes(connection, schema)
                     foreign_keys = self._fetch_foreign_keys(connection, schema)
                     estimated_rows = self._fetch_estimated_rows(connection, schema)
+                    non_table_objects = self._fetch_non_table_objects(connection, schema)
                 except Exception as exc:
                     raise MySqlAdapterError(
                         f"MySQL/MariaDB schema metadata query failed for schema '{schema}'. "
@@ -120,12 +125,13 @@ class MySqlSourceAdapter:
                 ref=TableRef(schema=schema, name=table_name),
                 columns=tuple(sorted(table_columns, key=lambda column: column.ordinal_position)),
                 primary_key=PrimaryKey(tuple(primary_keys[table_name])) if primary_keys[table_name] else None,
+                indexes=tuple(indexes[table_name]),
                 foreign_keys=tuple(foreign_keys[table_name]),
                 estimated_rows=estimated_rows.get(table_name),
             )
             for table_name, table_columns in sorted(grouped_columns.items())
         )
-        return SchemaSnapshot(tables=tables)
+        return SchemaSnapshot(tables=tables, non_table_objects=tuple(non_table_objects))
 
     def read_rows(
         self,
@@ -297,6 +303,40 @@ class MySqlSourceAdapter:
                 primary_keys[str(row["table_name"])].append(str(row["column_name"]))
         return primary_keys
 
+    def _fetch_indexes(self, connection, schema: str) -> dict[str, list[IndexSchema]]:
+        query = """
+            select
+                table_name,
+                index_name,
+                min(non_unique) as non_unique,
+                max(index_type) as index_type,
+                group_concat(column_name order by seq_in_index separator '\x1f') as column_names
+            from information_schema.statistics
+            where table_schema = %s
+              and index_name <> 'PRIMARY'
+            group by table_name, index_name
+            order by table_name, index_name
+        """
+        indexes: dict[str, list[IndexSchema]] = defaultdict(list)
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            for row in cursor.fetchall():
+                raw_columns = str(row["column_names"] or "")
+                columns = tuple(column for column in raw_columns.split("\x1f") if column)
+                index_type = str(row["index_type"] or "")
+                manual_review_reason = _mysql_index_manual_review_reason(columns=columns, index_type=index_type)
+                indexes[str(row["table_name"])].append(
+                    IndexSchema(
+                        name=str(row["index_name"]),
+                        columns=columns,
+                        unique=int(row["non_unique"]) == 0,
+                        method=index_type,
+                        auto_create_candidate=manual_review_reason is None,
+                        manual_review_reason=manual_review_reason,
+                    )
+                )
+        return indexes
+
     def _fetch_foreign_keys(self, connection, schema: str) -> dict[str, list[ForeignKeySchema]]:
         query = """
             select
@@ -348,6 +388,55 @@ class MySqlSourceAdapter:
         with connection.cursor() as cursor:
             cursor.execute(query, (schema,))
             return {str(row["table_name"]): int(row["table_rows"] or 0) for row in cursor.fetchall()}
+
+    def _fetch_non_table_objects(self, connection, schema: str) -> list[SchemaObjectSummary]:
+        objects: list[SchemaObjectSummary] = []
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select table_schema, table_name
+                from information_schema.views
+                where table_schema = %s
+                order by table_name
+                """,
+                (schema,),
+            )
+            objects.extend(
+                SchemaObjectSummary(kind=SchemaObjectKind.VIEW, schema=str(row["table_schema"]), name=str(row["table_name"]))
+                for row in cursor.fetchall()
+            )
+            cursor.execute(
+                """
+                select routine_schema, routine_name, routine_type
+                from information_schema.routines
+                where routine_schema = %s
+                order by routine_type, routine_name
+                """,
+                (schema,),
+            )
+            for row in cursor.fetchall():
+                routine_type = str(row["routine_type"]).lower()
+                kind = SchemaObjectKind.PROCEDURE if routine_type == "procedure" else SchemaObjectKind.FUNCTION
+                objects.append(SchemaObjectSummary(kind=kind, schema=str(row["routine_schema"]), name=str(row["routine_name"])))
+            cursor.execute(
+                """
+                select trigger_schema, trigger_name, event_object_schema, event_object_table
+                from information_schema.triggers
+                where trigger_schema = %s
+                order by trigger_name
+                """,
+                (schema,),
+            )
+            objects.extend(
+                SchemaObjectSummary(
+                    kind=SchemaObjectKind.TRIGGER,
+                    schema=str(row["trigger_schema"]),
+                    name=str(row["trigger_name"]),
+                    parent_table=TableRef(schema=str(row["event_object_schema"]), name=str(row["event_object_table"])),
+                )
+                for row in cursor.fetchall()
+            )
+        return objects
 
 
 class MySqlTargetAdapter:
@@ -609,6 +698,14 @@ def qualify_mysql_table_ref(table: TableRef, *, target_database: str | None = No
 def quote_mysql_identifier(identifier: str) -> str:
     escaped_identifier = identifier.replace("`", "``")
     return f"`{escaped_identifier}`"
+
+
+def _mysql_index_manual_review_reason(*, columns: tuple[str, ...], index_type: str) -> str | None:
+    if not columns:
+        return "Expression index requires manual conversion."
+    if index_type and index_type.upper() not in {"BTREE"}:
+        return f"MySQL/MariaDB {index_type} index type requires manual review."
+    return None
 
 
 def _mysql_order_by_clause(columns: tuple[str, ...], *, position: SamplePosition = SamplePosition.FIRST) -> str:

@@ -6,7 +6,17 @@ from typing import Any
 
 from db_migrator.config.models import Dbms
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, SchemaWarning, TypePolicy
-from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, PrimaryKey, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.models import (
+    ColumnSchema,
+    ForeignKeySchema,
+    IndexSchema,
+    PrimaryKey,
+    SchemaObjectKind,
+    SchemaObjectSummary,
+    SchemaSnapshot,
+    TableRef,
+    TableSchema,
+)
 from db_migrator.schema.type_mapping import mysql_type_to_common, postgres_type_to_common
 
 
@@ -34,7 +44,10 @@ def _parse_schema_snapshot(raw_snapshot: dict[str, Any], snapshot_path: Path, *,
     if not isinstance(raw_tables, list):
         raise SchemaSnapshotLoadError(f"Schema snapshot must contain a tables array: {snapshot_path}")
 
-    return SchemaSnapshot(tables=tuple(_parse_table(raw_table, snapshot_path, source_dbms=source_dbms) for raw_table in raw_tables))
+    return SchemaSnapshot(
+        tables=tuple(_parse_table(raw_table, snapshot_path, source_dbms=source_dbms) for raw_table in raw_tables),
+        non_table_objects=tuple(_parse_schema_object(raw_object, snapshot_path) for raw_object in raw_snapshot.get("non_table_objects", [])),
+    )
 
 
 def _parse_table(raw_table: Any, snapshot_path: Path, *, source_dbms: Dbms) -> TableSchema:
@@ -58,6 +71,7 @@ def _parse_table(raw_table: Any, snapshot_path: Path, *, source_dbms: Dbms) -> T
         ref=TableRef(schema=schema, name=table_name),
         columns=tuple(_parse_column(raw_column, snapshot_path, source_dbms=source_dbms) for raw_column in raw_columns),
         primary_key=primary_key,
+        indexes=tuple(_parse_index(raw_index, schema, table_name, snapshot_path) for raw_index in raw_table.get("indexes", [])),
         foreign_keys=tuple(_parse_foreign_key(raw_fk, schema, table_name, snapshot_path) for raw_fk in raw_table.get("foreign_keys", [])),
         estimated_rows=raw_table.get("estimated_rows"),
     )
@@ -140,6 +154,42 @@ def _parse_foreign_key(raw_fk: Any, schema: str, table_name: str, snapshot_path:
             name=_required_string(referenced, "name", snapshot_path),
         ),
         referenced_columns=tuple(referenced_columns),
+    )
+
+
+def _parse_index(raw_index: Any, schema: str, table_name: str, snapshot_path: Path) -> IndexSchema:
+    if not isinstance(raw_index, dict):
+        raise SchemaSnapshotLoadError(f"indexes entries must be objects: {schema}.{table_name}")
+    columns = raw_index.get("columns")
+    if not isinstance(columns, list) or not all(isinstance(column, str) for column in columns):
+        raise SchemaSnapshotLoadError(f"index columns must be a string array: {schema}.{table_name}")
+    return IndexSchema(
+        name=_required_string(raw_index, "name", snapshot_path),
+        columns=tuple(columns),
+        unique=bool(raw_index.get("unique", False)),
+        method=raw_index.get("method"),
+        auto_create_candidate=bool(raw_index.get("auto_create_candidate", True)),
+        manual_review_reason=raw_index.get("manual_review_reason"),
+    )
+
+
+def _parse_schema_object(raw_object: Any, snapshot_path: Path) -> SchemaObjectSummary:
+    if not isinstance(raw_object, dict):
+        raise SchemaSnapshotLoadError(f"non_table_objects entries must be objects: {snapshot_path}")
+    parent_table = None
+    raw_parent_table = raw_object.get("parent_table")
+    if raw_parent_table is not None:
+        if not isinstance(raw_parent_table, dict):
+            raise SchemaSnapshotLoadError(f"parent_table must be an object: {snapshot_path}")
+        parent_table = TableRef(
+            schema=_required_string(raw_parent_table, "schema", snapshot_path),
+            name=_required_string(raw_parent_table, "name", snapshot_path),
+        )
+    return SchemaObjectSummary(
+        kind=SchemaObjectKind(str(raw_object["kind"])),
+        schema=_required_string(raw_object, "schema", snapshot_path),
+        name=_required_string(raw_object, "name", snapshot_path),
+        parent_table=parent_table,
     )
 
 

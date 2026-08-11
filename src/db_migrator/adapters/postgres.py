@@ -11,7 +11,23 @@ from db_migrator.adapters.base import DdlResult, ExecutionResult
 from db_migrator.config.models import WatermarkConfig
 from db_migrator.config.models import SourceConfig, TargetConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
-from db_migrator.schema.models import ColumnSchema, CursorStrategy, ForeignKeySchema, PrimaryKey, ReadCursor, RowBatch, RowData, SamplePosition, SchemaSnapshot, TableRef, TableSchema, WriteResult
+from db_migrator.schema.models import (
+    ColumnSchema,
+    CursorStrategy,
+    ForeignKeySchema,
+    IndexSchema,
+    PrimaryKey,
+    ReadCursor,
+    RowBatch,
+    RowData,
+    SamplePosition,
+    SchemaObjectKind,
+    SchemaObjectSummary,
+    SchemaSnapshot,
+    TableRef,
+    TableSchema,
+    WriteResult,
+)
 from db_migrator.schema.type_mapping import common_type_to_postgres, postgres_type_to_common
 
 
@@ -292,8 +308,10 @@ class PostgresSourceAdapter:
                 try:
                     columns = self._fetch_columns(connection, schema)
                     primary_keys = self._fetch_primary_keys(connection, schema)
+                    indexes = self._fetch_indexes(connection, schema)
                     foreign_keys = self._fetch_foreign_keys(connection, schema)
                     estimated_rows = self._fetch_estimated_rows(connection, schema)
+                    non_table_objects = self._fetch_non_table_objects(connection, schema)
                 except Exception as exc:
                     raise PostgresAdapterError(
                         f"PostgreSQL schema metadata query failed for schema '{schema}'. "
@@ -334,12 +352,13 @@ class PostgresSourceAdapter:
                 ref=TableRef(schema=schema, name=table_name),
                 columns=tuple(sorted(table_columns, key=lambda column: column.ordinal_position)),
                 primary_key=PrimaryKey(tuple(primary_keys[table_name])) if primary_keys[table_name] else None,
+                indexes=tuple(indexes[table_name]),
                 foreign_keys=tuple(foreign_keys[table_name]),
                 estimated_rows=estimated_rows.get(table_name),
             )
             for table_name, table_columns in sorted(grouped_columns.items())
         )
-        return SchemaSnapshot(tables=tables)
+        return SchemaSnapshot(tables=tables, non_table_objects=tuple(non_table_objects))
 
     def read_rows(
         self,
@@ -580,11 +599,136 @@ class PostgresSourceAdapter:
             )
         return foreign_keys
 
+    def _fetch_indexes(self, connection: Any, schema: str) -> dict[str, list[IndexSchema]]:
+        query = """
+            select
+                table_name,
+                index_name,
+                bool_or(is_unique) as is_unique,
+                max(index_method) as index_method,
+                max(predicate_expression) as predicate_expression,
+                max(index_expression) as index_expression,
+                array_agg(column_name order by ordinal_position) filter (where column_name is not null) as column_names
+            from (
+                select
+                    tab.relname as table_name,
+                    idx.relname as index_name,
+                    ix.indisunique as is_unique,
+                    am.amname as index_method,
+                    pg_get_expr(ix.indpred, ix.indrelid) as predicate_expression,
+                    pg_get_expr(ix.indexprs, ix.indrelid) as index_expression,
+                    att.attname as column_name,
+                    keys.ordinality as ordinal_position,
+                    ix.indisprimary as is_primary
+                from pg_class tab
+                join pg_namespace ns on ns.oid = tab.relnamespace
+                join pg_index ix on ix.indrelid = tab.oid
+                join pg_class idx on idx.oid = ix.indexrelid
+                join pg_am am on am.oid = idx.relam
+                join unnest(ix.indkey) with ordinality as keys(attnum, ordinality) on true
+                left join pg_attribute att on att.attrelid = tab.oid and att.attnum = keys.attnum
+                where ns.nspname = %s
+                  and tab.relkind = 'r'
+                  and not ix.indisprimary
+            ) indexed_columns
+            group by table_name, index_name
+            order by table_name, index_name
+        """
+        indexes: dict[str, list[IndexSchema]] = defaultdict(list)
+        with connection.cursor() as cursor:
+            cursor.execute(query, (schema,))
+            for row in cursor.fetchall():
+                columns = tuple(str(column) for column in (row["column_names"] or ()))
+                manual_review_reason = _postgres_index_manual_review_reason(
+                    columns=columns,
+                    method=str(row["index_method"]),
+                    predicate=row["predicate_expression"],
+                    expression=row["index_expression"],
+                )
+                indexes[str(row["table_name"])].append(
+                    IndexSchema(
+                        name=str(row["index_name"]),
+                        columns=columns,
+                        unique=bool(row["is_unique"]),
+                        method=str(row["index_method"]),
+                        auto_create_candidate=manual_review_reason is None,
+                        manual_review_reason=manual_review_reason,
+                    )
+                )
+        return indexes
+
+    def _fetch_non_table_objects(self, connection: Any, schema: str) -> list[SchemaObjectSummary]:
+        objects: list[SchemaObjectSummary] = []
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select table_schema, table_name
+                from information_schema.views
+                where table_schema = %s
+                order by table_name
+                """,
+                (schema,),
+            )
+            objects.extend(
+                SchemaObjectSummary(kind=SchemaObjectKind.VIEW, schema=str(row["table_schema"]), name=str(row["table_name"]))
+                for row in cursor.fetchall()
+            )
+            cursor.execute(
+                """
+                select routine_schema, routine_name, routine_type
+                from information_schema.routines
+                where routine_schema = %s
+                order by routine_type, routine_name
+                """,
+                (schema,),
+            )
+            for row in cursor.fetchall():
+                routine_type = str(row["routine_type"]).lower()
+                kind = SchemaObjectKind.PROCEDURE if routine_type == "procedure" else SchemaObjectKind.FUNCTION
+                objects.append(SchemaObjectSummary(kind=kind, schema=str(row["routine_schema"]), name=str(row["routine_name"])))
+            cursor.execute(
+                """
+                select trigger_schema, trigger_name, event_object_schema, event_object_table
+                from information_schema.triggers
+                where trigger_schema = %s
+                order by trigger_name
+                """,
+                (schema,),
+            )
+            objects.extend(
+                SchemaObjectSummary(
+                    kind=SchemaObjectKind.TRIGGER,
+                    schema=str(row["trigger_schema"]),
+                    name=str(row["trigger_name"]),
+                    parent_table=TableRef(schema=str(row["event_object_schema"]), name=str(row["event_object_table"])),
+                )
+                for row in cursor.fetchall()
+            )
+        return objects
+
 
 def dict_row_factory() -> Any:
     from psycopg.rows import dict_row
 
     return dict_row
+
+
+def _postgres_index_manual_review_reason(
+    *,
+    columns: tuple[str, ...],
+    method: str,
+    predicate: object,
+    expression: object,
+) -> str | None:
+    if not columns:
+        return "Expression index requires manual conversion."
+    if str(method).lower() != "btree":
+        return f"PostgreSQL {method} index method requires target DBMS review."
+    if predicate is not None:
+        return "Partial index predicate requires manual conversion."
+    if expression is not None:
+        return "Expression index requires manual conversion."
+    return None
 
 
 def _format_source_type(row: dict[str, Any]) -> str:

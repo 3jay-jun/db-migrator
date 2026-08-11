@@ -332,6 +332,7 @@ def test_migrate_tables_reruns_completed_checkpoint_when_target_is_empty(tmp_pat
     users = next(table for table in snapshot.tables if table.ref.name == "users")
     checkpoint_store = CheckpointStore(tmp_path / "checkpoint.sqlite")
     source = FakeSourceReader({"users": [{"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"}]})
+    event_queue: Queue[MigrationEvent] = Queue()
 
     migrate_tables(
         job_id="job-1",
@@ -349,12 +350,16 @@ def test_migrate_tables_reruns_completed_checkpoint_when_target_is_empty(tmp_pat
         source=source,
         target=second_target,
         checkpoint_store=checkpoint_store,
-        event_publisher=QueueEventPublisher(Queue()),
+        event_publisher=QueueEventPublisher(event_queue),
         migration_config=MigrationConfig(batch_size=1),
     )
 
     assert result.tables[0].status == "completed"
     assert second_target.written_batches
+    events = [event_queue.get() for _ in range(event_queue.qsize())]
+    stale_events = [event for event in events if event.type is EventType.CHECKPOINT_STALE]
+    assert len(stale_events) == 1
+    assert stale_events[0].message.startswith("Checkpoint stale: users.")
 
 
 def test_append_mode_blocks_existing_target_rows(tmp_path) -> None:

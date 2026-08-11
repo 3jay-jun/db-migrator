@@ -6,7 +6,9 @@ import typer
 from rich.console import Console
 
 from db_migrator.application import CommandResult, MigrationApplicationService
+from db_migrator.config.models import IndexApplyTiming
 from db_migrator.cli.console_events import ConsoleEventPublisher
+from db_migrator.core.events import CompositeEventPublisher, EventPublisher, FileEventPublisher
 from db_migrator.selftest.package_check import check_pyinstaller_available
 from db_migrator.selftest.runner import run_self_test
 
@@ -25,7 +27,9 @@ def main() -> None:
 @app.command()
 def bootstrap(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
     result = _service.run_bootstrap(config)
+    file_events = FileEventPublisher()
     for event in result.events:
+        file_events.publish(event)
         console.print(f"[{event.level}] {event.message}")
     _print_or_fail(result)
 
@@ -59,9 +63,19 @@ def migrate_data(
             config=config,
             schema_file=schema_file,
             checkpoint_db=checkpoint_db,
-            event_publisher=ConsoleEventPublisher(console),
+            event_publisher=_tracked_console_events(),
         )
     )
+
+
+@app.command("apply-indexes")
+def apply_indexes(
+    config: Path = typer.Option(..., "--config", "-c"),
+    schema_file: Path | None = typer.Option(None, "--schema-file"),
+    output_file: Path | None = typer.Option(None, "--output-file"),
+    phase: IndexApplyTiming = typer.Option(IndexApplyTiming.POST_DATA, "--phase"),
+) -> None:
+    _print_or_fail(_service.run_apply_indexes(config=config, schema_file=schema_file, output_file=output_file, phase=phase))
 
 
 @app.command("resume")
@@ -75,7 +89,7 @@ def resume(
             config=config,
             schema_file=schema_file,
             checkpoint_db=checkpoint_db,
-            event_publisher=ConsoleEventPublisher(console),
+            event_publisher=_tracked_console_events(),
         )
     )
 
@@ -91,7 +105,7 @@ def retry_failed(
             config=config,
             schema_file=schema_file,
             checkpoint_db=checkpoint_db,
-            event_publisher=ConsoleEventPublisher(console),
+            event_publisher=_tracked_console_events(),
         )
     )
 
@@ -128,7 +142,7 @@ def self_test_run(
         large_rows=large_rows,
         keep_containers=keep_containers,
         work_dir=work_dir,
-        event_publisher=ConsoleEventPublisher(console),
+        event_publisher=_tracked_console_events(),
     )
     if not result.success:
         raise typer.BadParameter(result.message)
@@ -156,3 +170,7 @@ def _print_or_fail(result: CommandResult) -> None:
     if not result.success:
         raise typer.BadParameter(result.message)
     console.print(result.message)
+
+
+def _tracked_console_events() -> EventPublisher:
+    return CompositeEventPublisher(ConsoleEventPublisher(console), FileEventPublisher())

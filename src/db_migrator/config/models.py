@@ -24,6 +24,15 @@ class MigrationMode(StrEnum):
     DDL_AND_DML = "ddl_and_dml"
     DRY_RUN = "dry_run"
     INCREMENTAL = "incremental"
+    MANUAL = "manual"
+    MANUAL_DDL = "manual_ddl"
+
+
+class IndexApplyTiming(StrEnum):
+    PRE_DATA = "pre_data"
+    POST_DATA = "post_data"
+    MANUAL_REVIEW = "manual_review"
+    SKIP = "skip"
 
 
 class ExistingTablePolicy(StrEnum):
@@ -64,6 +73,9 @@ class MigrationConfig(BaseModel):
     mode: MigrationMode = MigrationMode.DRY_RUN
     existing_table_policy: ExistingTablePolicy = ExistingTablePolicy.SKIP
     apply_foreign_keys: bool = False
+    apply_indexes: bool = True
+    index_large_table_threshold: int = Field(default=1_000_000, ge=0)
+    index_apply_overrides: dict[str, IndexApplyTiming] = Field(default_factory=dict)
     batch_size: int = Field(default=10_000, gt=0)
     large_row_batch_size: int | None = Field(default=None, gt=0)
     commit_interval: int = Field(default=10_000, gt=0)

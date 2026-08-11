@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 from db_migrator.config.models import VerificationConfig
 from db_migrator.reports.metadata import ReportEndpoint
 from db_migrator.schema.common_types import CommonTypeKind
-from db_migrator.schema.models import RowData, SamplePosition, TableRef, TableSchema
+from db_migrator.schema.models import RowData, SamplePosition, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.object_checks import SchemaObjectComparison, compare_schema_objects
 
 
 class ValidationStatus:
@@ -66,6 +67,8 @@ class ValidationMetadata:
     generated_at: str
     source: ReportEndpoint | None = None
     target: ReportEndpoint | None = None
+    migration_mode: str | None = None
+    existing_table_policy: str | None = None
     checksum_sample_size: int | None = None
     checksum_timezone: str | None = None
     checksum_datetime_precision: str | None = None
@@ -105,12 +108,15 @@ class ValidationReport:
     job_id: str
     tables: tuple[TableValidationResult, ...]
     metadata: ValidationMetadata
+    schema_objects: tuple[SchemaObjectComparison, ...] = ()
 
     @property
     def status(self) -> str:
         if any(table.status == ValidationStatus.FAILED for table in self.tables):
             return ValidationStatus.FAILED
-        if any(table.status == ValidationStatus.MISMATCHED for table in self.tables):
+        if any(table.status == ValidationStatus.MISMATCHED for table in self.tables) or any(
+            schema_object.status in {"missing", "mismatched", "target_only"} for schema_object in self.schema_objects
+        ):
             return ValidationStatus.MISMATCHED
         return ValidationStatus.MATCHED
 
@@ -137,6 +143,8 @@ def validate_tables(
     verification: VerificationConfig,
     metadata: ValidationMetadata | None = None,
     target_table_resolver: Callable[[TableRef], TableRef] | None = None,
+    source_snapshot: SchemaSnapshot | None = None,
+    target_snapshot: SchemaSnapshot | None = None,
 ) -> ValidationReport:
     profile = NormalizationProfile(
         datetime_precision=verification.checksum_datetime_precision,
@@ -147,6 +155,9 @@ def validate_tables(
         job_id=job_id,
         metadata=metadata or _default_metadata(verification),
         tables=tuple(_validate_one_table(table, reader, verification, profile, target_table_resolver) for table in tables),
+        schema_objects=compare_schema_objects(source_snapshot, target_snapshot)
+        if source_snapshot is not None and target_snapshot is not None
+        else (),
     )
 
 

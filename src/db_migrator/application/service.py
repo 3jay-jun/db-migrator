@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
@@ -11,7 +11,7 @@ from db_migrator.adapters.mysql import MySqlAdapterError
 from db_migrator.adapters.postgres import PostgresAdapterError
 from db_migrator.adapters.registry import AdapterRegistryError, DbmsAdapterRegistry, default_adapter_registry
 from db_migrator.config.loader import ConfigLoadError, load_config
-from db_migrator.config.models import AppConfig, Dbms
+from db_migrator.config.models import AppConfig, Dbms, IndexApplyTiming, SourceConfig
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
 from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables
@@ -19,6 +19,8 @@ from db_migrator.core.engine import MigrationEngine
 from db_migrator.core.events import EventPublisher, MigrationEvent, QueueEventPublisher
 from db_migrator.core.health import run_health_checks
 from db_migrator.core.incremental import migrate_incremental_tables
+from db_migrator.core.indexes import execute_index_ddls
+from db_migrator.core.manual_migration import export_manual_migration_files
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation_readers import SourceTargetValidationReader
 from db_migrator.application.table_mapping import TargetMappingAdapter
@@ -26,7 +28,7 @@ from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, wr
 from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.incremental_report import write_incremental_report
 from db_migrator.reports.metadata import ReportEndpoint
-from db_migrator.schema.models import SchemaSnapshot, TableSchema
+from db_migrator.schema.models import ForeignKeySchema, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
 from db_migrator.schema.snapshot_io import SchemaSnapshotLoadError, load_schema_snapshot_from_json
 from db_migrator.schema.table_mapping import TableMappingResolver
 
@@ -147,10 +149,13 @@ class MigrationApplicationService:
             target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
             report = build_dry_run_report(
                 target_snapshot,
+                source_snapshot=snapshot,
+                source_dbms=app_config.source.dbms,
                 target_dbms=app_config.target.dbms,
                 target_database=app_config.target.database,
                 metadata=_dry_run_metadata(app_config),
                 registry=self._registry,
+                app_config=app_config,
             )
             resolved_output_dir = output_dir or Path(app_config.report.output_dir)
             write_dry_run_report(report, resolved_output_dir)
@@ -204,6 +209,46 @@ class MigrationApplicationService:
         except _KNOWN_ERRORS as exc:
             return _failure("apply-ddl", exc)
 
+    def run_apply_indexes(
+        self,
+        *,
+        config: Path,
+        schema_file: Path | None = None,
+        output_file: Path | None = None,
+        phase: IndexApplyTiming = IndexApplyTiming.POST_DATA,
+        selected_tables: set[str] | None = None,
+    ) -> CommandResult:
+        try:
+            app_config = load_config(config)
+            source = self._registry.create_source(app_config.source)
+            target = self._registry.create_target(app_config.target)
+            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
+            snapshot = _filter_snapshot(snapshot, selected_tables)
+            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
+            resolved_output_file = output_file or Path(app_config.report.output_dir) / f"index-execution-{phase.value}.json"
+            summary = execute_index_ddls(
+                config=app_config,
+                snapshot=target_snapshot,
+                executor=target,
+                phase=phase,
+                report_output_path=resolved_output_file,
+            )
+            failed_count = sum(1 for result in summary.indexes if not result.success)
+            return CommandResult(
+                command="apply-indexes",
+                success=failed_count == 0,
+                message=(
+                    f"index_execution_report={resolved_output_file} phase={phase.value} "
+                    f"indexes={len(summary.indexes)} failed={failed_count}"
+                ),
+                output_file=resolved_output_file,
+                table_count=len({(result.schema, result.table) for result in summary.indexes}),
+                warning_count=failed_count,
+                details={"phase": phase.value, "decisions": summary.decisions, "indexes": summary.indexes},
+            )
+        except _KNOWN_ERRORS as exc:
+            return _failure("apply-indexes", exc)
+
     def run_generate_manual_ddl(
         self,
         *,
@@ -235,6 +280,50 @@ class MigrationApplicationService:
             )
         except _KNOWN_ERRORS + (OSError,) as exc:
             return _failure("generate-manual-ddl", exc)
+
+    def run_generate_manual_migration(
+        self,
+        *,
+        config: Path,
+        schema_file: Path | None = None,
+        output_dir: Path | None = None,
+        selected_tables: set[str] | None = None,
+    ) -> CommandResult:
+        try:
+            app_config = load_config(config)
+            source = self._registry.create_source(app_config.source)
+            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
+            snapshot = _filter_snapshot(snapshot, selected_tables)
+            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
+            generator = self._registry.create_ddl_generator(app_config.target.dbms, target_database=app_config.target.database)
+            statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
+            ddl_sql = "\n\n".join(statements)
+            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
+            export = export_manual_migration_files(
+                source=source,
+                source_tables=snapshot.tables,
+                target_tables=target_snapshot.tables,
+                target_dbms=app_config.target.dbms,
+                target_database=app_config.target.database,
+                migration_config=app_config.migration,
+                ddl_sql=ddl_sql,
+                output_dir=resolved_output_dir,
+            )
+            return CommandResult(
+                command="generate-manual-migration",
+                success=True,
+                message=(
+                    f"manual_migration={export.ddl_file.parent} tables={len(export.tables)} "
+                    f"rows_exported={export.rows_exported}"
+                ),
+                output_dir=export.ddl_file.parent,
+                output_file=export.load_sql_file,
+                table_count=len(export.tables),
+                rows_written=export.rows_exported,
+                details={"ddl_file": export.ddl_file, "load_sql_file": export.load_sql_file, "tables": export.tables},
+            )
+        except _KNOWN_ERRORS + (OSError, ValueError) as exc:
+            return _failure("generate-manual-migration", exc)
 
     def run_migrate_data(
         self,
@@ -305,10 +394,13 @@ class MigrationApplicationService:
             app_config = load_config(config)
             source = self._registry.create_source(app_config.source)
             target = self._registry.create_target(app_config.target)
+            target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config))
             resolver = TableMappingResolver(app_config)
             target = TargetMappingAdapter(target, resolver)
             snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
             snapshot = _filter_snapshot(snapshot, selected_tables)
+            expected_target_snapshot = _schema_scan_expected_snapshot(resolver.target_snapshot_for(snapshot), app_config)
+            actual_target_snapshot = target_schema_reader.scan_schema(_target_schema_name(app_config))
             report = validate_tables(
                 job_id=app_config.job.name,
                 tables=snapshot.tables,
@@ -316,6 +408,8 @@ class MigrationApplicationService:
                 verification=app_config.verification,
                 metadata=_validation_metadata(app_config),
                 target_table_resolver=resolver.target_ref_for,
+                source_snapshot=expected_target_snapshot,
+                target_snapshot=actual_target_snapshot,
             )
             resolved_output_dir = output_dir or Path(app_config.report.output_dir)
             write_validation_report(report, resolved_output_dir)
@@ -520,7 +614,59 @@ def _validation_metadata(app_config: AppConfig) -> ValidationMetadata:
             database=app_config.target.database,
             schema=app_config.target.schema_name,
         ),
+        migration_mode=app_config.migration.mode.value,
+        existing_table_policy=app_config.migration.existing_table_policy.value,
         checksum_sample_size=app_config.verification.checksum_sample_size,
         checksum_timezone=app_config.verification.checksum_timezone,
         checksum_datetime_precision=app_config.verification.checksum_datetime_precision,
     )
+
+
+def _target_schema_scan_config(app_config: AppConfig) -> SourceConfig:
+    return SourceConfig(
+        dbms=app_config.target.dbms,
+        host=app_config.target.host,
+        port=app_config.target.port,
+        database=app_config.target.database,
+        schema=_target_schema_name(app_config),
+        user=app_config.target.user,
+        password=app_config.target.password,
+    )
+
+
+def _target_schema_name(app_config: AppConfig) -> str:
+    if app_config.target.schema_name:
+        return app_config.target.schema_name
+    if app_config.target.dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+        return app_config.target.database
+    return app_config.source.schema_name
+
+
+def _schema_scan_expected_snapshot(snapshot: SchemaSnapshot, app_config: AppConfig) -> SchemaSnapshot:
+    schema_name = _target_schema_name(app_config)
+    return SchemaSnapshot(
+        tables=tuple(_schema_scan_expected_table(table, schema_name) for table in snapshot.tables),
+        non_table_objects=tuple(_schema_scan_expected_object(schema_object, schema_name) for schema_object in snapshot.non_table_objects),
+    )
+
+
+def _schema_scan_expected_table(table: TableSchema, schema_name: str) -> TableSchema:
+    ref = TableRef(schema=schema_name, name=table.ref.name)
+    return replace(
+        table,
+        ref=ref,
+        foreign_keys=tuple(_schema_scan_expected_foreign_key(foreign_key, schema_name) for foreign_key in table.foreign_keys),
+    )
+
+
+def _schema_scan_expected_foreign_key(foreign_key: ForeignKeySchema, schema_name: str) -> ForeignKeySchema:
+    return replace(foreign_key, referenced_table=TableRef(schema=schema_name, name=foreign_key.referenced_table.name))
+
+
+def _schema_scan_expected_object(schema_object: SchemaObjectSummary, schema_name: str) -> SchemaObjectSummary:
+    parent_table = (
+        TableRef(schema=schema_name, name=schema_object.parent_table.name)
+        if schema_object.parent_table is not None
+        else None
+    )
+    return replace(schema_object, schema=schema_name, parent_table=parent_table)

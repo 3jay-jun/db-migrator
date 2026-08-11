@@ -23,6 +23,24 @@ class IndexSchema:
     name: str
     columns: tuple[str, ...]
     unique: bool = False
+    method: str | None = None
+    auto_create_candidate: bool = True
+    manual_review_reason: str | None = None
+
+
+class SchemaObjectKind(StrEnum):
+    VIEW = "view"
+    FUNCTION = "function"
+    PROCEDURE = "procedure"
+    TRIGGER = "trigger"
+
+
+@dataclass(frozen=True)
+class SchemaObjectSummary:
+    kind: SchemaObjectKind
+    schema: str
+    name: str
+    parent_table: TableRef | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +77,7 @@ class TableSchema:
 @dataclass(frozen=True)
 class SchemaSnapshot:
     tables: tuple[TableSchema, ...]
+    non_table_objects: tuple[SchemaObjectSummary, ...] = field(default_factory=tuple)
 
 
 RowData = dict[str, Any]

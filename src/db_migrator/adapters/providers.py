@@ -26,11 +26,17 @@ class DbmsProvider:
     def create_ddl_generator(self, *, target_database: str | None = None) -> DdlGenerator:
         raise DbmsCapabilityError(f"Unsupported target DDL DBMS: {self.dbms.value}")
 
+    def create_source_ddl_generator(self) -> DdlGenerator:
+        raise DbmsCapabilityError(f"Unsupported source DDL DBMS: {self.dbms.value}")
+
     def source_type_to_common(self, source_type: str, *, is_generated: bool = False) -> CommonType:
         raise DbmsCapabilityError(f"Unsupported source type DBMS: {self.dbms.value}")
 
     def common_type_to_target(self, common_type: CommonType) -> str:
         raise DbmsCapabilityError(f"Unsupported target type DBMS: {self.dbms.value}")
+
+    def common_type_to_source_ddl(self, common_type: CommonType) -> str:
+        return common_type.source_type or self.common_type_to_target(common_type)
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,9 @@ class PostgresProvider(DbmsProvider):
 
     def create_ddl_generator(self, *, target_database: str | None = None) -> DdlGenerator:
         return PostgresDdlGenerator(target_database=target_database, target_type_mapper=self.common_type_to_target)
+
+    def create_source_ddl_generator(self) -> DdlGenerator:
+        return PostgresDdlGenerator(target_type_mapper=self.common_type_to_source_ddl)
 
     def source_type_to_common(self, source_type: str, *, is_generated: bool = False) -> CommonType:
         return postgres_type_to_common(source_type, is_generated=is_generated)
@@ -65,6 +74,9 @@ class MySqlProvider(DbmsProvider):
 
     def create_ddl_generator(self, *, target_database: str | None = None) -> DdlGenerator:
         return MySqlDdlGenerator(target_database=target_database, target_type_mapper=self.common_type_to_target)
+
+    def create_source_ddl_generator(self) -> DdlGenerator:
+        return MySqlDdlGenerator(target_type_mapper=self.common_type_to_source_ddl)
 
     def common_type_to_target(self, common_type: CommonType) -> str:
         return common_type_to_mysql(common_type)

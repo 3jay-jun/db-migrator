@@ -4,6 +4,7 @@ from pathlib import Path
 from db_migrator.config.models import VerificationConfig
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.reports.final_report import write_validation_report
+from db_migrator.schema.models import IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -33,7 +34,7 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
         reader=MatchingReader(),
         verification=VerificationConfig(),
         metadata=ValidationMetadata(
-            generated_at="2026-08-10T12:00:00+09:00",
+            generated_at="2026-08-10T03:00:00+00:00",
             source=ValidationEndpoint(
                 dbms="postgresql",
                 host="source.local",
@@ -47,6 +48,8 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
                 port=3306,
                 database="target_db",
             ),
+            migration_mode="ddl_and_dml",
+            existing_table_policy="overwrite",
             checksum_sample_size=100,
             checksum_timezone="Asia/Seoul",
             checksum_datetime_precision="microseconds",
@@ -64,19 +67,45 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
     assert "Jigration 검증 리포트" in html
     assert "--color-primary: oklch(0.000 0.000 0)" in html
     assert "이슈 및 권장 조치" in html
-    assert "정상 이관 샘플" in html
-    assert "이관 전 원본" in html
-    assert "이관 후 대상" in html
+    assert "검산 샘플" in html
+    assert "원본 값" in html
+    assert "대상 값" in html
+    assert "검증 결과" in html
+    assert "성공" in html
     assert "총 테이블 수" in html
-    assert "총 원본 행 수" in html
-    assert "총 매칭 행 수" in html
-    assert "총 오류 수" in html
+    assert "전체 데이터 수" in html
+    assert "총 이관 수" in html
+    assert "이슈 테이블 수" in html
+    assert "스키마 객체 이슈 수" in html
     assert "테이블별 검증 요약" in html
-    assert "원본 행 수" in html
-    assert "대상 행 수" in html
-    assert "매칭 행 수" in html
-    assert "전체 상태" in html
+    assert "행 수 차이" in html
+    assert "대표 이슈" in html
+    assert "다음 조치" in html
+    assert "샘플 값 차이 수" not in html
+    assert "샘플 값 검증" not in html
+    assert "<h2>검산 샘플</h2>" not in html
+    assert "작업 ID" not in html
+    assert "전체 상태" not in html
+    assert "총 원본 행 수" not in html
+    assert "총 매칭 행 수" not in html
+    assert "매칭 행 수" not in html
+    assert "값 차이/정상 샘플" not in html
     assert "검증 대상 및 기준" in html
+    assert "작업 식별자" not in html
+    assert "2026-08-10 12:00:00" in html
+    assert "2026-08-10T03:00:00+00:00" not in html
+    assert "실행 방식" in html
+    assert "기본 이관" in html
+    assert "기존 테이블 처리" in html
+    assert "덮어쓰기" in html
+    assert "일시 비교 정밀도" in html
+    assert "마이크로초" in html
+    assert "행 수 비교" not in html
+    assert "검산 샘플 비교" not in html
+    assert "검산 샘플 수" not in html
+    assert "<dt>검증 테이블</dt>" not in html
+    assert "<dt>이슈 테이블</dt>" not in html
+    assert "<dt>테이블 상태</dt>" not in html
     assert "POSTGRESQL" in html
     assert "source.local:5432" in html
     assert "source_db" in html
@@ -84,10 +113,9 @@ def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path
     assert "target.local:3306" in html
     assert "target_db" in html
     assert "Asia/Seoul" in html
-    assert "일치 1, 불일치 0, 실패 0, 건너뜀 0" in html
-    assert "일치" in html
     assert "id=1" in html
-    assert "검증 이슈가 없습니다. 원본과 대상이 일치합니다." in html
+    assert "테이블 관련 이슈 및 조치사항이 없습니다." in html
+    assert "스키마 객체 관련 이슈 및 조치사항이 없습니다." in html
 
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["metadata"]["source"]["database"] == "source_db"
@@ -117,7 +145,7 @@ def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
 
     html = (tmp_path / "summary.html").read_text(encoding="utf-8")
     assert "행 수" in html
-    assert "체크섬" in html
+    assert "검산 샘플" in html
     assert "colspan=\"6\"" in html
     assert "issue-summary" in html
     assert "difference-panel" in html
@@ -129,6 +157,9 @@ def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
     assert "대상에 1행이 부족합니다." in html
     assert "email의 값 변환을 확인하세요." in html
     assert "테이블별 검증 요약" in html
+    assert "대표 이슈" in html
+    assert "다음 조치" in html
+    assert "대상 1행 부족" in html
     assert "2" in html
     assert "1" in html
 
@@ -137,3 +168,54 @@ def test_write_validation_report_includes_issue_actions(tmp_path: Path) -> None:
     assert "row_number" not in differences_csv
     assert "source@example.com" in differences_csv
     assert "target@example.com" in differences_csv
+
+
+def test_write_validation_report_includes_schema_object_mismatches(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    source_table = snapshot.tables[0]
+    expected = SchemaSnapshot(
+        tables=(
+            source_table.__class__(
+                ref=source_table.ref,
+                columns=source_table.columns,
+                primary_key=source_table.primary_key,
+                indexes=(
+                    IndexSchema(name="idx_users_email", columns=("email",), unique=True, method="btree"),
+                    IndexSchema(
+                        name="idx_users_profile_expr",
+                        columns=(),
+                        auto_create_candidate=False,
+                        manual_review_reason="Expression index requires manual conversion.",
+                    ),
+                ),
+            ),
+        ),
+        non_table_objects=(SchemaObjectSummary(kind=SchemaObjectKind.VIEW, schema="public", name="active_users"),),
+    )
+    actual = SchemaSnapshot(tables=(source_table,), non_table_objects=())
+    report = validate_tables(
+        job_id="job-1",
+        tables=(source_table,),
+        reader=MatchingReader(),
+        verification=VerificationConfig(),
+        source_snapshot=expected,
+        target_snapshot=actual,
+    )
+
+    write_validation_report(report, tmp_path)
+
+    assert report.status == "mismatched"
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["summary"]["schema_object_issue_count"] == 3
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert "스키마 객체 검증" in html
+    assert "idx_users_email" in html
+    assert "idx_users_profile_expr" in html
+    assert "active_users" in html
+    assert "누락" in html
+    assert "수동 검토" in html
+    assert "Expression index requires manual conversion." in html
+    schema_objects_csv = (tmp_path / "schema-objects.csv").read_text(encoding="utf-8")
+    assert "idx_users_email" in schema_objects_csv
+    assert "idx_users_profile_expr" in schema_objects_csv
+    assert "active_users" in schema_objects_csv

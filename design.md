@@ -11,14 +11,14 @@ last_updated: "2026-08-10"
 
 ## 1. Purpose
 
-DB Migrator의 HTML 리포트 UI를 위한 프로젝트 전용 디자인 기준이다. 대상 화면은 `dry-run`, validation, incremental 등 사람이 직접 검토하는 리포트이며, 1차 적용 대상은 dry-run report다.
+DB Migrator의 HTML 리포트 UI를 위한 프로젝트 전용 디자인 기준이다. 대상 화면은 사전 점검, 검증, 증분 이관 등 사람이 직접 검토하는 리포트이며, 1차 적용 대상은 사전 점검 리포트다.
 
 리포트의 목적은 예쁘게 보이는 대시보드가 아니라, 운영자가 다음 결정을 빠르게 내리도록 돕는 것이다.
 
-- target DDL 실행 전 변환 위험을 확인한다.
-- warning의 원인과 조치사항을 한 화면에서 확인한다.
-- validation mismatch의 table, row identity, column, source value, target value를 한 화면에서 확인한다.
-- table별 DDL preview를 필요할 때 펼쳐 본다.
+- 대상 테이블 생성 SQL 실행 전 변환 위험을 확인한다.
+- 검토 필요 항목의 원인과 조치사항을 한 화면에서 확인한다.
+- 검증 실패의 table, row identity, column, source value, target value를 한 화면에서 확인한다.
+- table별 생성 SQL preview를 필요할 때 펼쳐 본다.
 - HTML 단일 파일만 열어도 정보 구조와 스타일이 유지된다.
 
 ## 2. Design Source And Override
@@ -63,7 +63,7 @@ Generated UI에는 외부 디자인 시스템명, 패키지명, class prefix, so
 - 흰색 section/card surface
 - 1px neutral border
 - 의미 있는 상태 색상만 제한적으로 사용
-- metric summary → warnings/actions → table DDL preview 순서
+- metric summary → 검토 필요 항목/actions → table 생성 SQL preview 순서
 
 ## 4. Color Tokens
 
@@ -199,44 +199,39 @@ Letter spacing은 `0`을 기본으로 한다. 리포트 UI에서는 과도하게
 
 ## 9. Report Information Architecture
 
-Dry-run report는 다음 순서를 따른다.
+사전 점검 리포트는 다음 순서를 따른다.
 
 1. Header
 2. Metric summary
 3. Migration Context
-4. Warnings & Recommended Actions
-5. Table DDL Preview
+4. 검토 필요 항목 및 권장 조치
+5. 테이블 생성 SQL 비교
 
 ### Header
 
 필수 요소:
 
-- eyebrow: `Dry-run Report`
-- H1: `DB Migrator Dry-run Report`
-- description: target DDL 실행 전 schema 변환 위험과 조치사항을 검토한다는 목적
+- eyebrow: `사전 점검 리포트`
+- H1: `DB Migrator 사전 점검 리포트`
+- description: 대상 테이블 생성 SQL 실행 전 schema 변환 위험과 조치사항을 검토한다는 목적
 
 ### Metric Summary
 
 Metric card 3개를 기본으로 한다.
 
 - Total tables
-- Total warnings
-- Next step
-
-`Next step` 값:
-
-- warning이 있으면 `Review`
-- warning이 없으면 `Apply DDL`
+- 검토 필요 항목 수
+- 수동 검토 객체 수
 
 ### Migration Context
 
-Dry-run report에는 `이관 정보` 섹션을 metric summary 바로 아래에 배치한다. 이 섹션은 보고서 수신자가 어떤 source schema를 어떤 target database로 변환하려는 dry-run인지 한눈에 판단하기 위한 필수 정보다.
+사전 점검 리포트에는 `이관 정보` 섹션을 metric summary 바로 아래에 배치한다. 이 섹션은 보고서 수신자가 어떤 source schema를 어떤 target database로 변환하려는 사전 점검인지 한눈에 판단하기 위한 필수 정보다.
 
 필수 블록:
 
 - 원본 DB: DBMS, host/port, database, schema
 - 대상 DB: DBMS, host/port, database
-- Dry-run 기준: 실행 시각, 이관 모드, 기존 테이블 정책, DDL 실행 여부, 결과 요약
+- 사전 점검 기준: 실행 시각, 이관 모드, 기존 테이블 처리, 테이블 생성 SQL 실행 여부
 
 금지:
 
@@ -245,27 +240,27 @@ Dry-run report에는 `이관 정보` 섹션을 metric summary 바로 아래에 �
 - connection string 원문
 - 기타 credential 또는 secret
 
-### Warnings & Recommended Actions
+### 검토 필요 항목 및 권장 조치
 
-리포트의 핵심 영역이다. warning을 숫자로만 보여주면 안 된다.
+리포트의 핵심 영역이다. 검토 필요 항목을 숫자로만 보여주면 안 된다.
 
 필수 컬럼:
 
 - schema
 - table
 - severity
-- warning
-- recommended action
+- 검토 필요 항목
+- 권장 조치
 
-warning이 없을 때는 단일 empty row로 안내한다.
+검토 필요 항목이 없을 때는 단일 empty row로 안내한다.
 
 ```text
-No warnings. DDL can move to apply review.
+검토 필요 항목이 없습니다. 대상 테이블 생성 SQL 실행 검토 단계로 진행할 수 있습니다.
 ```
 
-### Table DDL Preview
+### 테이블 생성 SQL 비교
 
-DDL은 table별 `<details>`로 접어둔다. 기본 화면에서는 schema/table/warning 상태를 먼저 보여주고, SQL은 필요할 때 펼쳐 본다.
+생성 SQL은 table별 `<details>`로 접어둔다. 기본 화면에서는 schema/table/검토 필요 항목 상태를 먼저 보여주고, SQL은 필요할 때 펼쳐 본다.
 
 DDL code block은 dark neutral surface를 사용하고 horizontal scroll을 허용한다.
 
@@ -322,7 +317,7 @@ Badge는 22px 높이, 좌우 8px padding, pill radius를 사용한다.
 
 ## 11. Warning Action Rules
 
-warning은 반드시 조치사항과 함께 노출한다. action mapping은 report writer의 SSOT 함수와 일치해야 한다.
+검토 필요 항목은 반드시 조치사항과 함께 노출한다. action mapping은 report writer의 SSOT 함수와 일치해야 한다.
 
 | Warning type | Recommended action |
 | --- | --- |
@@ -347,14 +342,15 @@ warning은 반드시 조치사항과 함께 노출한다. action mapping은 repo
 
 ## 13. Validation Report Requirements
 
-Validation report는 단순히 `matched` / `mismatched` 상태만 보여주면 안 된다. 불일치가 있으면 운영자가 바로 원인을 좁힐 수 있도록 다음 정보를 HTML에 표시한다.
+검증 리포트는 단순히 `matched` / `mismatched` 상태만 보여주면 안 된다. 불일치가 있으면 운영자가 바로 원인을 좁힐 수 있도록 다음 정보를 HTML에 표시한다.
 
 필수 섹션:
 
-- Metric summary: job id, overall status, total tables, issue count
-- 검증 대상 및 기준: source/target DBMS, host/port, database/schema, 실행 시각, sample size, timezone, datetime precision, 상태별 table count
+- Metric summary: 검증 결과, 총 테이블 수, 전체 데이터 수, 총 이관 수, 이슈 테이블 수, 스키마 객체 이슈 수
+- 검증 대상 및 기준: source/target DBMS, host/port, database/schema, 실행 시각, 실행 방식, 기존 테이블 처리, 시간대 기준, 일시 비교 정밀도
+- 테이블별 검증 요약: 스키마, 테이블명, 검증 결과, 전체 데이터 수, 이관 수, 행 수 차이, 대표 이슈, 다음 조치
 - Issues & Recommended Actions: row count/checksum 단위 이슈, 조치사항, checksum sample 값 차이
-- Matched Transfer Samples: table별 정상 매칭 sample 최대 3건의 as-is -> to-be 값
+- 검산 샘플: 테이블별 검증 요약 row를 펼쳤을 때 table별 정상 매칭 sample 최대 3건의 원본 -> 대상 값
 
 `검증 대상 및 기준`은 metric summary 바로 아래에 배치한다. 비밀번호와 사용자명은 표시하지 않는다. host/port, database, schema는 보고서 수신자가 어떤 환경을 검증했는지 판단하는 최소 정보로 표시한다.
 
@@ -362,7 +358,7 @@ HTML report는 문제 해결에 필요한 이슈만 보여준다. 전체 table�
 
 `Issues & Recommended Actions`에서 checksum mismatch table은 table row 전체를 `<details>` summary로 렌더링한다. table name을 클릭하면 같은 issue 아래에 table 전체 width를 사용하는 diff panel을 펼쳐 본다.
 
-`Matched Transfer Samples`는 문제 테이블 아래에 배치한다. table별 `<details>`로 접어두고, 펼치면 row identity, as-is source, to-be target을 보여준다. 이 섹션은 전체 데이터 정합성을 증명하는 용도가 아니라 운영자가 “정상적으로 들어간 데이터도 눈으로 확인”하는 검산용이다.
+`검산 샘플`은 별도 섹션으로 분리하지 않고 `테이블별 검증 요약` row의 펼침 영역에 배치한다. 펼치면 row identity, 원본 값, 대상 값을 보여준다. 이 섹션은 전체 데이터 정합성을 증명하는 용도가 아니라 운영자가 “정상적으로 들어간 데이터도 눈으로 확인”하는 검산용이다.
 
 펼침 영역 필수 컬럼:
 
@@ -384,9 +380,9 @@ HTML report는 문제 해결에 필요한 이슈만 보여준다. 전체 table�
 
 Do:
 
-- `Target DDL을 실행하기 전에 schema 변환 위험과 조치사항을 검토하는 리포트입니다.`
-- `No warnings. DDL can move to apply review.`
-- `View CREATE TABLE`
+- `대상 테이블 생성 SQL을 실행하기 전에 스키마 변환 위험과 조치사항을 검토하는 리포트입니다.`
+- `검토 필요 항목이 없습니다. 대상 테이블 생성 SQL 실행 검토 단계로 진행할 수 있습니다.`
+- `원본 / 대상 테이블 생성 SQL 비교`
 
 Avoid:
 
@@ -398,8 +394,8 @@ Avoid:
 ## 15. Do
 
 - token을 CSS custom properties로 먼저 정의한다.
-- warning과 action을 같은 table row에 표시한다.
-- DDL은 접어두되 HTML 안에서 바로 열람 가능하게 한다.
+- 검토 필요 항목과 action을 같은 table row에 표시한다.
+- 생성 SQL은 접어두되 HTML 안에서 바로 열람 가능하게 한다.
 - primary black은 metric, badge, focus, disclosure에만 제한적으로 쓴다.
 - card/section은 1px border로 분리한다.
 - HTML 단독 파일로 스타일이 유지되게 inline CSS를 유지한다.
@@ -408,7 +404,7 @@ Avoid:
 
 ## 16. Don't
 
-- warning 상세를 CSV/JSON에서만 확인하게 만들지 않는다.
+- 검토 필요 항목 상세를 CSV/JSON에서만 확인하게 만들지 않는다.
 - validation mismatch를 hash만으로 설명하지 않는다.
 - gradient, glass, blur, texture, decorative illustration을 사용하지 않는다.
 - report card에 기본 shadow를 넣지 않는다.
