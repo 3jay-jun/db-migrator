@@ -54,6 +54,36 @@ target:
 
 `source.database`는 PostgreSQL의 DB명이고, `source.schema`는 그 DB 안의 schema명입니다. DB명이 틀려도 schema scan 단계에서 실패하므로, 에러 메시지의 `database=... schema=... detail=...` 부분을 같이 확인하세요.
 
+### SSH 터널로 private DB 접속
+
+AWS EC2/VPC 내부 DB처럼 외부에서 직접 접근할 수 없는 DB는 `source.tunnel` 또는 `target.tunnel`을 사용합니다. `host`/`port`에는 프로그램이 붙을 로컬 터널 endpoint를 적고, `tunnel.remote_host`/`tunnel.remote_port`에는 SSH 서버에서 접근 가능한 실제 DB endpoint를 적습니다.
+
+```yaml
+source:
+  dbms: postgresql
+  host: 127.0.0.1
+  port: 15433
+  database: legacy
+  schema: public
+  user: readonly_user
+  password: null
+  tunnel:
+    enabled: true
+    ssh_host: ec2-public.example.com
+    ssh_port: 22
+    ssh_user: ec2-user
+    auth_type: key
+    private_key_path: C:\keys\service.pem
+    private_key_passphrase_env: SSH_KEY_PASSPHRASE
+    known_hosts_path: null
+    remote_host: 127.0.0.1
+    remote_port: 5432
+    local_host: 127.0.0.1
+    local_port: 15433
+```
+
+`auth_type: password`를 쓰면 `private_key_path` 대신 `ssh_password`를 설정합니다. `known_hosts_path`를 비워두면 기본값은 `{사용자}/.ssh/known_hosts`입니다. 처음 접속하는 EC2라면 먼저 `ssh-keyscan` 또는 일반 SSH 접속으로 host key를 등록한 뒤 실행하세요. `local_port`는 메인 DB 설정의 `port`와 맞춰 두는 것이 GUI에서 가장 직관적입니다. `local_port: 0`은 자동 포트 선택이지만 실행 전에는 메인 DB 포트에 표시할 수 없습니다.
+
 ## 권장 실행 순서
 
 1. 로컬 환경 점검

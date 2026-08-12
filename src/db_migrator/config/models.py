@@ -48,6 +48,27 @@ class JobConfig(BaseModel):
     name: str = Field(default="db-migration-job", min_length=1)
 
 
+class SshAuthenticationType(StrEnum):
+    KEY = "key"
+    PASSWORD = "password"
+
+
+class SshTunnelConfig(BaseModel):
+    enabled: bool = False
+    ssh_host: str | None = Field(default=None, min_length=1)
+    ssh_port: int = Field(default=22, gt=0, le=65535)
+    ssh_user: str | None = Field(default=None, min_length=1)
+    auth_type: SshAuthenticationType = SshAuthenticationType.KEY
+    private_key_path: str | None = Field(default=None, min_length=1)
+    private_key_passphrase_env: str | None = Field(default=None, min_length=1)
+    ssh_password: str | None = None
+    known_hosts_path: str | None = Field(default=None, min_length=1)
+    remote_host: str | None = Field(default=None, min_length=1)
+    remote_port: int | None = Field(default=None, gt=0, le=65535)
+    local_host: str = Field(default="127.0.0.1", min_length=1)
+    local_port: int = Field(default=0, ge=0, le=65535)
+
+
 class SourceConfig(BaseModel):
     dbms: Dbms = Dbms.POSTGRESQL
     host: str = "localhost"
@@ -56,6 +77,7 @@ class SourceConfig(BaseModel):
     schema_name: str = Field(default="public", alias="schema")
     user: str = Field(default="readonly_user", min_length=1)
     password: str | None = None
+    tunnel: SshTunnelConfig = Field(default_factory=SshTunnelConfig)
 
 
 class TargetConfig(BaseModel):
@@ -67,6 +89,7 @@ class TargetConfig(BaseModel):
     user: str = Field(default="migration_user", min_length=1)
     password: str | None = None
     environment: TargetEnvironment = TargetEnvironment.STAGING
+    tunnel: SshTunnelConfig = Field(default_factory=SshTunnelConfig)
 
 
 class MigrationConfig(BaseModel):

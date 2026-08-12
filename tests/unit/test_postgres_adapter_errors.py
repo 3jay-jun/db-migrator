@@ -5,8 +5,54 @@ from typing import Iterator
 
 import pytest
 
-from db_migrator.adapters.postgres import PostgresAdapterError, PostgresSourceAdapter
-from db_migrator.config.models import SourceConfig
+from db_migrator.adapters.postgres import PostgresAdapterError, PostgresSourceAdapter, PostgresTargetAdapter
+from db_migrator.config.models import SourceConfig, TargetConfig
+
+
+def test_source_connection_test_reports_driver_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresSourceAdapter(
+        SourceConfig(host="127.0.0.1", port=15432, database="source_db", user="readonly", password="secret")
+    )
+
+    def fail_connect() -> object:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(adapter, "_connect", fail_connect)
+
+    with pytest.raises(PostgresAdapterError) as exc_info:
+        adapter.test_connection()
+
+    message = str(exc_info.value)
+    assert "PostgreSQL connection test failed" in message
+    assert "host=127.0.0.1" in message
+    assert "port=15432" in message
+    assert "database=source_db" in message
+    assert "user=readonly" in message
+    assert "detail=connection refused" in message
+    assert "secret" not in message
+
+
+def test_target_connection_test_reports_driver_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresTargetAdapter(
+        TargetConfig(host="127.0.0.1", port=15433, database="target_db", user="migration", password="secret")
+    )
+
+    def fail_connect() -> object:
+        raise RuntimeError("password authentication failed")
+
+    monkeypatch.setattr(adapter, "_connect", fail_connect)
+
+    with pytest.raises(PostgresAdapterError) as exc_info:
+        adapter.test_connection()
+
+    message = str(exc_info.value)
+    assert "PostgreSQL connection test failed" in message
+    assert "host=127.0.0.1" in message
+    assert "port=15433" in message
+    assert "database=target_db" in message
+    assert "user=migration" in message
+    assert "detail=password authentication failed" in message
+    assert "secret" not in message
 
 
 def test_scan_schema_reports_connection_context(monkeypatch: pytest.MonkeyPatch) -> None:

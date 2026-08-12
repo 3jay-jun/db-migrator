@@ -8,6 +8,7 @@ from typing import Callable, Iterable, Protocol
 from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
+from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
 from db_migrator.config.models import SourceConfig, TargetConfig, WatermarkConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
 from db_migrator.schema.models import (
@@ -73,7 +74,7 @@ class MySqlSourceAdapter:
                     cursor.execute("select 1 as ok")
                     return int(cursor.fetchone()["ok"]) == 1
         except Exception as exc:
-            raise MySqlAdapterError("MySQL/MariaDB connection test failed.") from exc
+            raise MySqlAdapterError(connection_test_failure_message("MySQL/MariaDB", self._config, exc)) from exc
 
     def scan_schema(self, schema: str) -> SchemaSnapshot:
         try:
@@ -88,7 +89,7 @@ class MySqlSourceAdapter:
                 except Exception as exc:
                     raise MySqlAdapterError(
                         f"MySQL/MariaDB schema metadata query failed for schema '{schema}'. "
-                        f"Check source.schema and metadata permissions. detail={_safe_error_detail(exc)}"
+                        f"Check source.schema and metadata permissions. detail={safe_error_detail(exc)}"
                     ) from exc
         except MySqlAdapterError:
             raise
@@ -97,7 +98,7 @@ class MySqlSourceAdapter:
                 "MySQL/MariaDB connection failed before schema scan. "
                 f"host={self._config.host} port={self._config.port} "
                 f"database={self._config.database} user={self._config.user} schema={schema}. "
-                f"detail={_safe_error_detail(exc)}"
+                f"detail={safe_error_detail(exc)}"
             ) from exc
 
         grouped_columns: dict[str, list[ColumnSchema]] = defaultdict(list)
@@ -451,7 +452,7 @@ class MySqlTargetAdapter:
                     cursor.execute("select 1")
                     return cursor.fetchone()[0] == 1
         except Exception as exc:
-            raise MySqlAdapterError("MySQL/MariaDB connection test failed.") from exc
+            raise MySqlAdapterError(connection_test_failure_message("MySQL/MariaDB", self._config, exc)) from exc
 
     def table_exists(self, table_schema: TableSchema) -> bool:
         query = """
@@ -478,7 +479,7 @@ class MySqlTargetAdapter:
         except Exception as exc:
             raise MySqlAdapterError(
                 "Failed to execute target DDL. "
-                f"target_database={self._config.database} ddl={_compact_sql(ddl)} detail={_safe_error_detail(exc)}"
+                f"target_database={self._config.database} ddl={_compact_sql(ddl)} detail={safe_error_detail(exc)}"
             ) from exc
 
     def truncate_table(self, table_schema: TableSchema) -> ExecutionResult:
@@ -806,11 +807,6 @@ def _unique_warning_messages(warnings: Iterable[str]) -> tuple[str, ...]:
         if isinstance(warning, str) and warning not in unique_warnings:
             unique_warnings.append(warning)
     return tuple(unique_warnings)
-
-
-def _safe_error_detail(exc: Exception) -> str:
-    detail = str(exc).strip()
-    return detail or exc.__class__.__name__
 
 
 def _compact_sql(sql: str) -> str:

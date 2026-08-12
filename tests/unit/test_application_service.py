@@ -64,6 +64,45 @@ def test_service_connection_tests_use_configured_adapters(tmp_path: Path) -> Non
     assert target_result.success is True
 
 
+def test_service_resolves_tunnel_endpoint_for_source_and_target(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    tunnel_factory = FakeTunnelFactory()
+    service = MigrationApplicationService(registry, tunnel_factory=tunnel_factory)
+    config_path = _write_tunnel_config(tmp_path)
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json")
+
+    assert result.success is True
+    assert registry.source_configs[-1].host == "127.0.0.1"
+    assert registry.source_configs[-1].port == 15000
+    assert registry.target_configs[-1].host == "127.0.0.1"
+    assert registry.target_configs[-1].port == 15001
+    assert [tunnel.stopped for tunnel in tunnel_factory.tunnels] == [True, True]
+
+
+def test_service_connection_test_reports_db_and_tunnel_endpoints(tmp_path: Path) -> None:
+    service = MigrationApplicationService(FakeRegistry(), tunnel_factory=FakeTunnelFactory())
+    config_path = _write_tunnel_config(tmp_path)
+
+    result = service.run_test_source_connection(config=config_path)
+
+    assert result.success is True
+    assert "db_endpoint=10.0.1.10:5432" in result.message
+    assert "tunnel_local_endpoint=127.0.0.1:15000" in result.message
+
+
+def test_service_validate_resolves_target_schema_scan_tunnel(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry, tunnel_factory=FakeTunnelFactory())
+    config_path = _write_tunnel_config(tmp_path)
+
+    result = service.run_validate(config=config_path, output_dir=tmp_path / "reports")
+
+    assert result.success is True
+    assert [config.port for config in registry.source_configs] == [15000, 15001]
+    assert registry.source_configs[-1].database == "target_db"
+
+
 def test_service_apply_ddl_accepts_gui_dry_run_report_override(tmp_path: Path) -> None:
     service = MigrationApplicationService(FakeRegistry())
     config_path = _write_config(
@@ -264,11 +303,15 @@ class FakeRegistry:
     def __init__(self) -> None:
         self.source = FakeAdapter()
         self.target = FakeAdapter()
+        self.source_configs = []
+        self.target_configs = []
 
     def create_source(self, _config):
+        self.source_configs.append(_config)
         return self.source
 
     def create_target(self, _config):
+        self.target_configs.append(_config)
         return self.target
 
     def create_ddl_generator(self, _dbms, *, target_database: str | None = None):
@@ -347,6 +390,30 @@ class FakeAdapter:
         return ({"id": 1},)
 
 
+class FakeTunnelFactory:
+    def __init__(self) -> None:
+        self.tunnels: list[FakeTunnel] = []
+
+    def create(self, *, label: str, endpoint_host: str, endpoint_port: int, config):
+        tunnel = FakeTunnel(label=label, local_port=15000 + len(self.tunnels))
+        self.tunnels.append(tunnel)
+        return tunnel
+
+
+class FakeTunnel:
+    def __init__(self, *, label: str, local_port: int) -> None:
+        self.label = label
+        self.local_bind_host = "127.0.0.1"
+        self.local_bind_port = local_port
+        self.stopped = False
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def _snapshot() -> SchemaSnapshot:
     return SchemaSnapshot(
         tables=(
@@ -405,3 +472,39 @@ target:
         encoding="utf-8",
     )
     return config_path
+
+
+def _write_tunnel_config(tmp_path: Path) -> Path:
+    key_file = tmp_path / "service.pem"
+    key_file.write_text("fake key", encoding="utf-8")
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("fake known hosts", encoding="utf-8")
+    return _write_config(
+        tmp_path,
+        f"""
+source:
+  dbms: postgresql
+  host: 10.0.1.10
+  port: 5432
+  database: source_db
+  schema: public
+  tunnel:
+    enabled: true
+    ssh_host: source-ec2.example.com
+    ssh_user: ec2-user
+    private_key_path: {key_file}
+    known_hosts_path: {known_hosts}
+target:
+  dbms: mysql
+  host: 10.0.2.20
+  port: 3306
+  database: target_db
+  environment: staging
+  tunnel:
+    enabled: true
+    ssh_host: target-ec2.example.com
+    ssh_user: ec2-user
+    private_key_path: {key_file}
+    known_hosts_path: {known_hosts}
+""",
+    )

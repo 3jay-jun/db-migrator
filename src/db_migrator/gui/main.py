@@ -11,7 +11,17 @@ from db_migrator.application import CommandResult, MigrationApplicationService, 
 from db_migrator.application.events import event_to_view
 from db_migrator.application.safety import evaluate_dry_run_gate
 from db_migrator.config.loader import ConfigLoadError, load_config
-from db_migrator.config.models import AppConfig, Dbms, ExistingTablePolicy, IndexApplyTiming, MigrationMode, TableRunConfig
+from db_migrator.config.models import (
+    AppConfig,
+    Dbms,
+    ExistingTablePolicy,
+    IndexApplyTiming,
+    MigrationMode,
+    SshAuthenticationType,
+    SshTunnelConfig,
+    TableRunConfig,
+)
+from db_migrator.connection import SshConnectionTester, TunnelError
 from db_migrator.core.events import EventPublisher, FileEventPublisher, MigrationEvent
 
 
@@ -100,8 +110,11 @@ if Signal is not None:
         def __init__(self, emit_event: Callable[[MigrationEvent], None]) -> None:
             self._emit_event = emit_event
             self._file_events = FileEventPublisher()
+            self.cancel_requested = False
 
         def publish(self, event: MigrationEvent) -> None:
+            if self.cancel_requested:
+                raise KeyboardInterrupt("Operation cancelled by user.")
             self._file_events.publish(event)
             self._emit_event(event)
 
@@ -114,11 +127,19 @@ if Signal is not None:
             super().__init__()
             self._label = label
             self._command = command
+            self._publisher: WorkerEventPublisher | None = None
+
+        def cancel(self) -> None:
+            if self._publisher is not None:
+                self._publisher.cancel_requested = True
 
         @Slot()
         def run(self) -> None:
             try:
-                result = self._command(WorkerEventPublisher(self.event_published.emit))
+                self._publisher = WorkerEventPublisher(self.event_published.emit)
+                result = self._command(self._publisher)
+            except KeyboardInterrupt:
+                result = CommandResult(command=self._label, success=False, message="작업이 취소되었습니다.")
             except Exception as exc:
                 result = CommandResult(command=self._label, success=False, message=f"작업 실행 중 오류가 발생했습니다: {exc}")
             self.completed.emit(result)
@@ -131,8 +152,11 @@ if Signal is not None:
             self._thread: QThread | None = None
             self._worker: CommandWorker | None = None
             self._running_label: str | None = None
+            self._cancel_requested = False
             self._manual_apply_foreign_keys = False
             self._syncing_foreign_key_option = False
+            self._source_tunnel_config = SshTunnelConfig()
+            self._target_tunnel_config = SshTunnelConfig()
             self._last_dry_run_report: Path | None = None
             self._last_report_html: Path | None = None
             self._buttons: list[QPushButton] = []
@@ -187,6 +211,10 @@ if Signal is not None:
             self._buttons.append(self.migrate_button)
             self._table_actions.append(self.migrate_button)
             actions.addWidget(self.migrate_button)
+            self.cancel_button = QPushButton("취소")
+            self.cancel_button.clicked.connect(self._cancel_running_command)
+            self.cancel_button.setEnabled(False)
+            actions.addWidget(self.cancel_button)
             layout.addLayout(actions)
 
             self.recovery_group = QGroupBox("복구 작업")
@@ -220,9 +248,12 @@ if Signal is not None:
             self.source_user = QLineEdit()
             self.source_password = QLineEdit()
             self.source_password.setEchoMode(QLineEdit.EchoMode.Password)
+            self.source_tunnel_enabled = QCheckBox("Use SSH Tunnel")
+            source_tunnel_button = QPushButton("SSH 터널 설정")
+            source_tunnel_button.clicked.connect(lambda: self._open_tunnel_settings("source"))
             test_button = QPushButton("원본 연결 테스트")
             test_button.clicked.connect(self._test_source)
-            self._buttons.append(test_button)
+            self._buttons.extend([source_tunnel_button, test_button])
             form.addRow("DBMS", self.source_dbms)
             form.addRow("호스트", self.source_host)
             form.addRow("포트", self.source_port)
@@ -230,6 +261,7 @@ if Signal is not None:
             form.addRow("스키마", self.source_schema)
             form.addRow("사용자", self.source_user)
             form.addRow("비밀번호", self.source_password)
+            form.addRow("SSH 터널", _inline_row(self.source_tunnel_enabled, source_tunnel_button))
             form.addRow("", test_button)
             return group
 
@@ -245,9 +277,12 @@ if Signal is not None:
             self.target_user = QLineEdit()
             self.target_password = QLineEdit()
             self.target_password.setEchoMode(QLineEdit.EchoMode.Password)
+            self.target_tunnel_enabled = QCheckBox("Use SSH Tunnel")
+            target_tunnel_button = QPushButton("SSH 터널 설정")
+            target_tunnel_button.clicked.connect(lambda: self._open_tunnel_settings("target"))
             test_button = QPushButton("대상 연결 테스트")
             test_button.clicked.connect(self._test_target)
-            self._buttons.append(test_button)
+            self._buttons.extend([target_tunnel_button, test_button])
             form.addRow("DBMS", self.target_dbms)
             form.addRow("호스트", self.target_host)
             form.addRow("포트", self.target_port)
@@ -255,6 +290,7 @@ if Signal is not None:
             form.addRow("기본 대상 스키마", self.target_schema)
             form.addRow("사용자", self.target_user)
             form.addRow("비밀번호", self.target_password)
+            form.addRow("SSH 터널", _inline_row(self.target_tunnel_enabled, target_tunnel_button))
             form.addRow("", test_button)
             return group
 
@@ -316,6 +352,11 @@ if Signal is not None:
                 self.config_path.setText(path)
                 self.config_label.setText(f"설정 파일: {self.config_path.text()}")
                 self._load_config_into_form(show_errors=True)
+
+        def _choose_file(self, line_edit: QLineEdit, title: str) -> None:
+            path, _ = QFileDialog.getOpenFileName(self, title, str(Path.cwd()), "All files (*)")
+            if path:
+                line_edit.setText(path)
 
         def _choose_schema(self) -> None:
             path, _ = QFileDialog.getOpenFileName(self, "Choose schema snapshot", str(Path.cwd()), "JSON files (*.json);;All files (*)")
@@ -714,9 +755,50 @@ if Signal is not None:
             self._thread.finished.connect(self._thread.deleteLater)
             self._thread.finished.connect(self._clear_worker)
             self._set_running(True)
+            self._cancel_requested = False
             self.status.setText(f"실행 중: {label}")
             self.log.appendPlainText(f"> {label}")
             self._thread.start()
+
+        def _cancel_running_command(self) -> None:
+            if self._worker is None:
+                return
+            self._cancel_requested = True
+            self._worker.cancel()
+            self.cancel_button.setEnabled(False)
+            if self._is_immediate_cancel_command(self._running_label):
+                self.cancel_button.setText("취소 중")
+                self.status.setText(f"취소 중: {self._running_label or '작업'}")
+                self.log.appendPlainText("연결/테스트 작업을 즉시 취소합니다.")
+                self._terminate_running_thread()
+                return
+            if self._thread is not None:
+                self._thread.requestInterruption()
+            self.cancel_button.setText("취소 요청됨")
+            self.status.setText(f"취소 요청됨: {self._running_label or '작업'}")
+            self.log.appendPlainText("취소 요청됨. 현재 처리 중인 DB 호출이 끝나면 작업을 중단합니다.")
+
+        def _is_immediate_cancel_command(self, label: str | None) -> bool:
+            return bool(label and ("연결 테스트" in label or "테스트" in label))
+
+        def _terminate_running_thread(self) -> None:
+            if self._thread is None:
+                return
+            label = self._running_label or "작업"
+            _safe_disconnect(self._thread.started)
+            _safe_disconnect(self._thread.finished)
+            self._thread.terminate()
+            self._thread.wait(3000)
+            if self._worker is not None:
+                self._worker.deleteLater()
+            if self._thread is not None:
+                self._thread.deleteLater()
+            self._thread = None
+            self._worker = None
+            self._running_label = None
+            self._set_running(False)
+            self.status.setText("취소됨")
+            self.log.appendPlainText(f"{label}이 취소되었습니다.")
 
         @Slot(object)
         def _append_event(self, event: MigrationEvent) -> None:
@@ -755,6 +837,8 @@ if Signal is not None:
         def _set_running(self, running: bool) -> None:
             for button in self._buttons:
                 button.setEnabled(not running)
+            self.cancel_button.setEnabled(running)
+            self.cancel_button.setText("취소")
             if not running:
                 self._set_table_actions_enabled(self.table_list.count() > 0)
 
@@ -802,6 +886,29 @@ if Signal is not None:
                 self.config_label.setText(f"설정 파일: {self.config_path.text()}")
                 self._load_config_into_form(show_errors=True)
 
+        def _open_tunnel_settings(self, side: str) -> None:
+            current = self._source_tunnel_config if side == "source" else self._target_tunnel_config
+            label = "원본" if side == "source" else "대상"
+            enabled = self.source_tunnel_enabled.isChecked() if side == "source" else self.target_tunnel_enabled.isChecked()
+            current = current.model_copy(update={"enabled": enabled})
+            db_host = self.source_host.text().strip() if side == "source" else self.target_host.text().strip()
+            db_port = self.source_port.value() if side == "source" else self.target_port.value()
+            dialog = SshTunnelDialog(self, label=label, config=current, db_host=db_host, db_port=db_port)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if side == "source":
+                self._source_tunnel_config = dialog.tunnel_config(enabled=self.source_tunnel_enabled.isChecked())
+                self._sync_db_endpoint_from_tunnel(self.source_host, self.source_port, self._source_tunnel_config)
+            else:
+                self._target_tunnel_config = dialog.tunnel_config(enabled=self.target_tunnel_enabled.isChecked())
+                self._sync_db_endpoint_from_tunnel(self.target_host, self.target_port, self._target_tunnel_config)
+
+        def _sync_db_endpoint_from_tunnel(self, host: QLineEdit, port: QSpinBox, tunnel: SshTunnelConfig) -> None:
+            if not tunnel.enabled or tunnel.local_port == 0:
+                return
+            host.setText(tunnel.local_host)
+            port.setValue(tunnel.local_port)
+
         def _load_config_into_form(self, *, show_errors: bool) -> None:
             try:
                 config = load_config(self._config())
@@ -816,6 +923,8 @@ if Signal is not None:
             self.source_schema.setText(config.source.schema_name)
             self.source_user.setText(config.source.user)
             self.source_password.setText(config.source.password or "")
+            self._source_tunnel_config = config.source.tunnel.model_copy(deep=True)
+            self.source_tunnel_enabled.setChecked(config.source.tunnel.enabled)
             self.target_dbms.setCurrentText(config.target.dbms.value)
             self.target_host.setText(config.target.host)
             self.target_port.setValue(config.target.port)
@@ -823,6 +932,8 @@ if Signal is not None:
             self.target_schema.setText(config.target.schema_name or "")
             self.target_user.setText(config.target.user)
             self.target_password.setText(config.target.password or "")
+            self._target_tunnel_config = config.target.tunnel.model_copy(deep=True)
+            self.target_tunnel_enabled.setChecked(config.target.tunnel.enabled)
             policy = config.migration.existing_table_policy
             self._set_existing_table_policy(policy if policy in GUI_EXISTING_TABLE_POLICIES else ExistingTablePolicy.SKIP)
             self._manual_apply_foreign_keys = config.migration.apply_foreign_keys
@@ -848,6 +959,7 @@ if Signal is not None:
             config.source.schema_name = self.source_schema.text().strip()
             config.source.user = self.source_user.text().strip()
             config.source.password = self.source_password.text() or None
+            config.source.tunnel = self._source_tunnel_config.model_copy(update={"enabled": self.source_tunnel_enabled.isChecked()})
             config.target.dbms = Dbms(self.target_dbms.currentText())
             config.target.host = self.target_host.text().strip()
             config.target.port = self.target_port.value()
@@ -855,7 +967,7 @@ if Signal is not None:
             config.target.schema_name = self.target_schema.text().strip() or None
             config.target.user = self.target_user.text().strip()
             config.target.password = self.target_password.text() or None
-            config.target.environment = AppConfig().target.environment
+            config.target.tunnel = self._target_tunnel_config.model_copy(update={"enabled": self.target_tunnel_enabled.isChecked()})
             config.migration.mode = self._selected_migration_mode()
             config.migration.existing_table_policy = self._selected_existing_table_policy()
             config.migration.apply_foreign_keys = self._effective_apply_foreign_keys()
@@ -1185,6 +1297,179 @@ if Signal is not None:
             )
 
 
+    class SshTunnelDialog(QDialog):
+        def __init__(self, parent: MainWindow, *, label: str, config: SshTunnelConfig, db_host: str, db_port: int) -> None:
+            super().__init__(parent)
+            self._label = label
+            self._test_thread: QThread | None = None
+            self._test_worker: CommandWorker | None = None
+            self._test_cancel_requested = False
+            self.setWindowTitle(f"{label} SSH 터널 설정")
+            self.resize(620, 360)
+            layout = QVBoxLayout(self)
+
+            connection_group = QGroupBox("SSH 연결")
+            connection_form = QFormLayout(connection_group)
+            self.host = QLineEdit(config.ssh_host or "")
+            self.port = _spin(1, 65535)
+            self.port.setValue(config.ssh_port)
+            self.username = QLineEdit(config.ssh_user or "")
+            self.auth_type = _combo([auth.value for auth in SshAuthenticationType])
+            self.auth_type.setCurrentText(config.auth_type.value)
+            self.password = QLineEdit(config.ssh_password or "")
+            self.password.setEchoMode(QLineEdit.EchoMode.Password)
+            self.key_path = QLineEdit(config.private_key_path or "")
+            connection_form.addRow("Host", self.host)
+            connection_form.addRow("SSH Port", self.port)
+            connection_form.addRow("Username", self.username)
+            connection_form.addRow("Authentication type", self.auth_type)
+            connection_form.addRow("Password", self.password)
+            connection_form.addRow("Key path", _path_row(self.key_path, self._choose_key, "찾기"))
+            layout.addWidget(connection_group)
+
+            remote_group = QGroupBox("터널 대상 DB")
+            remote_form = QFormLayout(remote_group)
+            self.remote_host = QLineEdit(config.remote_host or db_host)
+            self.remote_port = _spin(1, 65535)
+            self.remote_port.setValue(config.remote_port or db_port)
+            remote_form.addRow("실제 DB Host", self.remote_host)
+            remote_form.addRow("실제 DB Port", self.remote_port)
+            layout.addWidget(remote_group)
+
+            advanced_group = QGroupBox("옵션")
+            advanced_form = QFormLayout(advanced_group)
+            self.local_host = QLineEdit(config.local_host)
+            self.local_port = _spin(0, 65535)
+            self.local_port.setValue(config.local_port)
+            self.local_port.setToolTip("0이면 실행 시 사용 가능한 로컬 포트를 자동 선택합니다.")
+            self.known_hosts = QLineEdit(config.known_hosts_path or str(Path.home() / ".ssh" / "known_hosts"))
+            advanced_form.addRow("터널 로컬 호스트", self.local_host)
+            advanced_form.addRow("터널 로컬 포트", self.local_port)
+            advanced_form.addRow("known_hosts", _path_row(self.known_hosts, self._choose_known_hosts, "찾기"))
+            layout.addWidget(advanced_group)
+
+            actions = QHBoxLayout()
+            self.test_button = QPushButton("SSH 연결 테스트")
+            self.test_button.clicked.connect(self._test_connection)
+            self.cancel_test_button = QPushButton("취소")
+            self.cancel_test_button.clicked.connect(self._cancel_test_connection)
+            self.cancel_test_button.setEnabled(False)
+            actions.addWidget(self.test_button)
+            actions.addWidget(self.cancel_test_button)
+            actions.addStretch(1)
+            self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            self.buttons.accepted.connect(self.accept)
+            self.buttons.rejected.connect(self.reject)
+            actions.addWidget(self.buttons)
+            layout.addLayout(actions)
+            self.auth_type.currentTextChanged.connect(self._sync_auth_fields)
+            self._sync_auth_fields()
+
+        def tunnel_config(self, *, enabled: bool | None = None) -> SshTunnelConfig:
+            known_hosts = self.known_hosts.text().strip()
+            default_known_hosts = str(Path.home() / ".ssh" / "known_hosts")
+            auth_type = SshAuthenticationType(self.auth_type.currentText())
+            return SshTunnelConfig(
+                enabled=True if enabled is None else enabled,
+                ssh_host=self.host.text().strip() or None,
+                ssh_port=self.port.value(),
+                ssh_user=self.username.text().strip() or None,
+                auth_type=auth_type,
+                private_key_path=(self.key_path.text().strip() or None) if auth_type is SshAuthenticationType.KEY else None,
+                ssh_password=(self.password.text() or None) if auth_type is SshAuthenticationType.PASSWORD else None,
+                known_hosts_path=None if known_hosts == default_known_hosts else known_hosts or None,
+                remote_host=self.remote_host.text().strip() or None,
+                remote_port=self.remote_port.value(),
+                local_host=self.local_host.text().strip() or "127.0.0.1",
+                local_port=self.local_port.value(),
+            )
+
+        def _sync_auth_fields(self, _value: str | None = None) -> None:
+            is_password = self.auth_type.currentText() == SshAuthenticationType.PASSWORD.value
+            self.password.setEnabled(is_password)
+            self.key_path.setEnabled(not is_password)
+
+        def _test_connection(self) -> None:
+            if self._test_thread is not None:
+                return
+            config = self.tunnel_config(enabled=True)
+            self._test_thread = QThread()
+            self._test_worker = CommandWorker("ssh-test", lambda _publisher: self._run_ssh_test(config))
+            self._test_worker.moveToThread(self._test_thread)
+            self._test_thread.started.connect(self._test_worker.run)
+            self._test_worker.completed.connect(self._ssh_test_completed)
+            self._test_worker.completed.connect(self._test_thread.quit)
+            self._test_worker.completed.connect(self._test_worker.deleteLater)
+            self._test_thread.finished.connect(self._test_thread.deleteLater)
+            self._test_thread.finished.connect(self._clear_ssh_test_worker)
+            self._set_testing(True)
+            self._test_cancel_requested = False
+            self._test_thread.start()
+
+        def _run_ssh_test(self, config: SshTunnelConfig) -> CommandResult:
+            try:
+                SshConnectionTester().test(label=self._label, config=config)
+            except TunnelError as exc:
+                return CommandResult(command="ssh-test", success=False, message=str(exc))
+            return CommandResult(command="ssh-test", success=True, message="SSH 연결에 성공했습니다.")
+
+        def _cancel_test_connection(self) -> None:
+            if self._test_worker is None:
+                return
+            self._test_cancel_requested = True
+            self._test_worker.cancel()
+            self.cancel_test_button.setEnabled(False)
+            self.cancel_test_button.setText("취소 중")
+            self._terminate_test_thread()
+
+        @Slot(object)
+        def _ssh_test_completed(self, result: CommandResult) -> None:
+            if self._test_cancel_requested:
+                QMessageBox.information(self, "SSH 연결 테스트 취소", "SSH 연결 테스트가 취소되었습니다.")
+            elif result.success:
+                QMessageBox.information(self, "SSH 연결 테스트 성공", result.message)
+            else:
+                QMessageBox.warning(self, "SSH 연결 테스트 실패", result.message)
+
+        @Slot()
+        def _clear_ssh_test_worker(self) -> None:
+            self._test_thread = None
+            self._test_worker = None
+            self._set_testing(False)
+
+        def _terminate_test_thread(self) -> None:
+            if self._test_thread is None:
+                return
+            _safe_disconnect(self._test_thread.started)
+            _safe_disconnect(self._test_thread.finished)
+            self._test_thread.terminate()
+            self._test_thread.wait(3000)
+            if self._test_worker is not None:
+                self._test_worker.deleteLater()
+            if self._test_thread is not None:
+                self._test_thread.deleteLater()
+            self._test_thread = None
+            self._test_worker = None
+            self._set_testing(False)
+            QMessageBox.information(self, "SSH 연결 테스트 취소", "SSH 연결 테스트가 취소되었습니다.")
+
+        def _set_testing(self, testing: bool) -> None:
+            self.test_button.setEnabled(not testing)
+            self.cancel_test_button.setEnabled(testing)
+            self.cancel_test_button.setText("취소")
+            self.buttons.setEnabled(not testing)
+
+        def _choose_key(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(self, "SSH KEY 선택", str(Path.cwd()), "All files (*)")
+            if path:
+                self.key_path.setText(path)
+
+        def _choose_known_hosts(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(self, "known_hosts 선택", str(Path.home() / ".ssh"), "All files (*)")
+            if path:
+                self.known_hosts.setText(path)
+
+
     class SettingsDialog(QDialog):
         def __init__(self, window: MainWindow) -> None:
             super().__init__(window)
@@ -1267,6 +1552,24 @@ if Signal is not None:
         button.clicked.connect(handler)
         layout.addWidget(button)
         return row
+
+
+    def _inline_row(*widgets: QWidget) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for widget in widgets:
+            layout.addWidget(widget)
+        layout.addStretch(1)
+        return row
+
+
+    def _safe_disconnect(signal: object) -> None:
+        try:
+            disconnect = getattr(signal, "disconnect")
+            disconnect()
+        except (RuntimeError, TypeError):
+            return
 
 
     def _combo(values: list[str]) -> QComboBox:

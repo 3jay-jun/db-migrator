@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterable, Protocol
 from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
+from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
 from db_migrator.config.models import WatermarkConfig
 from db_migrator.config.models import SourceConfig, TargetConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
@@ -53,7 +54,7 @@ class PostgresTargetAdapter:
                     row = cursor.fetchone()
                     return _first_row_value(row) == 1
         except Exception as exc:
-            raise PostgresAdapterError("PostgreSQL connection test failed.") from exc
+            raise PostgresAdapterError(connection_test_failure_message("PostgreSQL", self._config, exc)) from exc
 
     def table_exists(self, table_schema: TableSchema) -> bool:
         query = """
@@ -82,7 +83,7 @@ class PostgresTargetAdapter:
         except Exception as exc:
             raise PostgresAdapterError(
                 "Failed to execute target DDL. "
-                f"target_database={self._config.database} ddl={_compact_sql(ddl)} detail={_safe_error_detail(exc)}"
+                f"target_database={self._config.database} ddl={_compact_sql(ddl)} detail={safe_error_detail(exc)}"
             ) from exc
 
     def truncate_table(self, table_schema: TableSchema) -> ExecutionResult:
@@ -111,7 +112,7 @@ class PostgresTargetAdapter:
             return WriteResult(success=True, rows_written=len(rows), message="Batch written.")
         except Exception as exc:
             raise PostgresAdapterError(
-                f"Failed to write target batch for table: {table_schema.ref.name}. detail={_safe_error_detail(exc)}"
+                f"Failed to write target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
             ) from exc
 
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
@@ -140,7 +141,7 @@ class PostgresTargetAdapter:
             return WriteResult(success=True, rows_written=len(rows), message="Batch upserted.")
         except Exception as exc:
             raise PostgresAdapterError(
-                f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={_safe_error_detail(exc)}"
+                f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
             ) from exc
 
     def count_rows(self, table: TableRef) -> int:
@@ -300,7 +301,7 @@ class PostgresSourceAdapter:
                     row = cursor.fetchone()
                     return _first_row_value(row) == 1
         except Exception as exc:
-            raise PostgresAdapterError("PostgreSQL connection test failed.") from exc
+            raise PostgresAdapterError(connection_test_failure_message("PostgreSQL", self._config, exc)) from exc
 
     def scan_schema(self, schema: str) -> SchemaSnapshot:
         try:
@@ -315,7 +316,7 @@ class PostgresSourceAdapter:
                 except Exception as exc:
                     raise PostgresAdapterError(
                         f"PostgreSQL schema metadata query failed for schema '{schema}'. "
-                        f"Check source.schema and metadata permissions. detail={_safe_error_detail(exc)}"
+                        f"Check source.schema and metadata permissions. detail={safe_error_detail(exc)}"
                     ) from exc
         except PostgresAdapterError:
             raise
@@ -324,7 +325,7 @@ class PostgresSourceAdapter:
                 "PostgreSQL connection failed before schema scan. "
                 f"host={self._config.host} port={self._config.port} "
                 f"database={self._config.database} user={self._config.user} schema={schema}. "
-                f"detail={_safe_error_detail(exc)}"
+                f"detail={safe_error_detail(exc)}"
             ) from exc
 
         grouped_columns: dict[str, list[ColumnSchema]] = defaultdict(list)
@@ -840,11 +841,6 @@ def _watermark_where_clause(watermark: WatermarkConfig) -> tuple[str, tuple[str,
     if not clauses:
         return "", ()
     return "where " + " and ".join(clauses), tuple(params)
-
-
-def _safe_error_detail(exc: Exception) -> str:
-    detail = str(exc).strip()
-    return detail or exc.__class__.__name__
 
 
 def _postgres_upsert_update_sql(update_columns: tuple[str, ...], keys: tuple[str, ...]) -> str:

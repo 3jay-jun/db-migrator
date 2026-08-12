@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
-from typing import Any
+from typing import Any, Iterator
 
-from db_migrator.adapters.base import SourceAdapter
+from db_migrator.adapters.base import SourceAdapter, TargetAdapter
 from db_migrator.adapters.mysql import MySqlAdapterError
 from db_migrator.adapters.postgres import PostgresAdapterError
 from db_migrator.adapters.registry import AdapterRegistryError, DbmsAdapterRegistry, default_adapter_registry
 from db_migrator.config.loader import ConfigLoadError, load_config
 from db_migrator.config.models import AppConfig, Dbms, IndexApplyTiming, SourceConfig
+from db_migrator.connection import ResolvedAppConfig, TunnelError, TunnelFactory, TunnelManager
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
 from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables
@@ -61,9 +63,25 @@ class TableSelection:
     has_primary_key: bool
 
 
+@dataclass(frozen=True)
+class CommandRuntime:
+    config: ResolvedAppConfig
+    source: SourceAdapter | None = None
+    target: TargetAdapter | None = None
+
+    @property
+    def original(self) -> AppConfig:
+        return self.config.original
+
+    @property
+    def resolved(self) -> AppConfig:
+        return self.config.resolved
+
+
 class MigrationApplicationService:
-    def __init__(self, registry: DbmsAdapterRegistry | None = None) -> None:
+    def __init__(self, registry: DbmsAdapterRegistry | None = None, tunnel_factory: TunnelFactory | None = None) -> None:
         self._registry = registry or default_adapter_registry()
+        self._tunnel_manager = TunnelManager(tunnel_factory)
 
     def run_bootstrap(self, config: Path | None = None) -> CommandResult:
         try:
@@ -93,35 +111,36 @@ class MigrationApplicationService:
 
     def run_test_source_connection(self, *, config: Path) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            connected = source.test_connection()
+            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+                assert runtime.source is not None
+                connected = runtime.source.test_connection()
             return CommandResult(
                 command="test-source",
                 success=connected,
-                message="Source connection succeeded." if connected else "Source connection failed.",
+                message=_connection_test_message("Source", runtime, "source", connected),
             )
         except _KNOWN_ERRORS as exc:
             return _failure("test-source", exc)
 
     def run_test_target_connection(self, *, config: Path) -> CommandResult:
         try:
-            app_config = load_config(config)
-            target = self._registry.create_target(app_config.target)
-            connected = target.test_connection()
+            with self._command_runtime(config, include_source=False, include_target=True) as runtime:
+                assert runtime.target is not None
+                connected = runtime.target.test_connection()
             return CommandResult(
                 command="test-target",
                 success=connected,
-                message="Target connection succeeded." if connected else "Target connection failed.",
+                message=_connection_test_message("Target", runtime, "target", connected),
             )
         except _KNOWN_ERRORS as exc:
             return _failure("test-target", exc)
 
     def run_scan_tables(self, *, config: Path, schema_file: Path | None = None) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
+            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+                assert runtime.source is not None
+                app_config = runtime.resolved
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
             tables = tuple(_table_selection(table) for table in snapshot.tables)
             return CommandResult(
                 command="scan-tables",
@@ -142,22 +161,24 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
+            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+                assert runtime.source is not None
+                app_config = runtime.resolved
+                report_config = runtime.original
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
             snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
+            target_snapshot = TableMappingResolver(report_config).target_snapshot_for(snapshot)
             report = build_dry_run_report(
                 target_snapshot,
                 source_snapshot=snapshot,
-                source_dbms=app_config.source.dbms,
-                target_dbms=app_config.target.dbms,
-                target_database=app_config.target.database,
-                metadata=_dry_run_metadata(app_config),
+                source_dbms=report_config.source.dbms,
+                target_dbms=report_config.target.dbms,
+                target_database=report_config.target.database,
+                metadata=_dry_run_metadata(report_config),
                 registry=self._registry,
-                app_config=app_config,
+                app_config=report_config,
             )
-            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
+            resolved_output_dir = output_dir or Path(report_config.report.output_dir)
             write_dry_run_report(report, resolved_output_dir)
             return CommandResult(
                 command="dry-run",
@@ -181,22 +202,24 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            if dry_run_report_path is not None:
-                app_config.migration.dry_run_report_path = str(dry_run_report_path)
-            source = self._registry.create_source(app_config.source)
-            target = self._registry.create_target(app_config.target)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
-            resolved_output_file = output_file or Path(app_config.report.output_dir) / "ddl-execution.json"
-            summary = execute_schema_ddl(
-                config=app_config,
-                snapshot=target_snapshot,
-                executor=target,
-                report_output_path=resolved_output_file,
-                registry=self._registry,
-            )
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                safety_config = runtime.original
+                if dry_run_report_path is not None:
+                    safety_config.migration.dry_run_report_path = str(dry_run_report_path)
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                target_snapshot = TableMappingResolver(safety_config).target_snapshot_for(snapshot)
+                resolved_output_file = output_file or Path(safety_config.report.output_dir) / "ddl-execution.json"
+                summary = execute_schema_ddl(
+                    config=safety_config,
+                    snapshot=target_snapshot,
+                    executor=runtime.target,
+                    report_output_path=resolved_output_file,
+                    registry=self._registry,
+                )
             return CommandResult(
                 command="apply-ddl",
                 success=True,
@@ -219,20 +242,22 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            target = self._registry.create_target(app_config.target)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
-            resolved_output_file = output_file or Path(app_config.report.output_dir) / f"index-execution-{phase.value}.json"
-            summary = execute_index_ddls(
-                config=app_config,
-                snapshot=target_snapshot,
-                executor=target,
-                phase=phase,
-                report_output_path=resolved_output_file,
-            )
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+                resolved_output_file = output_file or Path(original_config.report.output_dir) / f"index-execution-{phase.value}.json"
+                summary = execute_index_ddls(
+                    config=original_config,
+                    snapshot=target_snapshot,
+                    executor=runtime.target,
+                    phase=phase,
+                    report_output_path=resolved_output_file,
+                )
             failed_count = sum(1 for result in summary.indexes if not result.success)
             return CommandResult(
                 command="apply-indexes",
@@ -258,15 +283,17 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
+            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+                assert runtime.source is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
             snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
-            generator = self._registry.create_ddl_generator(app_config.target.dbms, target_database=app_config.target.database)
+            target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+            generator = self._registry.create_ddl_generator(original_config.target.dbms, target_database=original_config.target.database)
             statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
             sql = "\n\n".join(statements)
-            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
+            resolved_output_dir = output_dir or Path(original_config.report.output_dir)
             output_file = resolved_output_dir / "manual-ddl.sql"
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_text(sql, encoding="utf-8")
@@ -290,25 +317,27 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(app_config).target_snapshot_for(snapshot)
-            generator = self._registry.create_ddl_generator(app_config.target.dbms, target_database=app_config.target.database)
-            statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
-            ddl_sql = "\n\n".join(statements)
-            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
-            export = export_manual_migration_files(
-                source=source,
-                source_tables=snapshot.tables,
-                target_tables=target_snapshot.tables,
-                target_dbms=app_config.target.dbms,
-                target_database=app_config.target.database,
-                migration_config=app_config.migration,
-                ddl_sql=ddl_sql,
-                output_dir=resolved_output_dir,
-            )
+            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+                assert runtime.source is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+                generator = self._registry.create_ddl_generator(original_config.target.dbms, target_database=original_config.target.database)
+                statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
+                ddl_sql = "\n\n".join(statements)
+                resolved_output_dir = output_dir or Path(original_config.report.output_dir)
+                export = export_manual_migration_files(
+                    source=runtime.source,
+                    source_tables=snapshot.tables,
+                    target_tables=target_snapshot.tables,
+                    target_dbms=original_config.target.dbms,
+                    target_database=original_config.target.database,
+                    migration_config=original_config.migration,
+                    ddl_sql=ddl_sql,
+                    output_dir=resolved_output_dir,
+                )
             return CommandResult(
                 command="generate-manual-migration",
                 success=True,
@@ -391,28 +420,30 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            target = self._registry.create_target(app_config.target)
-            target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config))
-            resolver = TableMappingResolver(app_config)
-            target = TargetMappingAdapter(target, resolver)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            expected_target_snapshot = _schema_scan_expected_snapshot(resolver.target_snapshot_for(snapshot), app_config)
-            actual_target_snapshot = target_schema_reader.scan_schema(_target_schema_name(app_config))
-            report = validate_tables(
-                job_id=app_config.job.name,
-                tables=snapshot.tables,
-                reader=SourceTargetValidationReader(source, target),
-                verification=app_config.verification,
-                metadata=_validation_metadata(app_config),
-                target_table_resolver=resolver.target_ref_for,
-                source_snapshot=expected_target_snapshot,
-                target_snapshot=actual_target_snapshot,
-            )
-            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
-            write_validation_report(report, resolved_output_dir)
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config, original_config))
+                resolver = TableMappingResolver(original_config)
+                target = TargetMappingAdapter(runtime.target, resolver)
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                expected_target_snapshot = _schema_scan_expected_snapshot(resolver.target_snapshot_for(snapshot), original_config)
+                actual_target_snapshot = target_schema_reader.scan_schema(_target_schema_name(original_config))
+                report = validate_tables(
+                    job_id=original_config.job.name,
+                    tables=snapshot.tables,
+                    reader=SourceTargetValidationReader(runtime.source, target),
+                    verification=original_config.verification,
+                    metadata=_validation_metadata(original_config),
+                    target_table_resolver=resolver.target_ref_for,
+                    source_snapshot=expected_target_snapshot,
+                    target_snapshot=actual_target_snapshot,
+                )
+                resolved_output_dir = output_dir or Path(original_config.report.output_dir)
+                write_validation_report(report, resolved_output_dir)
             return CommandResult(
                 command="validate",
                 success=True,
@@ -435,35 +466,37 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            if not app_config.incremental.enabled:
-                return CommandResult(
-                    command="migrate-incremental",
-                    success=False,
-                    message="incremental.enabled must be true to run migrate-incremental.",
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                if not original_config.incremental.enabled:
+                    return CommandResult(
+                        command="migrate-incremental",
+                        success=False,
+                        message="incremental.enabled must be true to run migrate-incremental.",
+                    )
+                resolver = TableMappingResolver(original_config)
+                original_config.incremental.watermarks = resolver.incremental_watermarks()
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                report = migrate_incremental_tables(
+                    job_id=original_config.job.name,
+                    tables=snapshot.tables,
+                    source=runtime.source,
+                    target=TargetMappingAdapter(runtime.target, resolver),
+                    migration_config=original_config.migration,
+                    incremental_config=original_config.incremental,
+                    target_table_resolver=resolver.target_ref_for,
                 )
-            source = self._registry.create_source(app_config.source)
-            target = self._registry.create_target(app_config.target)
-            resolver = TableMappingResolver(app_config)
-            app_config.incremental.watermarks = resolver.incremental_watermarks()
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            report = migrate_incremental_tables(
-                job_id=app_config.job.name,
-                tables=snapshot.tables,
-                source=source,
-                target=TargetMappingAdapter(target, resolver),
-                migration_config=app_config.migration,
-                incremental_config=app_config.incremental,
-                target_table_resolver=resolver.target_ref_for,
-            )
-            resolved_output_dir = output_dir or Path(app_config.report.output_dir)
-            write_incremental_report(report, resolved_output_dir)
+                resolved_output_dir = output_dir or Path(original_config.report.output_dir)
+                write_incremental_report(report, resolved_output_dir)
             return CommandResult(
                 command="migrate-incremental",
                 success=True,
                 message=f"incremental_report={resolved_output_dir} tables={len(report.tables)} rows_upserted={report.rows_upserted}",
-                job_id=app_config.job.name,
+                job_id=original_config.job.name,
                 output_dir=resolved_output_dir,
                 report_html=resolved_output_dir / "summary.html",
                 table_count=len(report.tables),
@@ -484,30 +517,32 @@ class MigrationApplicationService:
         selected_tables: set[str] | None,
     ) -> CommandResult:
         try:
-            app_config = load_config(config)
-            source = self._registry.create_source(app_config.source)
-            target = self._registry.create_target(app_config.target)
-            target = TargetMappingAdapter(target, TableMappingResolver(app_config))
-            checkpoint_store = CheckpointStore(checkpoint_db)
-            snapshot = self._load_snapshot(app_config.source.schema_name, source, schema_file, source_dbms=app_config.source.dbms)
-            snapshot = _filter_snapshot(snapshot, selected_tables)
-            resume_plan = None
-            if retry_failed_only is not None:
-                resume_plan = (
-                    build_retry_failed_plan(app_config.job.name, checkpoint_store)
-                    if retry_failed_only
-                    else build_resume_plan(app_config.job.name, snapshot.tables, checkpoint_store)
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                target = TargetMappingAdapter(runtime.target, TableMappingResolver(original_config))
+                checkpoint_store = CheckpointStore(checkpoint_db)
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                resume_plan = None
+                if retry_failed_only is not None:
+                    resume_plan = (
+                        build_retry_failed_plan(original_config.job.name, checkpoint_store)
+                        if retry_failed_only
+                        else build_resume_plan(original_config.job.name, snapshot.tables, checkpoint_store)
+                    )
+                result = migrate_tables(
+                    job_id=original_config.job.name,
+                    tables=snapshot.tables,
+                    source=runtime.source,
+                    target=target,
+                    checkpoint_store=checkpoint_store,
+                    event_publisher=event_publisher,
+                    migration_config=original_config.migration,
+                    resume_plan=resume_plan,
                 )
-            result = migrate_tables(
-                job_id=app_config.job.name,
-                tables=snapshot.tables,
-                source=source,
-                target=target,
-                checkpoint_store=checkpoint_store,
-                event_publisher=event_publisher,
-                migration_config=app_config.migration,
-                resume_plan=resume_plan,
-            )
             return CommandResult(
                 command=command,
                 success=True,
@@ -532,6 +567,27 @@ class MigrationApplicationService:
             return load_schema_snapshot_from_json(schema_file, source_dbms=source_dbms)
         return source.scan_schema(schema_name)
 
+    @contextmanager
+    def _command_runtime(
+        self,
+        config_path: Path | None,
+        *,
+        include_source: bool,
+        include_target: bool,
+    ) -> Iterator[CommandRuntime]:
+        app_config = load_config(config_path)
+        source: SourceAdapter | None = None
+        target: TargetAdapter | None = None
+        with self._tunnel_manager.open(app_config, include_source=include_source, include_target=include_target) as resolved_config:
+            try:
+                if include_source:
+                    source = self._registry.create_source(resolved_config.resolved.source)
+                if include_target:
+                    target = self._registry.create_target(resolved_config.resolved.target)
+                yield CommandRuntime(config=resolved_config, source=source, target=target)
+            finally:
+                _close_adapter(target)
+
 
 _KNOWN_ERRORS = (
     ConfigLoadError,
@@ -540,11 +596,33 @@ _KNOWN_ERRORS = (
     MySqlAdapterError,
     AdapterRegistryError,
     DdlExecutionBlocked,
+    TunnelError,
 )
 
 
 def _failure(command: str, exc: Exception) -> CommandResult:
     return CommandResult(command=command, success=False, message=str(exc))
+
+
+def _connection_test_message(label: str, runtime: CommandRuntime, side: str, connected: bool) -> str:
+    config = runtime.resolved.source if side == "source" else runtime.resolved.target
+    original = runtime.original.source if side == "source" else runtime.original.target
+    status = "succeeded" if connected else "failed"
+    if original.tunnel.enabled:
+        remote_host = original.tunnel.remote_host or original.host
+        remote_port = original.tunnel.remote_port or original.port
+        return (
+            f"{label} connection {status}. "
+            f"db_endpoint={remote_host}:{remote_port} "
+            f"tunnel_local_endpoint={config.host}:{config.port}."
+        )
+    return f"{label} connection {status}. db_endpoint={config.host}:{config.port}."
+
+
+def _close_adapter(adapter: object | None) -> None:
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        close()
 
 
 def _filter_snapshot(snapshot: SchemaSnapshot, selected_tables: set[str] | None) -> SchemaSnapshot:
@@ -622,15 +700,16 @@ def _validation_metadata(app_config: AppConfig) -> ValidationMetadata:
     )
 
 
-def _target_schema_scan_config(app_config: AppConfig) -> SourceConfig:
+def _target_schema_scan_config(app_config: AppConfig, original_config: AppConfig | None = None) -> SourceConfig:
+    metadata_config = original_config or app_config
     return SourceConfig(
         dbms=app_config.target.dbms,
         host=app_config.target.host,
         port=app_config.target.port,
-        database=app_config.target.database,
-        schema=_target_schema_name(app_config),
-        user=app_config.target.user,
-        password=app_config.target.password,
+        database=metadata_config.target.database,
+        schema=_target_schema_name(metadata_config),
+        user=metadata_config.target.user,
+        password=metadata_config.target.password,
     )
 
 
