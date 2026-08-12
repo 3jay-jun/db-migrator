@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,12 @@ class ExistingTablePolicy(StrEnum):
     SYNC = "sync"
     TRUNCATE_RELOAD = "truncate_reload"
     OVERWRITE = "overwrite"
+
+
+class SourceOnlyColumnAction(StrEnum):
+    IGNORE = "ignore"
+    MANUAL = "manual"
+    ADD_TO_TARGET = "add_to_target"
 
 
 class JobConfig(BaseModel):
@@ -106,6 +113,7 @@ class MigrationConfig(BaseModel):
     throttle_sleep_ms: int = Field(default=0, ge=0)
     checkpoint_resume: bool = True
     dry_run_report_path: str | None = None
+    strict_source_only_columns: bool = False
 
 
 class SafetyConfig(BaseModel):
@@ -147,9 +155,20 @@ class TableIncrementalConfig(BaseModel):
     end_value: str | None = None
 
 
+class ColumnTransformConfig(BaseModel):
+    source: str | None = Field(default=None, min_length=1)
+    target_type: str | None = Field(default=None, min_length=1)
+    default: Any | None = None
+    null: bool = False
+    skip: bool = False
+
+
 class TableRunConfig(BaseModel):
     target_schema: str | None = Field(default=None, min_length=1)
     target_table: str | None = Field(default=None, min_length=1)
+    comment: str | None = Field(default=None, min_length=1)
+    columns: dict[str, ColumnTransformConfig] = Field(default_factory=dict)
+    source_only_columns: dict[str, SourceOnlyColumnAction] = Field(default_factory=dict)
     incremental: TableIncrementalConfig = Field(default_factory=TableIncrementalConfig)
 
 

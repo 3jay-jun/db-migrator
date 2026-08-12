@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import sys
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -7,22 +9,27 @@ from typing import Callable
 
 import yaml
 
-from db_migrator.application import CommandResult, MigrationApplicationService, TableSelection
+from db_migrator.application import ColumnSelection, CommandResult, MigrationApplicationService, TableSelection
 from db_migrator.application.events import event_to_view
 from db_migrator.application.safety import evaluate_dry_run_gate
 from db_migrator.config.loader import ConfigLoadError, load_config
 from db_migrator.config.models import (
     AppConfig,
+    ColumnTransformConfig,
     Dbms,
     ExistingTablePolicy,
     IndexApplyTiming,
     MigrationMode,
+    SourceOnlyColumnAction,
     SshAuthenticationType,
     SshTunnelConfig,
     TableRunConfig,
 )
 from db_migrator.connection import SshConnectionTester, TunnelError
 from db_migrator.core.events import EventPublisher, FileEventPublisher, MigrationEvent
+from db_migrator.gui.state import GuiPathState, GuiStateStore
+from db_migrator.schema.common_types import CommonTypeKind
+from db_migrator.schema.type_mapping import common_type_to_mysql, common_type_to_postgres, mysql_type_to_common, postgres_type_to_common
 
 
 def main() -> None:
@@ -44,7 +51,7 @@ def main() -> None:
 
 try:
     from PySide6.QtCore import QObject, QThread, QUrl, Qt, Signal, Slot
-    from PySide6.QtGui import QDesktopServices, QIcon
+    from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon
     from PySide6.QtWidgets import (
         QCheckBox,
         QComboBox,
@@ -66,6 +73,9 @@ try:
         QPushButton,
         QSpinBox,
         QPlainTextEdit,
+        QTabWidget,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
@@ -86,6 +96,11 @@ if Signal is not None:
     ESTIMATED_ROWS_ROLE = TABLE_ID_ROLE + 7
     HAS_PRIMARY_KEY_ROLE = TABLE_ID_ROLE + 8
     TABLE_SELECTED_ROLE = TABLE_ID_ROLE + 9
+    SOURCE_ONLY_COLUMNS_ROLE = TABLE_ID_ROLE + 10
+    TABLE_COLUMNS_ROLE = TABLE_ID_ROLE + 11
+    TABLE_COMMENT_ROLE = TABLE_ID_ROLE + 12
+    COLUMN_MAPPINGS_ROLE = TABLE_ID_ROLE + 13
+    TYPE_OVERRIDES_ROLE = TABLE_ID_ROLE + 14
     GUI_EXISTING_TABLE_POLICIES = (
         ExistingTablePolicy.SKIP,
         ExistingTablePolicy.APPEND,
@@ -157,8 +172,11 @@ if Signal is not None:
             self._syncing_foreign_key_option = False
             self._source_tunnel_config = SshTunnelConfig()
             self._target_tunnel_config = SshTunnelConfig()
+            self._state_store: GuiStateStore | None = self._create_state_store()
             self._last_dry_run_report: Path | None = None
             self._last_report_html: Path | None = None
+            self._last_dry_run_tables: dict[str, dict] = {}
+            self._target_table_options: tuple[TableSelection, ...] = ()
             self._buttons: list[QPushButton] = []
             self._table_actions: list[QPushButton] = []
             self.setWindowTitle("Jigration")
@@ -174,10 +192,11 @@ if Signal is not None:
             root = QWidget()
             layout = QVBoxLayout(root)
 
-            self.config_path = QLineEdit(str(Path("config.yml").resolve()))
-            self.schema_path = QLineEdit()
-            self.output_dir = QLineEdit(str(Path("reports/live").resolve()))
-            self.checkpoint_path = QLineEdit(str(Path("checkpoints/migration.sqlite").resolve()))
+            path_state = self._load_gui_path_state()
+            self.config_path = QLineEdit(path_state.config_path)
+            self.schema_path = QLineEdit(path_state.schema_path)
+            self.output_dir = QLineEdit(path_state.output_dir)
+            self.checkpoint_path = QLineEdit(path_state.checkpoint_path)
             top_bar = QHBoxLayout()
             self.config_label = QLabel(f"설정 파일: {self.config_path.text()}")
             top_bar.addWidget(self.config_label, stretch=1)
@@ -306,6 +325,7 @@ if Signal is not None:
             controls.addWidget(select_none)
             layout.addLayout(controls)
             self.table_list = QListWidget()
+            self.table_list.itemDoubleClicked.connect(self._edit_table_settings)
             layout.addWidget(self.table_list, stretch=1)
             self.table_summary = QLabel("원본 DB 연결 후 테이블을 불러오면 이관 대상을 선택할 수 있습니다.")
             self.table_summary.setWordWrap(True)
@@ -351,6 +371,7 @@ if Signal is not None:
             if path:
                 self.config_path.setText(path)
                 self.config_label.setText(f"설정 파일: {self.config_path.text()}")
+                self._save_gui_path_state()
                 self._load_config_into_form(show_errors=True)
 
         def _choose_file(self, line_edit: QLineEdit, title: str) -> None:
@@ -362,16 +383,19 @@ if Signal is not None:
             path, _ = QFileDialog.getOpenFileName(self, "Choose schema snapshot", str(Path.cwd()), "JSON files (*.json);;All files (*)")
             if path:
                 self.schema_path.setText(path)
+                self._save_gui_path_state()
 
         def _choose_output_dir(self) -> None:
             path = QFileDialog.getExistingDirectory(self, "Choose output directory", str(Path.cwd()))
             if path:
                 self.output_dir.setText(path)
+                self._save_gui_path_state()
 
         def _choose_checkpoint(self) -> None:
             path, _ = QFileDialog.getSaveFileName(self, "Choose checkpoint DB", str(Path.cwd()), "SQLite files (*.sqlite *.db);;All files (*)")
             if path:
                 self.checkpoint_path.setText(path)
+                self._save_gui_path_state()
 
         def _test_source(self) -> None:
             if self._save_form_to_config():
@@ -814,9 +838,13 @@ if Signal is not None:
             self.status.setText("준비됨" if result.success else "실패")
             self.log.appendPlainText(result.message)
             if result.success and result.command == "scan-tables":
+                self._target_table_options = tuple(result.details.get("target_tables", ()))
+                self._last_dry_run_tables = {}
+                self._last_dry_run_report = None
                 self._populate_tables(result.details.get("tables", ()))
             if result.success and result.command == "dry-run" and result.report_html is not None:
                 self._last_dry_run_report = result.report_html
+                self._load_dry_run_summary(result.report_html)
             if result.success and result.command == "generate-manual-ddl":
                 self._open_manual_ddl_dialog(result)
             if result.success and result.report_html is not None:
@@ -871,6 +899,22 @@ if Signal is not None:
             layout.addLayout(actions)
             dialog.exec()
 
+        def _load_dry_run_summary(self, report_html: Path) -> dict | None:
+            summary_path = report_html.with_name("summary.json")
+            if not summary_path.exists():
+                return None
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                self.log.appendPlainText(f"dry-run 요약을 읽지 못했습니다: {exc}")
+                return None
+            self._last_dry_run_tables = {
+                f"{table.get('source_schema')}.{table.get('source_table')}": table
+                for table in summary.get("tables", [])
+                if table.get("source_schema") and table.get("source_table")
+            }
+            return summary
+
         def _save_manual_ddl_as(self, sql: str) -> None:
             output_path, _ = QFileDialog.getSaveFileName(self, "DDL 저장", str(self._output_dir() / "manual-ddl.sql"), "SQL Files (*.sql)")
             if not output_path:
@@ -884,6 +928,7 @@ if Signal is not None:
             dialog = SettingsDialog(self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.config_label.setText(f"설정 파일: {self.config_path.text()}")
+                self._save_gui_path_state()
                 self._load_config_into_form(show_errors=True)
 
         def _open_tunnel_settings(self, side: str) -> None:
@@ -987,7 +1032,48 @@ if Signal is not None:
             except OSError as exc:
                 QMessageBox.warning(self, "설정 파일 저장 실패", str(exc))
                 return False
+            self._save_gui_path_state()
             return True
+
+        def _save_gui_path_state(self) -> None:
+            if self._state_store is None:
+                return
+            try:
+                self._state_store.save_paths(
+                    GuiPathState(
+                        config_path=self.config_path.text().strip() or _default_gui_path_state().config_path,
+                        schema_path=self.schema_path.text().strip(),
+                        output_dir=self.output_dir.text().strip() or _default_gui_path_state().output_dir,
+                        checkpoint_path=self.checkpoint_path.text().strip() or _default_gui_path_state().checkpoint_path,
+                    )
+                )
+            except OSError as exc:
+                self.log.appendPlainText(f"GUI 경로 기본값 저장 실패: {exc}")
+            except sqlite3.Error as exc:
+                self.log.appendPlainText(f"GUI 경로 기본값 저장 실패: {exc}")
+
+        def _load_gui_path_state(self) -> GuiPathState:
+            defaults = _default_gui_path_state()
+            if self._state_store is None:
+                return defaults
+            try:
+                return self._state_store.load_paths(defaults)
+            except (OSError, sqlite3.Error):
+                return defaults
+
+        def _create_state_store(self) -> GuiStateStore | None:
+            try:
+                return GuiStateStore()
+            except (OSError, sqlite3.Error):
+                return None
+
+        def _current_form_config(self) -> AppConfig:
+            config = AppConfig()
+            config.source.schema_name = self.source_schema.text().strip() or config.source.schema_name
+            config.target.dbms = Dbms(self.target_dbms.currentText())
+            config.target.database = self.target_database.text().strip() or config.target.database
+            config.target.schema_name = self.target_schema.text().strip() or None
+            return config
 
         def _remember_manual_foreign_key_option(self, checked: bool) -> None:
             if self._syncing_foreign_key_option or not self.apply_foreign_keys.isEnabled():
@@ -1024,28 +1110,28 @@ if Signal is not None:
 
         def _populate_tables(self, tables: tuple[TableSelection, ...]) -> None:
             self.table_list.clear()
-            try:
-                config = load_config(self._config())
-            except ConfigLoadError:
-                config = AppConfig()
+            self.table_list.clearSelection()
+            self.table_list.setCurrentRow(-1)
+            config = self._current_form_config()
             for table in tables:
-                table_config = config.tables.get(table.identifier)
                 source_schema = table.identifier.rsplit(".", 1)[0]
-                target_schema = table_config.target_schema if table_config is not None else None
-                default_target_schema = config.target.schema_name or source_schema
-                target_table = table_config.target_table if table_config is not None else None
-                incremental = table_config.incremental if table_config is not None else None
+                default_target_schema = _default_target_schema_name(config, source_schema)
                 item = QListWidgetItem()
                 item.setData(TABLE_ID_ROLE, table.identifier)
-                item.setData(TARGET_TABLE_ROLE, target_table or table.table)
-                item.setData(TARGET_SCHEMA_ROLE, target_schema or default_target_schema)
-                item.setData(WATERMARK_COLUMN_ROLE, incremental.watermark_column if incremental is not None else "")
-                item.setData(WATERMARK_START_ROLE, incremental.start_value if incremental is not None else "")
-                item.setData(WATERMARK_END_ROLE, incremental.end_value if incremental is not None else "")
+                item.setData(TARGET_TABLE_ROLE, table.table)
+                item.setData(TARGET_SCHEMA_ROLE, default_target_schema)
+                item.setData(WATERMARK_COLUMN_ROLE, "")
+                item.setData(WATERMARK_START_ROLE, "")
+                item.setData(WATERMARK_END_ROLE, "")
                 item.setData(COLUMN_COUNT_ROLE, table.column_count)
                 item.setData(ESTIMATED_ROWS_ROLE, table.estimated_rows)
                 item.setData(HAS_PRIMARY_KEY_ROLE, table.has_primary_key)
                 item.setData(TABLE_SELECTED_ROLE, True)
+                item.setData(SOURCE_ONLY_COLUMNS_ROLE, "")
+                item.setData(TABLE_COLUMNS_ROLE, table.columns)
+                item.setData(TABLE_COMMENT_ROLE, "")
+                item.setData(COLUMN_MAPPINGS_ROLE, {})
+                item.setData(TYPE_OVERRIDES_ROLE, {})
                 self.table_list.addItem(item)
                 row_widget = self._table_row_widget(table, item)
                 item.setSizeHint(row_widget.sizeHint())
@@ -1076,30 +1162,37 @@ if Signal is not None:
                 item = self.table_list.item(index)
                 identifier = str(item.data(TABLE_ID_ROLE))
                 source_schema, source_table = identifier.rsplit(".", 1)
-                default_target_schema = config.target.schema_name or source_schema
+                default_target_schema = _default_target_schema_name(config, identifier.rsplit(".", 1)[0])
                 target_schema = str(item.data(TARGET_SCHEMA_ROLE) or "").strip()
                 target_table = str(item.data(TARGET_TABLE_ROLE) or "").strip()
                 watermark_column = str(item.data(WATERMARK_COLUMN_ROLE) or "").strip()
                 start_value = str(item.data(WATERMARK_START_ROLE) or "").strip()
                 end_value = str(item.data(WATERMARK_END_ROLE) or "").strip()
+                source_only_columns = _parse_source_only_columns(str(item.data(SOURCE_ONLY_COLUMNS_ROLE) or ""))
+                column_mappings = dict(item.data(COLUMN_MAPPINGS_ROLE) or {})
+                type_overrides = dict(item.data(TYPE_OVERRIDES_ROLE) or {})
+                comment = str(item.data(TABLE_COMMENT_ROLE) or "").strip()
                 if not target_schema or target_schema == default_target_schema:
                     target_schema = None
                 if not target_table or target_table == source_table:
                     target_table = None
-                if not any((target_schema, target_table, watermark_column, start_value, end_value)):
+                if not any((target_schema, target_table, comment, watermark_column, start_value, end_value, source_only_columns, column_mappings, type_overrides)):
                     config.tables.pop(identifier, None)
                     continue
                 table_config = config.tables.get(identifier, TableRunConfig())
                 table_config.target_schema = target_schema
                 table_config.target_table = target_table
+                table_config.comment = comment or None
                 table_config.incremental.watermark_column = watermark_column or None
                 table_config.incremental.start_value = start_value or None
                 table_config.incremental.end_value = end_value or None
+                table_config.source_only_columns = source_only_columns
+                _apply_column_mappings_to_config(table_config, tuple(item.data(TABLE_COLUMNS_ROLE) or ()), column_mappings, type_overrides)
                 config.tables[identifier] = table_config
 
         def _table_item_label(self, table: TableSelection, item: QListWidgetItem) -> str:
             source_schema = table.identifier.rsplit(".", 1)[0]
-            target_schema = str(item.data(TARGET_SCHEMA_ROLE) or source_schema)
+            target_schema = str(item.data(TARGET_SCHEMA_ROLE) or _default_target_schema_name(self._current_form_config(), source_schema))
             target_table = str(item.data(TARGET_TABLE_ROLE) or table.table)
             label = f"{table.identifier}"
             if target_schema != source_schema or target_table != table.table:
@@ -1109,6 +1202,9 @@ if Signal is not None:
                 label += f" 예상 행={table.estimated_rows}"
             if str(item.data(WATERMARK_COLUMN_ROLE) or "").strip():
                 label += "  증분 설정됨"
+            source_only_count = len(_parse_source_only_columns(str(item.data(SOURCE_ONLY_COLUMNS_ROLE) or "")))
+            if source_only_count:
+                label += f"  source-only={source_only_count}"
             if not table.has_primary_key:
                 label += "  PK 없음"
             return label
@@ -1123,21 +1219,20 @@ if Signal is not None:
             label = QLabel(self._table_item_label(table, item))
             label.setObjectName("table_label")
             label.setWordWrap(False)
-            target_button = QPushButton("대상 설정")
-            target_button.setToolTip("이 테이블의 대상 스키마와 테이블명을 변경합니다.")
-            target_button.clicked.connect(lambda _checked=False, selected_item=item: self._edit_target_table_settings(selected_item))
-            incremental_button = QPushButton("증분")
-            incremental_button.setToolTip("이 테이블의 증분 이관 watermark를 설정합니다.")
-            incremental_button.clicked.connect(lambda _checked=False, selected_item=item: self._edit_incremental_table_settings(selected_item))
+            settings_button = QPushButton("설정")
+            settings_button.setToolTip("이 테이블의 대상/컬럼/증분 설정을 변경합니다.")
+            settings_button.clicked.connect(lambda _checked=False, selected_item=item: self._edit_table_settings(selected_item))
             layout.addWidget(checkbox)
             layout.addWidget(label, stretch=1)
-            layout.addWidget(target_button)
-            layout.addWidget(incremental_button)
+            layout.addWidget(settings_button)
             return row
 
         def _row_checkbox(self, item: QListWidgetItem) -> QCheckBox | None:
             widget = self.table_list.itemWidget(item)
             return widget.findChild(QCheckBox) if widget is not None else None
+
+        def _edit_table_settings(self, item: QListWidgetItem | None = None) -> None:
+            self._edit_target_table_settings(item)
 
         def _edit_target_table_settings(self, item: QListWidgetItem | None = None) -> None:
             item = item or self.table_list.currentItem()
@@ -1146,49 +1241,230 @@ if Signal is not None:
                 return
             identifier = str(item.data(TABLE_ID_ROLE))
             source_schema, source_table = identifier.rsplit(".", 1)
-            current_schema = str(item.data(TARGET_SCHEMA_ROLE) or self.target_schema.text().strip() or source_schema)
+            current_schema = str(item.data(TARGET_SCHEMA_ROLE) or _default_target_schema_name(self._current_form_config(), source_schema))
             current = str(item.data(TARGET_TABLE_ROLE) or source_table)
+            dry_run_table = self._last_dry_run_tables.get(identifier, {})
             dialog = QDialog(self)
             dialog.setWindowTitle("대상 테이블 설정")
-            form = QFormLayout(dialog)
+            dialog.resize(980, 720)
+            layout = QVBoxLayout(dialog)
+            form = QFormLayout()
             target_schema = QLineEdit(current_schema)
-            target_table = QLineEdit(current)
+            target_table = _target_table_combo(self._target_table_options, current_schema, current)
+            table_status = QLabel(_target_table_status_label(self._target_table_options, current_schema, current, dry_run_table))
+            comment = QLineEdit(str(item.data(TABLE_COMMENT_ROLE) or ""))
+            source_only_actions = _parse_source_only_columns(str(item.data(SOURCE_ONLY_COLUMNS_ROLE) or ""))
+            column_mappings = dict(item.data(COLUMN_MAPPINGS_ROLE) or {})
+            type_overrides = dict(item.data(TYPE_OVERRIDES_ROLE) or {})
+            columns = tuple(item.data(TABLE_COLUMNS_ROLE) or ())
+            target_dbms = self._current_form_config().target.dbms
+            data_preview = self._load_table_data_preview(identifier, current_schema, current, column_mappings, type_overrides, source_only_actions)
             form.addRow("대상 스키마", target_schema)
-            form.addRow("대상 테이블명", target_table)
+            form.addRow("대상 테이블", _inline_row(target_table, table_status))
+            form.addRow("코멘트", comment)
+            layout.addLayout(form)
+
+            tabs = QTabWidget()
+            mapping_state_holder: dict[str, dict[str, QComboBox]] = {}
+            preview_dirty = {"value": False}
+            preview_refreshing = {"value": False}
+
+            def mark_preview_dirty() -> None:
+                preview_dirty["value"] = True
+
+            target_columns = _target_columns_for(self._target_table_options, current_schema, target_table.currentText())
+            columns_widget, mapping_state = _columns_mapping_widget(columns, target_columns, column_mappings, type_overrides, source_only_actions, target_dbms=target_dbms, on_change=mark_preview_dirty)
+            mapping_state_holder.update(mapping_state)
+            initial_mappings = _column_mapping_state_to_dict(mapping_state_holder.get("target", {}))
+            initial_type_overrides = _type_override_state_to_dict(mapping_state_holder.get("type", {}), columns, target_columns, initial_mappings, target_dbms)
+            initial_actions = _source_only_state_to_dict(mapping_state_holder.get("action", {}), initial_mappings)
+            initial_mappings = _without_ignored_column_mappings(initial_mappings, initial_actions)
+            initial_type_overrides = _without_ignored_type_overrides(initial_type_overrides, initial_actions)
+            columns_tab_index = tabs.addTab(columns_widget, f"Columns ({len(columns)})")
+            data_tab_index = tabs.addTab(_data_preview_widget(data_preview, columns), "Data Preview")
+            ddl_tab_index = tabs.addTab(
+                _ddl_preview_widget(
+                    dry_run_table,
+                    current_schema,
+                    target_table.currentText(),
+                    target_dbms,
+                    columns,
+                    target_columns,
+                    initial_mappings,
+                    initial_type_overrides,
+                    initial_actions,
+                    existing=_is_existing_target_table(self._target_table_options, current_schema, target_table.currentText(), dry_run_table),
+                ),
+                "DDL Preview",
+            )
+            incremental_widget, incremental_fields = _incremental_settings_widget(
+                columns,
+                str(item.data(WATERMARK_COLUMN_ROLE) or ""),
+                str(item.data(WATERMARK_START_ROLE) or ""),
+                str(item.data(WATERMARK_END_ROLE) or ""),
+            )
+            tabs.addTab(incremental_widget, "Incremental")
+            layout.addWidget(tabs, stretch=1)
+
+            def refresh_preview_tabs() -> None:
+                if preview_refreshing["value"]:
+                    return
+                preview_refreshing["value"] = True
+                selected_schema = target_schema.text().strip() or current_schema
+                selected_table = target_table.currentText().strip()
+                current_mappings = _column_mapping_state_to_dict(mapping_state_holder.get("target", {}))
+                current_type_overrides = _type_override_state_to_dict(mapping_state_holder.get("type", {}), columns, target_columns, current_mappings, target_dbms)
+                current_actions = _source_only_state_to_dict(mapping_state_holder.get("action", {}), current_mappings)
+                current_mappings = _without_ignored_column_mappings(current_mappings, current_actions)
+                current_type_overrides = _without_ignored_type_overrides(current_type_overrides, current_actions)
+                selected_target_columns = _target_columns_for(self._target_table_options, selected_schema, selected_table)
+
+                refreshed_preview = self._load_table_data_preview(identifier, selected_schema, selected_table, current_mappings, current_type_overrides, current_actions)
+                current_index = tabs.currentIndex()
+                try:
+                    tabs.blockSignals(True)
+                    old_data_widget = tabs.widget(data_tab_index)
+                    tabs.removeTab(data_tab_index)
+                    tabs.insertTab(data_tab_index, _data_preview_widget(refreshed_preview, columns), "Data Preview")
+                    if old_data_widget is not None:
+                        old_data_widget.deleteLater()
+
+                    old_ddl_widget = tabs.widget(ddl_tab_index)
+                    tabs.removeTab(ddl_tab_index)
+                    tabs.insertTab(
+                        ddl_tab_index,
+                        _ddl_preview_widget(
+                            dry_run_table,
+                            selected_schema,
+                            selected_table,
+                            target_dbms,
+                            columns,
+                            selected_target_columns,
+                            current_mappings,
+                            current_type_overrides,
+                            current_actions,
+                            existing=_is_existing_target_table(self._target_table_options, selected_schema, selected_table, dry_run_table),
+                        ),
+                        "DDL Preview",
+                    )
+                    if old_ddl_widget is not None:
+                        old_ddl_widget.deleteLater()
+                    tabs.setCurrentIndex(current_index)
+                    preview_dirty["value"] = False
+                finally:
+                    tabs.blockSignals(False)
+                    preview_refreshing["value"] = False
+
+            def refresh_target_table_preview(_value: str | None = None) -> None:
+                selected_schema = target_schema.text().strip() or current_schema
+                selected_table = target_table.currentText().strip()
+                table_status.setText(_target_table_status_label(self._target_table_options, selected_schema, selected_table, dry_run_table))
+                current_mappings = _column_mapping_state_to_dict(mapping_state_holder.get("target", {}))
+                selected_target_columns = _target_columns_for(self._target_table_options, selected_schema, selected_table)
+                current_type_overrides = _type_override_state_to_dict(mapping_state_holder.get("type", {}), columns, selected_target_columns, current_mappings, target_dbms)
+                current_actions = _source_only_state_to_dict(mapping_state_holder.get("action", {}), current_mappings)
+                current_mappings = _without_ignored_column_mappings(current_mappings, current_actions)
+                current_type_overrides = _without_ignored_type_overrides(current_type_overrides, current_actions)
+                refreshed_widget, refreshed_state = _columns_mapping_widget(
+                    columns,
+                    selected_target_columns,
+                    current_mappings,
+                    current_type_overrides,
+                    current_actions,
+                    target_dbms=target_dbms,
+                    on_change=mark_preview_dirty,
+                )
+                mapping_state_holder.clear()
+                mapping_state_holder.update(refreshed_state)
+                current_index = tabs.currentIndex()
+                try:
+                    tabs.blockSignals(True)
+                    old_widget = tabs.widget(columns_tab_index)
+                    tabs.removeTab(columns_tab_index)
+                    tabs.insertTab(columns_tab_index, refreshed_widget, f"Columns ({len(columns)})")
+                    if old_widget is not None:
+                        old_widget.deleteLater()
+                    tabs.setCurrentIndex(current_index)
+                finally:
+                    tabs.blockSignals(False)
+                refresh_preview_tabs()
+
+            def refresh_preview_on_tab_change(index: int) -> None:
+                if preview_dirty["value"] and index in {data_tab_index, ddl_tab_index}:
+                    refresh_preview_tabs()
+
+            target_table.currentTextChanged.connect(refresh_target_table_preview)
+            target_schema.textChanged.connect(refresh_target_table_preview)
+            tabs.currentChanged.connect(refresh_preview_on_tab_change)
+
+            def accept_if_valid() -> None:
+                invalid_types = _invalid_type_entries(mapping_state_holder.get("type", {}), target_dbms)
+                if invalid_types:
+                    QMessageBox.warning(
+                        dialog,
+                        "Target type 확인 필요",
+                        "Target DBMS에서 인식하지 못하는 타입이 있습니다.\n\n" + "\n".join(invalid_types[:20]),
+                    )
+                    return
+                dialog.accept()
+
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            buttons.accepted.connect(dialog.accept)
+            buttons.accepted.connect(accept_if_valid)
             buttons.rejected.connect(dialog.reject)
-            form.addRow(buttons)
+            layout.addWidget(buttons)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
-            item.setData(TARGET_SCHEMA_ROLE, target_schema.text().strip() or self.target_schema.text().strip() or source_schema)
-            item.setData(TARGET_TABLE_ROLE, target_table.text().strip() or source_table)
+            item.setData(TARGET_SCHEMA_ROLE, target_schema.text().strip() or _default_target_schema_name(self._current_form_config(), source_schema))
+            item.setData(TARGET_TABLE_ROLE, target_table.currentText().strip() or source_table)
+            item.setData(TABLE_COMMENT_ROLE, comment.text().strip())
+            saved_mappings = _column_mapping_state_to_dict(mapping_state_holder.get("target", {}))
+            saved_actions = _source_only_state_to_dict(mapping_state_holder.get("action", {}), saved_mappings)
+            saved_mappings = _without_ignored_column_mappings(saved_mappings, saved_actions)
+            saved_type_overrides = _type_override_state_to_dict(
+                mapping_state_holder.get("type", {}),
+                columns,
+                _target_columns_for(self._target_table_options, target_schema.text().strip() or current_schema, target_table.currentText().strip()),
+                saved_mappings,
+                target_dbms,
+            )
+            saved_type_overrides = _without_ignored_type_overrides(saved_type_overrides, saved_actions)
+            item.setData(COLUMN_MAPPINGS_ROLE, saved_mappings)
+            item.setData(TYPE_OVERRIDES_ROLE, saved_type_overrides)
+            item.setData(SOURCE_ONLY_COLUMNS_ROLE, _source_only_columns_to_text(saved_actions))
+            item.setData(WATERMARK_COLUMN_ROLE, incremental_fields["watermark"].currentText().strip())
+            item.setData(WATERMARK_START_ROLE, incremental_fields["start"].text().strip())
+            item.setData(WATERMARK_END_ROLE, incremental_fields["end"].text().strip())
             self._refresh_table_item_label(item)
 
+        def _load_table_data_preview(
+            self,
+            identifier: str,
+            target_schema: str,
+            target_table: str,
+            column_mappings: dict[str, str],
+            type_overrides: dict[str, str],
+            source_only_actions: dict[str, SourceOnlyColumnAction],
+        ) -> dict:
+            try:
+                result = self._service.run_table_preview(
+                    config=self._config(),
+                    schema_file=self._schema_file(),
+                    table_identifier=identifier,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                    column_mappings=column_mappings,
+                    type_overrides=type_overrides,
+                    source_only_actions=source_only_actions,
+                    sample_size=30,
+                )
+            except Exception as exc:
+                return {"columns": (), "rows": (), "message": f"Data Preview 조회 실패: {exc}"}
+            if not result.success:
+                return {"columns": (), "rows": (), "message": result.message}
+            return result.details
+
         def _edit_incremental_table_settings(self, item: QListWidgetItem | None = None) -> None:
-            item = item or self.table_list.currentItem()
-            if item is None:
-                QMessageBox.warning(self, "테이블 선택 필요", "증분 설정을 바꿀 테이블을 선택하세요.")
-                return
-            dialog = QDialog(self)
-            dialog.setWindowTitle("증분 이관 설정")
-            form = QFormLayout(dialog)
-            watermark_column = QLineEdit(str(item.data(WATERMARK_COLUMN_ROLE) or ""))
-            start_value = QLineEdit(str(item.data(WATERMARK_START_ROLE) or ""))
-            end_value = QLineEdit(str(item.data(WATERMARK_END_ROLE) or ""))
-            form.addRow("Watermark 컬럼", watermark_column)
-            form.addRow("시작값", start_value)
-            form.addRow("종료값", end_value)
-            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            form.addRow(buttons)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            item.setData(WATERMARK_COLUMN_ROLE, watermark_column.text().strip())
-            item.setData(WATERMARK_START_ROLE, start_value.text().strip())
-            item.setData(WATERMARK_END_ROLE, end_value.text().strip())
-            self._refresh_table_item_label(item)
+            self._edit_table_settings(item)
 
         def _refresh_table_item_label(self, item: QListWidgetItem) -> None:
             identifier = str(item.data(TABLE_ID_ROLE))
@@ -1589,6 +1865,668 @@ if Signal is not None:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         return spin
+
+
+    def _source_only_columns_to_text(actions: dict[str, SourceOnlyColumnAction]) -> str:
+        return "\n".join(f"{column}:{action.value}" for column, action in sorted(actions.items()))
+
+
+    def _column_mappings_from_config(table_config: TableRunConfig) -> dict[str, str]:
+        mappings: dict[str, str] = {}
+        for target_column, column_config in table_config.columns.items():
+            if column_config.source:
+                mappings[column_config.source] = target_column
+        return mappings
+
+
+    def _type_overrides_from_config(table_config: TableRunConfig) -> dict[str, str]:
+        overrides: dict[str, str] = {}
+        for target_column, column_config in table_config.columns.items():
+            if column_config.target_type:
+                overrides[column_config.source or target_column] = column_config.target_type
+        return overrides
+
+
+    def _apply_column_mappings_to_config(
+        table_config: TableRunConfig,
+        source_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+    ) -> None:
+        source_column_names = {column.name for column in source_columns}
+        table_config.columns = {
+            target_column: column_config
+            for target_column, column_config in table_config.columns.items()
+            if not column_config.source or column_config.source not in source_column_names
+        }
+        target_by_source = {source_column: target_column for source_column, target_column in column_mappings.items() if source_column and target_column}
+        for source_column in sorted(set(target_by_source) | set(type_overrides)):
+            target_column = target_by_source.get(source_column, source_column)
+            target_type = type_overrides.get(source_column)
+            if not source_column or not target_column or (source_column == target_column and target_type is None):
+                continue
+            existing = table_config.columns.get(target_column)
+            table_config.columns[target_column] = (
+                existing.model_copy(update={"source": source_column, "target_type": target_type or existing.target_type})
+                if existing is not None
+                else ColumnTransformConfig(source=source_column, target_type=target_type)
+            )
+
+
+    def _target_table_combo(target_tables: tuple[TableSelection, ...], schema: str, current_table: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        table_names = sorted({table.table for table in target_tables if table.schema == schema})
+        combo.addItems(table_names)
+        if current_table and combo.findText(current_table) < 0:
+            combo.addItem(current_table)
+        combo.setCurrentText(current_table)
+        return combo
+
+
+    def _target_columns_for(target_tables: tuple[TableSelection, ...], schema: str, table_name: str) -> tuple[ColumnSelection, ...]:
+        for table in target_tables:
+            if table.schema == schema and table.table == table_name:
+                return table.columns
+        return ()
+
+
+    def _target_table_status_label(
+        target_tables: tuple[TableSelection, ...],
+        schema: str,
+        table_name: str,
+        dry_run_table: dict,
+    ) -> str:
+        if any(table.schema == schema and table.table == table_name for table in target_tables):
+            return "Existing"
+        if dry_run_table.get("schema_origin") == "target_existing":
+            return "Existing"
+        return "New"
+
+
+    def _is_existing_target_table(
+        target_tables: tuple[TableSelection, ...],
+        schema: str,
+        table_name: str,
+        dry_run_table: dict,
+    ) -> bool:
+        return _target_table_status_label(target_tables, schema, table_name, dry_run_table) == "Existing"
+
+
+    def _column_mapping_state_to_dict(target_combos: dict[str, QComboBox]) -> dict[str, str]:
+        return {
+            source_column: combo.currentText().strip()
+            for source_column, combo in target_combos.items()
+            if combo.currentText().strip()
+        }
+
+
+    def _source_only_state_to_dict(
+        action_combos: dict[str, QComboBox],
+        column_mappings: dict[str, str],
+    ) -> dict[str, SourceOnlyColumnAction]:
+        actions: dict[str, SourceOnlyColumnAction] = {}
+        for source_column, combo in action_combos.items():
+            raw_action = str(combo.currentData() or "")
+            if raw_action == SourceOnlyColumnAction.IGNORE.value:
+                actions[source_column] = SourceOnlyColumnAction.IGNORE
+            elif raw_action == SourceOnlyColumnAction.ADD_TO_TARGET.value and source_column not in column_mappings:
+                actions[source_column] = SourceOnlyColumnAction.ADD_TO_TARGET
+        return actions
+
+
+    def _without_ignored_column_mappings(
+        column_mappings: dict[str, str],
+        source_only_actions: dict[str, SourceOnlyColumnAction],
+    ) -> dict[str, str]:
+        return {
+            source_column: target_column
+            for source_column, target_column in column_mappings.items()
+            if source_only_actions.get(source_column) is not SourceOnlyColumnAction.IGNORE
+        }
+
+
+    def _without_ignored_type_overrides(
+        type_overrides: dict[str, str],
+        source_only_actions: dict[str, SourceOnlyColumnAction],
+    ) -> dict[str, str]:
+        return {
+            source_column: target_type
+            for source_column, target_type in type_overrides.items()
+            if source_only_actions.get(source_column) is not SourceOnlyColumnAction.IGNORE
+        }
+
+
+    def _type_override_state_to_dict(
+        type_edits: dict[str, QLineEdit],
+        source_columns: tuple[ColumnSelection, ...],
+        target_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        target_dbms: Dbms,
+    ) -> dict[str, str]:
+        source_by_name = {column.name: column for column in source_columns}
+        target_by_name = {column.name: column for column in target_columns}
+        overrides: dict[str, str] = {}
+        for source_column, edit in type_edits.items():
+            value = edit.text().strip()
+            if not value:
+                continue
+            source = source_by_name.get(source_column)
+            target_name = column_mappings.get(source_column, source_column)
+            target = target_by_name.get(target_name) or target_by_name.get(source_column)
+            default_type = target.source_type if target is not None else (_target_type_for_column(target_dbms, source) if source is not None else "")
+            if _normalize_type_text(value) != _normalize_type_text(default_type):
+                overrides[source_column] = value
+        return overrides
+
+
+    def _invalid_type_entries(type_edits: dict[str, QLineEdit], target_dbms: Dbms) -> list[str]:
+        invalid: list[str] = []
+        for source_column, edit in sorted(type_edits.items()):
+            if edit.isEnabled() and not _is_valid_target_type(target_dbms, edit.text().strip()):
+                invalid.append(f"{source_column}: {edit.text().strip()}")
+        return invalid
+
+
+    def _columns_mapping_widget(
+        source_columns: tuple[ColumnSelection, ...],
+        target_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+        source_only_actions: dict[str, SourceOnlyColumnAction],
+        *,
+        target_dbms: Dbms,
+        on_change: Callable[[], None] | None = None,
+    ) -> tuple[QWidget, dict[str, dict[str, QComboBox]]]:
+        table = QTableWidget()
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(["Source column", "Source type", "Target column", "Target type", "Key", "Status", "Action"])
+        target_by_name = {column.name: column for column in target_columns}
+        source_by_name = {column.name: column for column in source_columns}
+        mapped_target_names = {target for target in column_mappings.values() if target}
+        row_models = [
+            (column.name, column, target_by_name.get(column_mappings.get(column.name, column.name)))
+            for column in source_columns
+        ]
+        row_models.extend((name, None, column) for name, column in target_by_name.items() if name not in source_by_name and name not in mapped_target_names)
+        table.setRowCount(len(row_models))
+        target_combos: dict[str, QComboBox] = {}
+        type_edits: dict[str, QLineEdit] = {}
+        action_combos: dict[str, QComboBox] = {}
+        for row, (name, source_column, target_column) in enumerate(row_models):
+            status = _column_mapping_status(source_column, target_column)
+            color = _column_status_color(status)
+            values = (
+                source_column.name if source_column is not None else "",
+                source_column.source_type if source_column is not None else "",
+                target_column.name if target_column is not None else "",
+                target_column.source_type if target_column is not None else "",
+                _column_key_label(source_column, target_column),
+                status,
+            )
+            row_items: list[QTableWidgetItem] = []
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if color is not None:
+                    item.setBackground(QBrush(color))
+                table.setItem(row, column_index, item)
+                row_items.append(item)
+
+            if source_column is not None:
+                target_combo = QComboBox()
+                target_combo.setEditable(True)
+                target_combo.addItem("", "")
+                for target_name in sorted(target_by_name):
+                    target_combo.addItem(target_name, target_name)
+                selected_target = column_mappings.get(source_column.name)
+                if selected_target is None and source_column.name in target_by_name:
+                    selected_target = source_column.name
+                if selected_target is None and source_column.name not in target_by_name:
+                    selected_target = source_column.name
+                if selected_target and target_combo.findText(selected_target) < 0:
+                    target_combo.addItem(selected_target, selected_target)
+                target_combo.setCurrentText(selected_target or "")
+                row_items[2].setText("")
+                table.setCellWidget(row, 2, target_combo)
+                target_combos[source_column.name] = target_combo
+                type_edit = QLineEdit(type_overrides.get(source_column.name) or (target_column.source_type if target_column is not None else _target_type_for_column(target_dbms, source_column)))
+                row_items[3].setText("")
+                table.setCellWidget(row, 3, type_edit)
+                type_edit.setEnabled(bool(selected_target))
+                _refresh_target_type_edit_state(type_edit, source_column, target_column, target_dbms)
+                type_edits[source_column.name] = type_edit
+
+                action_combo = QComboBox()
+                action_combo.addItem("", "")
+                action_combo.addItem("무시 - 이관되지 않음", SourceOnlyColumnAction.IGNORE.value)
+                action = source_only_actions.get(source_column.name)
+                if action is SourceOnlyColumnAction.IGNORE:
+                    action_combo.setCurrentIndex(max(0, action_combo.findData(action.value)))
+                action_combo.setEnabled(not bool(target_by_name.get(selected_target or "")))
+                table.setCellWidget(row, 6, action_combo)
+                table.setRowHeight(row, max(table.rowHeight(row), target_combo.sizeHint().height() + 4, type_edit.sizeHint().height() + 4, action_combo.sizeHint().height() + 4))
+                action_combos[source_column.name] = action_combo
+                target_combo.currentTextChanged.connect(
+                    lambda value,
+                    source=source_column,
+                    items=tuple(row_items),
+                    combo=action_combo,
+                    edit=type_edit,
+                    dbms=target_dbms: _refresh_column_mapping_row(value, source, target_by_name, items, combo, edit, dbms)
+                )
+                _refresh_type_override_row(source_column, selected_target or "", target_by_name, tuple(row_items), type_edit, target_dbms, action_combo)
+                type_edit.textChanged.connect(
+                    lambda _value,
+                    source=source_column,
+                    target_combo=target_combo,
+                    targets=target_by_name,
+                    items=tuple(row_items),
+                    edit=type_edit,
+                    dbms=target_dbms,
+                    action=action_combo: _refresh_type_override_row(source, target_combo.currentText(), targets, items, edit, dbms, action)
+                )
+                action_combo.currentIndexChanged.connect(
+                    lambda _index,
+                    source=source_column,
+                    target_combo=target_combo,
+                    targets=target_by_name,
+                    items=tuple(row_items),
+                    action=action_combo,
+                    edit=type_edit,
+                    dbms=target_dbms: _refresh_column_mapping_row(target_combo.currentText(), source, targets, items, action, edit, dbms)
+                )
+                if on_change is not None:
+                    target_combo.currentTextChanged.connect(lambda _value, callback=on_change: callback())
+                    type_edit.textChanged.connect(lambda _value, callback=on_change: callback())
+                    action_combo.currentIndexChanged.connect(lambda _index, callback=on_change: callback())
+            else:
+                action_item = QTableWidgetItem("")
+                action_item.setFlags(action_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if color is not None:
+                    action_item.setBackground(QBrush(color))
+                table.setItem(row, 6, action_item)
+        table.resizeColumnsToContents()
+        return table, {"target": target_combos, "type": type_edits, "action": action_combos}
+
+
+    def _incremental_settings_widget(
+        columns: tuple[ColumnSelection, ...],
+        watermark_column: str,
+        start_value: str,
+        end_value: str,
+    ) -> tuple[QWidget, dict[str, QComboBox | QLineEdit]]:
+        widget = QWidget()
+        form = QFormLayout(widget)
+        watermark = QComboBox()
+        watermark.setEditable(True)
+        watermark.addItem("")
+        watermark.addItems(column.name for column in columns)
+        if watermark_column and watermark.findText(watermark_column) < 0:
+            watermark.addItem(watermark_column)
+        watermark.setCurrentText(watermark_column)
+        start = QLineEdit(start_value)
+        end = QLineEdit(end_value)
+        form.addRow("Watermark 컬럼", watermark)
+        form.addRow("시작값", start)
+        form.addRow("종료값", end)
+        return widget, {"watermark": watermark, "start": start, "end": end}
+
+
+    def _data_preview_widget(data_preview: dict, fallback_columns: tuple[ColumnSelection, ...]) -> QWidget:
+        table = QTableWidget()
+        preview_columns = tuple(data_preview.get("columns") or tuple(column.name for column in fallback_columns))
+        rows = tuple(data_preview.get("rows") or ())
+        message = str(data_preview.get("message") or "")
+        table.setColumnCount(len(preview_columns) or 1)
+        table.setHorizontalHeaderLabels(list(preview_columns) if preview_columns else ["Preview"])
+        if rows:
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                for column_index, column in enumerate(preview_columns):
+                    table.setItem(row_index, column_index, QTableWidgetItem(_preview_value(row.get(column))))
+        else:
+            table.setRowCount(1)
+            table.setItem(0, 0, QTableWidgetItem(message or "표시할 샘플 데이터가 없습니다."))
+            if len(preview_columns) > 1:
+                table.setSpan(0, 0, 1, len(preview_columns))
+        table.resizeColumnsToContents()
+        return table
+
+
+    def _ddl_preview_widget(
+        dry_run_table: dict,
+        target_schema: str,
+        target_table: str,
+        target_dbms: Dbms,
+        columns: tuple[ColumnSelection, ...],
+        target_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+        source_only_actions: dict[str, SourceOnlyColumnAction],
+        *,
+        existing: bool,
+    ) -> QWidget:
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        target_ddl = str(dry_run_table.get("target_ddl") or dry_run_table.get("ddl") or "")
+        alter_candidates = dry_run_table.get("alter_table_candidates") or ()
+        sections = []
+        if existing:
+            alter_candidates = (
+                tuple(_draft_mapped_column_change_candidates(target_schema, target_table, target_dbms, columns, target_columns, column_mappings, type_overrides))
+                + tuple(_draft_type_change_candidates(target_schema, target_table, target_dbms, columns, target_columns, column_mappings, type_overrides))
+                + tuple(_draft_alter_candidates(target_schema, target_table, target_dbms, columns, source_only_actions))
+            ) or alter_candidates
+        elif target_ddl:
+            sections.append(target_ddl)
+        else:
+            sections.append(_draft_create_table_ddl(target_schema, target_table, target_dbms, columns, column_mappings, type_overrides))
+        if alter_candidates:
+            sections.append("\n".join(str(candidate) for candidate in alter_candidates))
+        preview.setPlainText("\n\n".join(section for section in sections if section).strip() or "변경 DDL 없음.")
+        return preview
+
+
+    def _column_mapping_status(source_column: ColumnSelection | None, target_column: ColumnSelection | None) -> str:
+        if source_column is not None and target_column is not None:
+            if source_column.name != target_column.name:
+                return "컬럼 변경"
+            if _same_common_type(source_column, target_column):
+                return "mapped"
+            return "type 변경"
+        if source_column is not None:
+            return "target 컬럼 추가"
+        return "대상 전용"
+
+
+    def _column_status_color(status: str) -> QColor | None:
+        if status in {"target 컬럼 추가", "type 변경", "컬럼 변경"}:
+            return QColor(255, 246, 204)
+        if status == "대상 전용":
+            return QColor(238, 238, 238)
+        if status == "이관 제외":
+            return QColor(255, 225, 225)
+        if status == "invalid type":
+            return QColor(255, 205, 210)
+        return None
+
+
+    def _refresh_column_mapping_row(
+        target_column_name: str,
+        source_column: ColumnSelection,
+        target_by_name: dict[str, ColumnSelection],
+        row_items: tuple[QTableWidgetItem, ...],
+        action_combo: QComboBox,
+        type_edit: QLineEdit,
+        target_dbms: Dbms,
+    ) -> None:
+        target_column = target_by_name.get(target_column_name.strip())
+        type_edit.setEnabled(target_column is not None or bool(target_column_name.strip()))
+        type_edit.setText(target_column.source_type if target_column is not None else _target_type_for_column(target_dbms, source_column))
+        _refresh_target_type_edit_state(type_edit, source_column, target_column, target_dbms)
+        action_combo.setEnabled(not bool(target_column))
+        status = _column_status_for_type_edit(source_column, target_column, type_edit, target_dbms, action_combo)
+        row_items[4].setText(_column_key_label(source_column, target_column))
+        row_items[5].setText(status)
+        color = _column_status_color(status)
+        brush = QBrush(color) if color is not None else QBrush()
+        for item in row_items:
+            item.setBackground(brush)
+
+
+    def _refresh_type_override_row(
+        source_column: ColumnSelection,
+        target_column_name: str,
+        target_by_name: dict[str, ColumnSelection],
+        row_items: tuple[QTableWidgetItem, ...],
+        type_edit: QLineEdit,
+        target_dbms: Dbms,
+        action_combo: QComboBox,
+    ) -> None:
+        target_column = target_by_name.get(target_column_name.strip())
+        _refresh_target_type_edit_state(type_edit, source_column, target_column, target_dbms)
+        status = _column_status_for_type_edit(source_column, target_column, type_edit, target_dbms, action_combo)
+        row_items[5].setText(status)
+        color = _column_status_color(status)
+        brush = QBrush(color) if color is not None else QBrush()
+        for item in row_items:
+            item.setBackground(brush)
+
+
+    def _column_status_for_type_edit(
+        source_column: ColumnSelection,
+        target_column: ColumnSelection | None,
+        type_edit: QLineEdit,
+        target_dbms: Dbms,
+        action_combo: QComboBox | None = None,
+    ) -> str:
+        if action_combo is not None and str(action_combo.currentData() or "") == SourceOnlyColumnAction.IGNORE.value:
+            return "이관 제외"
+        if not type_edit.isEnabled():
+            return _column_mapping_status(source_column, target_column)
+        value = type_edit.text().strip()
+        if not _is_valid_target_type(target_dbms, value):
+            return "invalid type"
+        default_type = target_column.source_type if target_column is not None else _target_type_for_column(target_dbms, source_column)
+        if _normalize_type_text(value) != _normalize_type_text(default_type):
+            return "type 변경"
+        return _column_mapping_status(source_column, target_column)
+
+
+    def _refresh_target_type_edit_state(
+        type_edit: QLineEdit,
+        source_column: ColumnSelection,
+        target_column: ColumnSelection | None,
+        target_dbms: Dbms,
+    ) -> None:
+        value = type_edit.text().strip()
+        if not type_edit.isEnabled() or _is_valid_target_type(target_dbms, value):
+            type_edit.setStyleSheet("")
+            type_edit.setToolTip("")
+            return
+        type_edit.setStyleSheet("border: 1px solid #c62828; background: #ffebee;")
+        type_edit.setToolTip(f"{target_dbms.value}에서 인식하지 못하는 target type입니다: {value}")
+
+
+    def _same_common_type(source_column: ColumnSelection, target_column: ColumnSelection) -> bool:
+        return (
+            source_column.common_type.kind,
+            source_column.common_type.length,
+            source_column.common_type.precision,
+            source_column.common_type.scale,
+        ) == (
+            target_column.common_type.kind,
+            target_column.common_type.length,
+            target_column.common_type.precision,
+            target_column.common_type.scale,
+        )
+
+
+    def _column_key_label(source_column: ColumnSelection | None, target_column: ColumnSelection | None) -> str:
+        if (source_column is not None and source_column.primary_key) or (target_column is not None and target_column.primary_key):
+            return "PK"
+        return ""
+
+
+    def _draft_create_table_ddl(
+        target_schema: str,
+        target_table: str,
+        target_dbms: Dbms,
+        columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+    ) -> str:
+        table_name = _qualified_table_name(target_dbms, target_schema, target_table)
+        column_lines = [
+            f"  {_quote_identifier_for(target_dbms, column_mappings.get(column.name, column.name))} {_target_type_for_column(target_dbms, column, type_overrides.get(column.name))}{' NULL' if column.nullable else ' NOT NULL'}"
+            for column in columns
+        ]
+        primary_key_columns = [_quote_identifier_for(target_dbms, column_mappings.get(column.name, column.name)) for column in columns if column.primary_key]
+        if primary_key_columns:
+            column_lines.append(f"  PRIMARY KEY ({', '.join(primary_key_columns)})")
+        if not column_lines:
+            return ""
+        return f"CREATE TABLE {table_name} (\n" + ",\n".join(column_lines) + "\n);"
+
+
+    def _draft_mapped_column_change_candidates(
+        target_schema: str,
+        target_table: str,
+        target_dbms: Dbms,
+        columns: tuple[ColumnSelection, ...],
+        target_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+    ) -> list[str]:
+        table_name = _qualified_table_name(target_dbms, target_schema, target_table)
+        columns_by_name = {column.name: column for column in columns}
+        existing_target_column_names = {column.name for column in target_columns}
+        ddls: list[str] = []
+        for source_column, target_column in sorted(column_mappings.items()):
+            if not target_column or target_column in existing_target_column_names:
+                continue
+            column = columns_by_name.get(source_column)
+            if column is None:
+                continue
+            if source_column in existing_target_column_names:
+                ddls.append(
+                    f"ALTER TABLE {table_name} RENAME COLUMN {_quote_identifier_for(target_dbms, source_column)} TO {_quote_identifier_for(target_dbms, target_column)};"
+                )
+            else:
+                ddls.append(
+                    f"ALTER TABLE {table_name} ADD COLUMN {_quote_identifier_for(target_dbms, target_column)} {_target_type_for_column(target_dbms, column, type_overrides.get(source_column))}{' NULL' if column.nullable else ' NOT NULL'};"
+                )
+        return ddls
+
+
+    def _draft_type_change_candidates(
+        target_schema: str,
+        target_table: str,
+        target_dbms: Dbms,
+        columns: tuple[ColumnSelection, ...],
+        target_columns: tuple[ColumnSelection, ...],
+        column_mappings: dict[str, str],
+        type_overrides: dict[str, str],
+    ) -> list[str]:
+        table_name = _qualified_table_name(target_dbms, target_schema, target_table)
+        target_columns_by_name = {column.name: column for column in target_columns}
+        ddls: list[str] = []
+        for source_column in columns:
+            target_column_name = column_mappings.get(source_column.name, source_column.name)
+            original_target_column = target_columns_by_name.get(target_column_name) or target_columns_by_name.get(source_column.name)
+            target_type = type_overrides.get(source_column.name)
+            if original_target_column is None:
+                continue
+            if target_type is None and _same_common_type(source_column, original_target_column):
+                continue
+            if target_type is not None and _normalize_type_text(target_type) == _normalize_type_text(original_target_column.source_type):
+                continue
+            if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+                ddls.append(
+                    f"ALTER TABLE {table_name} MODIFY COLUMN {_quote_identifier_for(target_dbms, target_column_name)} {_target_type_for_column(target_dbms, source_column, target_type)}{' NULL' if source_column.nullable else ' NOT NULL'};"
+                )
+            else:
+                ddls.append(
+                    f"ALTER TABLE {table_name} ALTER COLUMN {_quote_identifier_for(target_dbms, target_column_name)} TYPE {_target_type_for_column(target_dbms, source_column, target_type)};"
+                )
+        return ddls
+
+
+    def _draft_alter_candidates(
+        target_schema: str,
+        target_table: str,
+        target_dbms: Dbms,
+        columns: tuple[ColumnSelection, ...],
+        source_only_actions: dict[str, SourceOnlyColumnAction],
+    ) -> list[str]:
+        table_name = _qualified_table_name(target_dbms, target_schema, target_table)
+        columns_by_name = {column.name: column for column in columns}
+        ddls: list[str] = []
+        for source_column, action in sorted(source_only_actions.items()):
+            if action is not SourceOnlyColumnAction.ADD_TO_TARGET:
+                continue
+            column = columns_by_name.get(source_column)
+            if column is None:
+                continue
+            ddls.append(
+                f"ALTER TABLE {table_name} ADD COLUMN {_quote_identifier_for(target_dbms, column.name)} {_target_type_for_column(target_dbms, column)}{' NULL' if column.nullable else ' NOT NULL'};"
+            )
+        return ddls
+
+
+    def _target_type_for_column(target_dbms: Dbms, column: ColumnSelection, target_type_override: str | None = None) -> str:
+        if target_type_override:
+            return target_type_override
+        if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+            return common_type_to_mysql(column.common_type)
+        return common_type_to_postgres(column.common_type)
+
+
+    def _is_valid_target_type(target_dbms: Dbms, target_type: str) -> bool:
+        if not target_type.strip():
+            return False
+        common_type = mysql_type_to_common(target_type) if target_dbms in {Dbms.MYSQL, Dbms.MARIADB} else postgres_type_to_common(target_type)
+        return common_type.kind is not CommonTypeKind.UNKNOWN
+
+
+    def _normalize_type_text(value: str) -> str:
+        return " ".join(value.strip().lower().split())
+
+
+    def _qualified_table_name(target_dbms: Dbms, schema: str, table: str) -> str:
+        quote = _quote_identifier_for
+        return f"{quote(target_dbms, schema)}.{quote(target_dbms, table)}"
+
+
+    def _quote_identifier_for(target_dbms: Dbms, value: str) -> str:
+        if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+            return "`" + value.replace("`", "``") + "`"
+        return '"' + value.replace('"', '""') + '"'
+
+
+    def _preview_value(value: object) -> str:
+        if value is None:
+            return "<null>"
+        text = str(value)
+        if len(text) > 80:
+            return text[:77] + "..."
+        return text
+
+
+    def _default_target_schema_name(config: AppConfig, source_schema: str) -> str:
+        if config.target.schema_name:
+            return config.target.schema_name
+        if config.target.dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+            return config.target.database
+        return source_schema
+
+
+    def _default_gui_path_state() -> GuiPathState:
+        return GuiPathState(
+            config_path=str(Path("config.yml").resolve()),
+            schema_path="",
+            output_dir=str(Path("reports/live").resolve()),
+            checkpoint_path=str(Path("checkpoints/migration.sqlite").resolve()),
+        )
+
+
+    def _parse_source_only_columns(raw_value: str) -> dict[str, SourceOnlyColumnAction]:
+        actions: dict[str, SourceOnlyColumnAction] = {}
+        for line in raw_value.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if ":" not in stripped:
+                continue
+            column, action = (part.strip() for part in stripped.split(":", 1))
+            if not column:
+                continue
+            try:
+                actions[column] = SourceOnlyColumnAction(action)
+            except ValueError:
+                continue
+        return actions
 
 
     def _app_icon() -> QIcon:

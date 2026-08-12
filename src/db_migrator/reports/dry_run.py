@@ -13,7 +13,9 @@ from db_migrator.config.models import AppConfig, Dbms
 from db_migrator.core.indexes import IndexMigrationDecision, plan_index_migration
 from db_migrator.reports.labels import display_timestamp, option_label
 from db_migrator.reports.metadata import ReportEndpoint
+from db_migrator.schema.column_plan import ColumnPlan
 from db_migrator.schema.models import SchemaObjectKind, SchemaSnapshot, TableSchema
+from db_migrator.schema.schema_pair import SchemaOrigin
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,9 @@ class DryRunTableResult:
     source_ddl: str
     target_ddl: str
     ddl: str
+    schema_origin: str
+    source_only_columns: tuple[str, ...]
+    alter_table_candidates: tuple[str, ...]
     warning_count: int
     warnings: tuple[DryRunWarning, ...]
 
@@ -81,6 +86,8 @@ def build_dry_run_report(
     metadata: DryRunMetadata | None = None,
     registry: DbmsAdapterRegistry | None = None,
     app_config: AppConfig | None = None,
+    column_plans: dict[str, ColumnPlan] | None = None,
+    schema_origins: dict[str, SchemaOrigin] | None = None,
 ) -> DryRunReport:
     adapter_registry = registry or default_adapter_registry()
     source_tables = source_snapshot.tables if source_snapshot is not None else snapshot.tables
@@ -97,7 +104,14 @@ def build_dry_run_report(
     index_plan = plan_index_migration(snapshot, config=app_config or _index_plan_default_config(target_dbms), target_dbms=target_dbms)
     return DryRunReport(
         tables=tuple(
-            _build_table_result(source_generator, target_generator, source_table, target_table)
+            _build_table_result(
+                source_generator,
+                target_generator,
+                source_table,
+                target_table,
+                column_plan=(column_plans or {}).get(_table_key(source_table)),
+                schema_origin=(schema_origins or {}).get(_table_key(source_table), SchemaOrigin.SOURCE_MAPPED),
+            )
             for source_table, target_table in zip(source_tables, snapshot.tables, strict=True)
         ),
         object_checks=_build_object_checks(object_source, index_plan=index_plan),
@@ -118,12 +132,31 @@ def _build_table_result(
     target_generator: DdlGenerator,
     source_table: TableSchema,
     target_table: TableSchema,
+    column_plan: ColumnPlan | None,
+    schema_origin: SchemaOrigin,
 ) -> DryRunTableResult:
     source_ddl_result: DdlResult = source_generator.generate_create_table(source_table)
     target_ddl_result: DdlResult = target_generator.generate_create_table(target_table)
     warning_messages = list(target_ddl_result.warnings)
     if source_table.primary_key is None and not any(index.unique for index in source_table.indexes):
         warning_messages.append("high risk: 기본키 또는 unique index가 없어 offset 기준 resume만 가능합니다.")
+    source_only_column_plans = column_plan.source_only_columns if column_plan is not None else ()
+    source_only_columns = tuple(item.column.name for item in source_only_column_plans)
+    alter_table_candidates = (
+        (column_plan.rename_column_ddls + column_plan.type_change_ddls + column_plan.add_column_ddls) if column_plan is not None else ()
+    ) + tuple(
+        item.alter_table_ddl for item in source_only_column_plans if item.alter_table_ddl
+    )
+    for item in source_only_column_plans:
+        if item.action.value == "manual":
+            warning_messages.append(f"source-only column ignored: {item.column.name}")
+        elif item.action.value == "add_to_target":
+            warning_messages.append(f"source-only column selected as ALTER candidate: {item.column.name}")
+        else:
+            warning_messages.append(f"source-only column ignored: {item.column.name}")
+    if column_plan is not None:
+        for item in column_plan.unresolved_target_columns:
+            warning_messages.append(f"unresolved target column: {item.column.name} - {item.message}")
     warnings = tuple(_build_warning(message) for message in warning_messages)
     return DryRunTableResult(
         schema=target_table.ref.schema,
@@ -133,9 +166,16 @@ def _build_table_result(
         source_ddl=source_ddl_result.ddl,
         target_ddl=target_ddl_result.ddl,
         ddl=target_ddl_result.ddl,
+        schema_origin=schema_origin.value,
+        source_only_columns=source_only_columns,
+        alter_table_candidates=alter_table_candidates,
         warning_count=len(warnings),
         warnings=warnings,
     )
+
+
+def _table_key(table: TableSchema) -> str:
+    return f"{table.ref.schema}.{table.ref.name}"
 
 
 def _default_metadata() -> DryRunMetadata:
@@ -222,12 +262,15 @@ def _write_json(report: DryRunReport, output_path: Path) -> None:
 def _write_csv(report: DryRunReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["schema", "table", "warning_count", "warnings", "recommended_actions"])
+        writer.writerow(["schema", "table", "schema_origin", "source_only_columns", "alter_table_candidates", "warning_count", "warnings", "recommended_actions"])
         for table in report.tables:
             writer.writerow(
                 [
                     table.schema,
                     table.table,
+                    table.schema_origin,
+                    " | ".join(table.source_only_columns),
+                    " | ".join(table.alter_table_candidates),
                     table.warning_count,
                     " | ".join(warning.message for warning in table.warnings),
                     " | ".join(warning.action for warning in table.warnings),
@@ -691,6 +734,10 @@ def _warning_message_label(message: str) -> str:
         return "PostgreSQL array 타입은 명시적인 target 모델 검토가 필요합니다."
     if "offset resume only" in normalized_message:
         return "기본키 또는 unique index가 없어 offset 기준 resume만 가능합니다."
+    if "source-only column" in normalized_message:
+        return message
+    if "unresolved target column" in normalized_message:
+        return message
     if "requires manual review" in normalized_message:
         return "자동 변환이 어려운 타입이 있어 수동 검토가 필요합니다."
     return message
@@ -713,6 +760,14 @@ def _warning_action(normalized_message: str) -> str:
         return "apply-ddl 실행 전에 JSON text 또는 child table 등 명시적인 target 모델을 결정하세요."
     if "offset resume only" in normalized_message:
         return "resume/retry 안정성을 높이려면 기본키 또는 unique index 추가 가능 여부를 검토하세요."
+    if "source-only column selected as alter candidate" in normalized_message:
+        return "자동 ALTER는 실행하지 않습니다. 생성 후보 DDL을 검토한 뒤 별도 적용하세요."
+    if "source-only column requires manual" in normalized_message:
+        return "target schema에 없는 source 컬럼입니다. 별도 수동 이관 또는 스키마 변경 여부를 결정하세요."
+    if "source-only column ignored" in normalized_message:
+        return "무시로 선택된 컬럼입니다. 이관하려면 컬럼 매핑에서 대상 컬럼을 지정하세요."
+    if "unresolved target column" in normalized_message:
+        return "target 필수 컬럼을 채울 source/default/null mapping을 config에 추가하세요."
     if "requires manual review" in normalized_message:
         return "apply-ddl 실행 전에 명시적인 타입 매핑 또는 custom migration rule을 정의하세요."
     return "apply-ddl 실행 전에 생성된 DDL과 애플리케이션 동작 영향을 검토하세요."
@@ -834,7 +889,7 @@ def _table_row(table: DryRunTableResult) -> str:
                   <span>{escape(table.schema)}</span>
                   <span class="summary-table">{escape(table.table)}</span>
                   <span>{warning_badge}</span>
-                  <span class="action">원본 / 대상 테이블 생성 SQL 비교</span>
+                  <span class="action">스키마 기준: {escape(table.schema_origin)} / 원본 / 대상 테이블 생성 SQL 비교</span>
                 </summary>
                 <div class="ddl-compare">
                   <div class="ddl-panel">
@@ -846,7 +901,22 @@ def _table_row(table: DryRunTableResult) -> str:
                     <pre>{escape(table.target_ddl)}</pre>
                   </div>
                 </div>
+                {_alter_candidates_block(table)}
               </details>
             </td>
           </tr>
+    """
+
+
+def _alter_candidates_block(table: DryRunTableResult) -> str:
+    if not table.alter_table_candidates:
+        return ""
+    candidates = "\n".join(f"<pre>{escape(candidate)}</pre>" for candidate in table.alter_table_candidates)
+    return f"""
+                <div class="ddl-compare">
+                  <div class="ddl-panel">
+                    <h3>Source-only 컬럼 ALTER 후보</h3>
+                    {candidates}
+                  </div>
+                </div>
     """

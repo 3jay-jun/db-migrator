@@ -507,7 +507,9 @@ class MySqlTargetAdapter:
                 cursor.executemany(sql, values)
             return WriteResult(success=True, rows_written=len(rows), message="Batch written.")
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to write target batch for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to write target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
         if not keys:
@@ -530,7 +532,9 @@ class MySqlTargetAdapter:
                 cursor.executemany(sql, values)
             return WriteResult(success=True, rows_written=len(rows), message="Batch upserted.")
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to upsert target batch for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def count_rows(self, table: TableRef) -> int:
         table_sql = self._qualified_table_ref(table)
@@ -540,7 +544,9 @@ class MySqlTargetAdapter:
                     cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
                     return int(cursor.fetchone()[0])
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to count target rows for table: {table.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to count target rows for table: {table.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
         temp_table = _mysql_sync_temp_table_name(table_schema)
@@ -552,7 +558,9 @@ class MySqlTargetAdapter:
                 cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {temp_table}")
                 cursor.execute(f"CREATE TEMPORARY TABLE {temp_table} AS SELECT {key_sql} FROM {table_sql} WHERE 1 = 0")
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to prepare target sync keys for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to prepare target sync keys for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def record_sync_keys(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> None:
         if not rows:
@@ -566,7 +574,9 @@ class MySqlTargetAdapter:
             with connection.cursor() as cursor:
                 cursor.executemany(f"INSERT INTO {temp_table} ({key_sql}) VALUES ({placeholders})", values)
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to record target sync keys for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to record target sync keys for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def delete_rows_not_in_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> int:
         temp_table = _mysql_sync_temp_table_name(table_schema)
@@ -581,7 +591,10 @@ class MySqlTargetAdapter:
                 cursor.execute(f"DELETE FROM {table_sql} WHERE NOT EXISTS (SELECT 1 FROM {temp_table} WHERE {match_sql})")
                 return int(cursor.rowcount or 0)
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to delete target rows missing from source for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                "Failed to delete target rows missing from source for table: "
+                f"{table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def end_sync_keys(self, table_schema: TableSchema) -> None:
         temp_table = _mysql_sync_temp_table_name(table_schema)
@@ -590,7 +603,9 @@ class MySqlTargetAdapter:
             with connection.cursor() as cursor:
                 cursor.execute(f"DROP TEMPORARY TABLE IF EXISTS {temp_table}")
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to clean up target sync keys for table: {table_schema.ref.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to clean up target sync keys for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def sample_rows(
         self,
@@ -612,7 +627,9 @@ class MySqlTargetAdapter:
                     rows = cursor.fetchall()
             return tuple(dict(zip(columns, row, strict=True)) for row in rows)
         except Exception as exc:
-            raise MySqlAdapterError(f"Failed to sample target rows for table: {table.name}") from exc
+            raise MySqlAdapterError(
+                f"Failed to sample target rows for table: {table.name}. detail={safe_error_detail(exc)}"
+            ) from exc
 
     def commit(self) -> None:
         if self._dml_connection is not None:

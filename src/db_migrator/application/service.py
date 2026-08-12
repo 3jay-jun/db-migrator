@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
@@ -12,11 +12,11 @@ from db_migrator.adapters.mysql import MySqlAdapterError
 from db_migrator.adapters.postgres import PostgresAdapterError
 from db_migrator.adapters.registry import AdapterRegistryError, DbmsAdapterRegistry, default_adapter_registry
 from db_migrator.config.loader import ConfigLoadError, load_config
-from db_migrator.config.models import AppConfig, Dbms, IndexApplyTiming, SourceConfig
+from db_migrator.config.models import AppConfig, ColumnTransformConfig, Dbms, IndexApplyTiming, SourceConfig, SourceOnlyColumnAction, TableRunConfig
 from db_migrator.connection import ResolvedAppConfig, TunnelError, TunnelFactory, TunnelManager
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
-from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables
+from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables, stable_order_columns
 from db_migrator.core.engine import MigrationEngine
 from db_migrator.core.events import EventPublisher, MigrationEvent, QueueEventPublisher
 from db_migrator.core.health import run_health_checks
@@ -25,12 +25,14 @@ from db_migrator.core.indexes import execute_index_ddls
 from db_migrator.core.manual_migration import export_manual_migration_files
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation_readers import SourceTargetValidationReader
-from db_migrator.application.table_mapping import TargetMappingAdapter
+from db_migrator.application.table_mapping import ColumnPlanTargetAdapter, TargetMappingAdapter
 from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, write_dry_run_report
 from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.incremental_report import write_incremental_report
 from db_migrator.reports.metadata import ReportEndpoint
-from db_migrator.schema.models import ForeignKeySchema, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.common_types import CommonType
+from db_migrator.schema.models import SamplePosition, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.schema_pair import SchemaPairPlan, SchemaPairResolver
 from db_migrator.schema.snapshot_io import SchemaSnapshotLoadError, load_schema_snapshot_from_json
 from db_migrator.schema.table_mapping import TableMappingResolver
 
@@ -54,6 +56,15 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class ColumnSelection:
+    name: str
+    source_type: str
+    common_type: CommonType
+    nullable: bool
+    primary_key: bool
+
+
+@dataclass(frozen=True)
 class TableSelection:
     identifier: str
     schema: str
@@ -61,6 +72,7 @@ class TableSelection:
     column_count: int
     estimated_rows: int | None
     has_primary_key: bool
+    columns: tuple[ColumnSelection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,7 +123,7 @@ class MigrationApplicationService:
 
     def run_test_source_connection(self, *, config: Path) -> CommandResult:
         try:
-            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
                 assert runtime.source is not None
                 connected = runtime.source.test_connection()
             return CommandResult(
@@ -140,17 +152,72 @@ class MigrationApplicationService:
             with self._command_runtime(config, include_source=True, include_target=False) as runtime:
                 assert runtime.source is not None
                 app_config = runtime.resolved
+                original_config = runtime.original
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_snapshot = self._load_target_snapshot(app_config, original_config)
             tables = tuple(_table_selection(table) for table in snapshot.tables)
+            target_tables = tuple(_table_selection(table) for table in target_snapshot.tables)
             return CommandResult(
                 command="scan-tables",
                 success=True,
                 message=f"tables={len(tables)}",
                 table_count=len(tables),
-                details={"tables": tables},
+                details={"tables": tables, "target_tables": target_tables},
             )
         except _KNOWN_ERRORS as exc:
             return _failure("scan-tables", exc)
+
+    def run_table_preview(
+        self,
+        *,
+        config: Path,
+        table_identifier: str,
+        schema_file: Path | None = None,
+        target_schema: str | None = None,
+        target_table: str | None = None,
+        column_mappings: dict[str, str] | None = None,
+        type_overrides: dict[str, str] | None = None,
+        source_only_actions: dict[str, SourceOnlyColumnAction] | None = None,
+        sample_size: int = 30,
+    ) -> CommandResult:
+        try:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                source_snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_snapshot = self._load_target_snapshot(app_config, original_config)
+                preview_config = original_config.model_copy(deep=True)
+                table_config = preview_config.tables.get(table_identifier, TableRunConfig())
+                table_config.target_schema = target_schema or table_config.target_schema
+                table_config.target_table = target_table or table_config.target_table
+                _apply_preview_column_mappings(table_config, column_mappings or {}, type_overrides or {})
+                table_config.source_only_columns = source_only_actions or table_config.source_only_columns
+                preview_config.tables[table_identifier] = table_config
+                selected_snapshot = _filter_snapshot(source_snapshot, {table_identifier})
+                schema_plan = self._resolve_schema_plan(preview_config, source_snapshot=selected_snapshot, target_snapshot=target_snapshot)
+                if not schema_plan.pairs:
+                    return CommandResult(command="table-preview", success=False, message=f"table not found: {table_identifier}")
+                plan = schema_plan.pairs[0].column_plan
+                read_columns = plan.read_columns or tuple(column.name for column in plan.source_table.columns if not column.is_generated)
+                order_by = stable_order_columns(plan.source_table, read_columns)
+                rows = plan.transform_rows(
+                    runtime.source.sample_rows(plan.source_table.ref, read_columns, sample_size, order_by, SamplePosition.FIRST)
+                )
+                columns = plan.write_columns or tuple(rows[0].keys() if rows else ())
+            return CommandResult(
+                command="table-preview",
+                success=True,
+                message=f"preview_rows={len(rows)}",
+                details={
+                    "columns": columns,
+                    "rows": rows,
+                    "schema_origin": schema_plan.pairs[0].schema_origin.value,
+                    "target_table": schema_plan.pairs[0].target_table.ref,
+                },
+            )
+        except _KNOWN_ERRORS as exc:
+            return _failure("table-preview", exc)
 
     def run_dry_run(
         self,
@@ -161,22 +228,25 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
                 assert runtime.source is not None
                 app_config = runtime.resolved
                 report_config = runtime.original
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_snapshot = self._load_target_snapshot(app_config, report_config)
             snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(report_config).target_snapshot_for(snapshot)
+            schema_plan = self._resolve_schema_plan(report_config, source_snapshot=snapshot, target_snapshot=target_snapshot)
             report = build_dry_run_report(
-                target_snapshot,
-                source_snapshot=snapshot,
+                schema_plan.target_snapshot,
+                source_snapshot=schema_plan.source_snapshot,
                 source_dbms=report_config.source.dbms,
                 target_dbms=report_config.target.dbms,
                 target_database=report_config.target.database,
                 metadata=_dry_run_metadata(report_config),
                 registry=self._registry,
                 app_config=report_config,
+                column_plans=_column_plan_by_source_key(schema_plan),
+                schema_origins=_schema_origin_by_source_key(schema_plan),
             )
             resolved_output_dir = output_dir or Path(report_config.report.output_dir)
             write_dry_run_report(report, resolved_output_dir)
@@ -210,15 +280,17 @@ class MigrationApplicationService:
                 if dry_run_report_path is not None:
                     safety_config.migration.dry_run_report_path = str(dry_run_report_path)
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, safety_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
-                target_snapshot = TableMappingResolver(safety_config).target_snapshot_for(snapshot)
+                schema_plan = self._resolve_schema_plan(safety_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
                 resolved_output_file = output_file or Path(safety_config.report.output_dir) / "ddl-execution.json"
                 summary = execute_schema_ddl(
                     config=safety_config,
-                    snapshot=target_snapshot,
+                    snapshot=schema_plan.target_snapshot,
                     executor=runtime.target,
                     report_output_path=resolved_output_file,
                     registry=self._registry,
+                    column_plans=schema_plan.column_plans,
                 )
             return CommandResult(
                 command="apply-ddl",
@@ -248,12 +320,13 @@ class MigrationApplicationService:
                 app_config = runtime.resolved
                 original_config = runtime.original
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
-                target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+                schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
                 resolved_output_file = output_file or Path(original_config.report.output_dir) / f"index-execution-{phase.value}.json"
                 summary = execute_index_ddls(
                     config=original_config,
-                    snapshot=target_snapshot,
+                    snapshot=schema_plan.target_snapshot,
                     executor=runtime.target,
                     phase=phase,
                     report_output_path=resolved_output_file,
@@ -283,15 +356,16 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
                 assert runtime.source is not None
                 app_config = runtime.resolved
                 original_config = runtime.original
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
             snapshot = _filter_snapshot(snapshot, selected_tables)
-            target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+            schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
             generator = self._registry.create_ddl_generator(original_config.target.dbms, target_database=original_config.target.database)
-            statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
+            statements = tuple(generator.generate_create_table(table).ddl for table in schema_plan.target_snapshot.tables)
             sql = "\n\n".join(statements)
             resolved_output_dir = output_dir or Path(original_config.report.output_dir)
             output_file = resolved_output_dir / "manual-ddl.sql"
@@ -317,26 +391,28 @@ class MigrationApplicationService:
         selected_tables: set[str] | None = None,
     ) -> CommandResult:
         try:
-            with self._command_runtime(config, include_source=True, include_target=False) as runtime:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
                 assert runtime.source is not None
                 app_config = runtime.resolved
                 original_config = runtime.original
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
-                target_snapshot = TableMappingResolver(original_config).target_snapshot_for(snapshot)
+                schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
                 generator = self._registry.create_ddl_generator(original_config.target.dbms, target_database=original_config.target.database)
-                statements = tuple(generator.generate_create_table(table).ddl for table in target_snapshot.tables)
+                statements = tuple(generator.generate_create_table(table).ddl for table in schema_plan.target_snapshot.tables)
                 ddl_sql = "\n\n".join(statements)
                 resolved_output_dir = output_dir or Path(original_config.report.output_dir)
                 export = export_manual_migration_files(
                     source=runtime.source,
-                    source_tables=snapshot.tables,
-                    target_tables=target_snapshot.tables,
+                    source_tables=schema_plan.source_snapshot.tables,
+                    target_tables=schema_plan.target_snapshot.tables,
                     target_dbms=original_config.target.dbms,
                     target_database=original_config.target.database,
                     migration_config=original_config.migration,
                     ddl_sql=ddl_sql,
                     output_dir=resolved_output_dir,
+                    column_plans=schema_plan.column_plans,
                 )
             return CommandResult(
                 command="generate-manual-migration",
@@ -425,21 +501,18 @@ class MigrationApplicationService:
                 assert runtime.target is not None
                 app_config = runtime.resolved
                 original_config = runtime.original
-                target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config, original_config))
-                resolver = TableMappingResolver(original_config)
-                target = TargetMappingAdapter(runtime.target, resolver)
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
-                expected_target_snapshot = _schema_scan_expected_snapshot(resolver.target_snapshot_for(snapshot), original_config)
-                actual_target_snapshot = target_schema_reader.scan_schema(_target_schema_name(original_config))
+                actual_target_snapshot = self._load_target_snapshot(app_config, original_config)
+                schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=actual_target_snapshot)
                 report = validate_tables(
                     job_id=original_config.job.name,
-                    tables=snapshot.tables,
-                    reader=SourceTargetValidationReader(runtime.source, target),
+                    tables=schema_plan.source_snapshot.tables,
+                    reader=SourceTargetValidationReader(runtime.source, runtime.target, schema_plan.column_plans),
                     verification=original_config.verification,
                     metadata=_validation_metadata(original_config),
-                    target_table_resolver=resolver.target_ref_for,
-                    source_snapshot=expected_target_snapshot,
+                    target_table_resolver=lambda table: schema_plan.column_plans[table].target_table.ref,
+                    source_snapshot=schema_plan.target_snapshot,
                     target_snapshot=actual_target_snapshot,
                 )
                 resolved_output_dir = output_dir or Path(original_config.report.output_dir)
@@ -522,10 +595,12 @@ class MigrationApplicationService:
                 assert runtime.target is not None
                 app_config = runtime.resolved
                 original_config = runtime.original
-                target = TargetMappingAdapter(runtime.target, TableMappingResolver(original_config))
                 checkpoint_store = CheckpointStore(checkpoint_db)
                 snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
+                schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
+                target = ColumnPlanTargetAdapter(runtime.target, schema_plan.column_plans)
                 resume_plan = None
                 if retry_failed_only is not None:
                     resume_plan = (
@@ -542,6 +617,7 @@ class MigrationApplicationService:
                     event_publisher=event_publisher,
                     migration_config=original_config.migration,
                     resume_plan=resume_plan,
+                    column_plans=schema_plan.column_plans,
                 )
             return CommandResult(
                 command=command,
@@ -566,6 +642,22 @@ class MigrationApplicationService:
         if schema_file is not None:
             return load_schema_snapshot_from_json(schema_file, source_dbms=source_dbms)
         return source.scan_schema(schema_name)
+
+    def _load_target_snapshot(self, app_config: AppConfig, original_config: AppConfig) -> SchemaSnapshot:
+        target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config, original_config))
+        return target_schema_reader.scan_schema(_target_schema_name(original_config))
+
+    def _resolve_schema_plan(
+        self,
+        config: AppConfig,
+        *,
+        source_snapshot: SchemaSnapshot,
+        target_snapshot: SchemaSnapshot | None,
+    ) -> SchemaPairPlan:
+        return SchemaPairResolver(config, target_schema_name=_target_schema_name(config)).resolve(
+            source_snapshot=source_snapshot,
+            target_snapshot=target_snapshot,
+        )
 
     @contextmanager
     def _command_runtime(
@@ -631,7 +723,29 @@ def _filter_snapshot(snapshot: SchemaSnapshot, selected_tables: set[str] | None)
     return SchemaSnapshot(tables=tuple(table for table in snapshot.tables if _table_identifier(table) in selected_tables))
 
 
+def _column_plan_by_source_key(schema_plan: SchemaPairPlan):
+    return {_table_identifier(pair.source_table): pair.column_plan for pair in schema_plan.pairs}
+
+
+def _apply_preview_column_mappings(table_config: TableRunConfig, column_mappings: dict[str, str], type_overrides: dict[str, str]) -> None:
+    for source_column, target_column in {**{column: column for column in type_overrides}, **column_mappings}.items():
+        if not source_column or not target_column:
+            continue
+        existing = table_config.columns.get(target_column)
+        target_type = type_overrides.get(source_column)
+        table_config.columns[target_column] = (
+            existing.model_copy(update={"source": source_column, "target_type": target_type or existing.target_type})
+            if existing is not None
+            else ColumnTransformConfig(source=source_column, target_type=target_type)
+        )
+
+
+def _schema_origin_by_source_key(schema_plan: SchemaPairPlan):
+    return {_table_identifier(pair.source_table): pair.schema_origin for pair in schema_plan.pairs}
+
+
 def _table_selection(table: TableSchema) -> TableSelection:
+    primary_key_columns = set(table.primary_key.columns if table.primary_key is not None else ())
     return TableSelection(
         identifier=_table_identifier(table),
         schema=table.ref.schema,
@@ -639,6 +753,16 @@ def _table_selection(table: TableSchema) -> TableSelection:
         column_count=len(table.columns),
         estimated_rows=table.estimated_rows,
         has_primary_key=table.primary_key is not None and bool(table.primary_key.columns),
+        columns=tuple(
+            ColumnSelection(
+                name=column.name,
+                source_type=column.source_type,
+                common_type=column.common_type,
+                nullable=column.nullable,
+                primary_key=column.name in primary_key_columns,
+            )
+            for column in table.columns
+        ),
     )
 
 
@@ -719,33 +843,3 @@ def _target_schema_name(app_config: AppConfig) -> str:
     if app_config.target.dbms in {Dbms.MYSQL, Dbms.MARIADB}:
         return app_config.target.database
     return app_config.source.schema_name
-
-
-def _schema_scan_expected_snapshot(snapshot: SchemaSnapshot, app_config: AppConfig) -> SchemaSnapshot:
-    schema_name = _target_schema_name(app_config)
-    return SchemaSnapshot(
-        tables=tuple(_schema_scan_expected_table(table, schema_name) for table in snapshot.tables),
-        non_table_objects=tuple(_schema_scan_expected_object(schema_object, schema_name) for schema_object in snapshot.non_table_objects),
-    )
-
-
-def _schema_scan_expected_table(table: TableSchema, schema_name: str) -> TableSchema:
-    ref = TableRef(schema=schema_name, name=table.ref.name)
-    return replace(
-        table,
-        ref=ref,
-        foreign_keys=tuple(_schema_scan_expected_foreign_key(foreign_key, schema_name) for foreign_key in table.foreign_keys),
-    )
-
-
-def _schema_scan_expected_foreign_key(foreign_key: ForeignKeySchema, schema_name: str) -> ForeignKeySchema:
-    return replace(foreign_key, referenced_table=TableRef(schema=schema_name, name=foreign_key.referenced_table.name))
-
-
-def _schema_scan_expected_object(schema_object: SchemaObjectSummary, schema_name: str) -> SchemaObjectSummary:
-    parent_table = (
-        TableRef(schema=schema_name, name=schema_object.parent_table.name)
-        if schema_object.parent_table is not None
-        else None
-    )
-    return replace(schema_object, schema=schema_name, parent_table=parent_table)

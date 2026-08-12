@@ -6,6 +6,7 @@ from db_migrator.config.models import ExistingTablePolicy, MigrationConfig
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.dml_migration import migrate_tables
 from db_migrator.core.events import EventType, MigrationEvent, QueueEventPublisher
+from db_migrator.schema.column_plan import build_column_plan
 from db_migrator.schema.common_types import CommonTypeKind
 from db_migrator.schema.models import CursorStrategy, ReadCursor, RowBatch, TableRef, TableSchema, WriteResult
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
@@ -215,6 +216,48 @@ def test_migrate_tables_excludes_generated_columns_from_read_columns(tmp_path) -
     )
 
     assert "profile" not in source.calls[0][1]
+
+
+def test_migrate_tables_uses_column_plan_read_columns(tmp_path) -> None:
+    from db_migrator.config.models import AppConfig, SourceOnlyColumnAction, TableRunConfig
+
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    users = next(table for table in snapshot.tables if table.ref.name == "users")
+    target_users = TableSchema(
+        ref=TableRef(schema="public", name="app_users"),
+        columns=tuple(column for column in users.columns if column.name in {"id", "email"}),
+        primary_key=users.primary_key,
+        indexes=users.indexes,
+        estimated_rows=users.estimated_rows,
+    )
+    column_plan = build_column_plan(
+        config=AppConfig(
+            tables={
+                "public.users": TableRunConfig(
+                    source_only_columns={
+                        "profile": SourceOnlyColumnAction.IGNORE,
+                        "created_at": SourceOnlyColumnAction.IGNORE,
+                    }
+                )
+            }
+        ),
+        source_table=users,
+        target_table=target_users,
+    )
+    source = FakeSourceReader({"users": [{"id": 1, "email": "a@example.com", "profile": {"ignored": True}, "created_at": "2026-01-01"}]})
+
+    migrate_tables(
+        job_id="job-1",
+        tables=(users,),
+        source=source,
+        target=FakeTargetWriter(),
+        checkpoint_store=CheckpointStore(tmp_path / "checkpoint.sqlite"),
+        event_publisher=QueueEventPublisher(Queue()),
+        migration_config=MigrationConfig(batch_size=100),
+        column_plans={users.ref: column_plan},
+    )
+
+    assert source.calls[0][1] == ("id", "email")
 
 
 def test_migrate_tables_records_failed_table_status(tmp_path) -> None:

@@ -1,10 +1,16 @@
-from db_migrator.config.models import AppConfig, TableRunConfig
+from db_migrator.config.models import AppConfig, Dbms, TableRunConfig, TargetConfig
 from db_migrator.schema.models import ForeignKeySchema, SchemaSnapshot, TableRef, TableSchema
 from db_migrator.schema.table_mapping import TableMappingResolver
 
 
-def test_table_mapping_resolver_defaults_to_source_table() -> None:
+def test_table_mapping_resolver_defaults_to_target_database_for_mysql() -> None:
     resolver = TableMappingResolver(AppConfig())
+
+    assert resolver.target_ref_for(TableRef(schema="public", name="users")) == TableRef(schema="target", name="users")
+
+
+def test_table_mapping_resolver_defaults_to_source_schema_for_postgres_without_target_schema() -> None:
+    resolver = TableMappingResolver(AppConfig(target=TargetConfig(dbms=Dbms.POSTGRESQL)))
 
     assert resolver.target_ref_for(TableRef(schema="public", name="users")) == TableRef(schema="public", name="users")
 
@@ -37,9 +43,9 @@ def test_table_mapping_resolver_maps_target_table_and_foreign_keys() -> None:
 
     mapped = resolver.target_snapshot_for(snapshot)
 
-    assert mapped.tables[0].ref == TableRef(schema="public", name="app_users")
-    assert mapped.tables[1].ref == TableRef(schema="public", name="app_orders")
-    assert mapped.tables[1].foreign_keys[0].referenced_table == TableRef(schema="public", name="app_users")
+    assert mapped.tables[0].ref == TableRef(schema="target", name="app_users")
+    assert mapped.tables[1].ref == TableRef(schema="target", name="app_orders")
+    assert mapped.tables[1].foreign_keys[0].referenced_table == TableRef(schema="target", name="app_users")
 
 
 def test_table_mapping_resolver_uses_default_target_schema() -> None:

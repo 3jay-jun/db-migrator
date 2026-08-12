@@ -10,6 +10,7 @@ from typing import Protocol
 from db_migrator.config.models import ExistingTablePolicy, MigrationConfig
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.events import EventLevel, EventPublisher, EventType, MigrationEvent, ProgressSnapshot
+from db_migrator.schema.column_plan import ColumnPlan
 from db_migrator.schema.models import ReadCursor, RowBatch, RowData, TableRef, TableSchema, WriteResult
 
 
@@ -106,6 +107,7 @@ def migrate_tables(
     event_publisher: EventPublisher,
     migration_config: MigrationConfig,
     resume_plan: ResumePlan | None = None,
+    column_plans: dict[TableRef, ColumnPlan] | None = None,
 ) -> DmlMigrationResult:
     work_items: list[TableSchema | TableMigrationResult] = []
     selected_tables = set(resume_plan.selected_tables) if resume_plan and resume_plan.selected_tables is not None else None
@@ -120,6 +122,7 @@ def migrate_tables(
             event_publisher=event_publisher,
             migration_config=migration_config,
             resume_plan=resume_plan,
+            column_plan=(column_plans or {}).get(table.ref),
         )
         work_items.append(preflight_result or table)
 
@@ -136,6 +139,7 @@ def migrate_tables(
                 migration_config=migration_config,
                 start_cursor=_start_cursor_for_table(resume_plan, item),
                 target_lock=target_lock,
+                column_plan=(column_plans or {}).get(item.ref),
             )
             for item in work_items
         ]
@@ -156,6 +160,7 @@ def migrate_tables(
                 migration_config=migration_config,
                 start_cursor=_start_cursor_for_table(resume_plan, table),
                 target_lock=target_lock,
+                column_plan=(column_plans or {}).get(table.ref),
             )
             for table in pending_tables
         ]
@@ -174,9 +179,10 @@ def _migrate_one_table(
     migration_config: MigrationConfig,
     start_cursor: ReadCursor | None,
     target_lock: Lock,
+    column_plan: ColumnPlan | None = None,
 ) -> TableMigrationResult:
     batch_size = _effective_batch_size(table, migration_config)
-    columns = _writable_columns(table)
+    columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else _writable_columns(table)
     order_by = stable_order_columns(table, columns)
     effective_start_cursor = start_cursor or _initial_cursor_for_table(table, order_by)
     sync_keys = resume_key_columns(table, order_by) if migration_config.existing_table_policy is ExistingTablePolicy.SYNC else ()
@@ -499,7 +505,32 @@ def _preflight_table_result(
     event_publisher: EventPublisher,
     migration_config: MigrationConfig,
     resume_plan: ResumePlan | None,
+    column_plan: ColumnPlan | None,
 ) -> TableMigrationResult | None:
+    if column_plan is not None and column_plan.unresolved_target_columns:
+        message = "; ".join(f"{item.column.name}: {item.message}" for item in column_plan.unresolved_target_columns)
+        event_publisher.publish(_table_failed_event(job_id, table, message))
+        return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
+
+    if column_plan is not None and migration_config.strict_source_only_columns:
+        unresolved_source_only = tuple(item for item in column_plan.source_only_columns if not item.configured)
+        if unresolved_source_only:
+            message = "Strict source-only column policy requires explicit action for: " + ", ".join(
+                item.column.name for item in unresolved_source_only
+            )
+            event_publisher.publish(_table_failed_event(job_id, table, message))
+            return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
+
+    if column_plan is not None and migration_config.existing_table_policy is ExistingTablePolicy.SYNC:
+        columns = column_plan.read_columns if column_plan.read_columns else _writable_columns(table)
+        source_sync_keys = resume_key_columns(table, stable_order_columns(table, columns))
+        if source_sync_keys and not column_plan.target_key_columns_for(source_sync_keys):
+            message = "Sync blocked because source key columns cannot be mapped to target write columns: " + ", ".join(
+                source_sync_keys
+            )
+            event_publisher.publish(_table_failed_event(job_id, table, message))
+            return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
+
     checkpoint = checkpoint_store.latest_checkpoint_for_table(job_id, table.ref)
     if migration_config.existing_table_policy is ExistingTablePolicy.APPEND:
         if checkpoint is not None:

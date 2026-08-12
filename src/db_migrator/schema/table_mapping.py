@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from db_migrator.config.models import AppConfig, WatermarkConfig
+from db_migrator.config.models import AppConfig, Dbms, WatermarkConfig
 from db_migrator.schema.models import ForeignKeySchema, SchemaSnapshot, TableRef, TableSchema
 
 
@@ -17,7 +17,7 @@ class TableMappingResolver:
 
     def target_ref_for(self, source_ref: TableRef) -> TableRef:
         table_config = self._config.tables.get(table_key(source_ref))
-        target_schema = self._config.target.schema_name or source_ref.schema
+        target_schema = _default_target_schema_name(self._config, source_ref)
         if table_config is None:
             return TableRef(schema=target_schema, name=source_ref.name)
         return TableRef(
@@ -54,3 +54,11 @@ class TableMappingResolver:
 
     def _target_foreign_key(self, foreign_key: ForeignKeySchema) -> ForeignKeySchema:
         return replace(foreign_key, referenced_table=self.target_ref_for(foreign_key.referenced_table))
+
+
+def _default_target_schema_name(config: AppConfig, source_ref: TableRef) -> str:
+    if config.target.schema_name:
+        return config.target.schema_name
+    if config.target.dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+        return config.target.database
+    return source_ref.schema

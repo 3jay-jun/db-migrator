@@ -11,7 +11,8 @@ from db_migrator.config.models import AppConfig, ExistingTablePolicy
 from db_migrator.core.foreign_keys import generate_foreign_key_ddls
 from db_migrator.core.overwrite_audit import OverwriteAuditStore
 from db_migrator.core.safety_guard import SafetyGuardInput, TargetSafetyGuard
-from db_migrator.schema.models import SchemaSnapshot, TableSchema
+from db_migrator.schema.column_plan import ColumnPlan
+from db_migrator.schema.models import SchemaSnapshot, TableRef, TableSchema
 
 
 class TargetDdlExecutor(Protocol):
@@ -60,6 +61,7 @@ def execute_schema_ddl(
     executor: TargetDdlExecutor,
     report_output_path: Path,
     registry: DbmsAdapterRegistry | None = None,
+    column_plans: dict[TableRef, ColumnPlan] | None = None,
 ) -> DdlExecutionSummary:
     dry_run_report_exists = _dry_run_report_exists(config)
     guard_decision = TargetSafetyGuard().evaluate(
@@ -97,6 +99,30 @@ def execute_schema_ddl(
             table_exists = executor.table_exists(table)
             if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.SKIP:
                 table_results.append(_skipped_table_result(table, "Target table already exists."))
+                continue
+
+            if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.SYNC:
+                table_results.append(
+                    DdlTableExecutionResult(
+                        schema=table.ref.schema,
+                        table=table.ref.name,
+                        action="sync_existing",
+                        success=True,
+                        message="Target table already exists; CREATE skipped for sync policy.",
+                    )
+                )
+                for ddl in _sync_alter_candidates(table, column_plans):
+                    execution_result = executor.execute_ddl(ddl)
+                    table_results.append(
+                        DdlTableExecutionResult(
+                            schema=table.ref.schema,
+                            table=table.ref.name,
+                            action="alter_table",
+                            success=execution_result.success,
+                            message=execution_result.message,
+                            ddl=ddl,
+                        )
+                    )
                 continue
 
             if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.TRUNCATE_RELOAD:
@@ -182,6 +208,8 @@ def _execute_foreign_key_ddls(
 ) -> tuple[DdlTableExecutionResult, ...]:
     if not config.migration.apply_foreign_keys:
         return ()
+    if config.migration.existing_table_policy is ExistingTablePolicy.SYNC:
+        return ()
 
     results: list[DdlTableExecutionResult] = []
     for foreign_key_ddl in generate_foreign_key_ddls(snapshot, target_dbms=config.target.dbms):
@@ -246,3 +274,12 @@ def _record_overwrite_action(
         message=result.message,
         ddl=ddl,
     )
+
+
+def _sync_alter_candidates(table: TableSchema, column_plans: dict[TableRef, ColumnPlan] | None) -> tuple[str, ...]:
+    if not column_plans:
+        return ()
+    for plan in column_plans.values():
+        if plan.target_table.ref == table.ref:
+            return plan.rename_column_ddls + plan.type_change_ddls + plan.add_column_ddls + tuple(item.alter_table_ddl for item in plan.source_only_columns if item.alter_table_ddl)
+    return ()

@@ -8,6 +8,7 @@ from typing import Protocol
 
 from db_migrator.config.models import Dbms, MigrationConfig
 from db_migrator.core.dml_migration import stable_order_columns
+from db_migrator.schema.column_plan import ColumnPlan
 from db_migrator.schema.models import ReadCursor, RowBatch, RowData, TableRef, TableSchema
 
 
@@ -52,6 +53,7 @@ def export_manual_migration_files(
     migration_config: MigrationConfig,
     ddl_sql: str,
     output_dir: Path,
+    column_plans: dict[TableRef, ColumnPlan] | None = None,
 ) -> ManualMigrationExport:
     manual_dir = output_dir / "manual-migration"
     data_dir = manual_dir / "data"
@@ -63,14 +65,18 @@ def export_manual_migration_files(
     exports: list[ManualTableExport] = []
     load_statements: list[str] = []
     for source_table, target_table in zip(source_tables, target_tables, strict=True):
-        columns = _writable_columns(source_table)
+        column_plan = (column_plans or {}).get(source_table.ref)
+        read_columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else _writable_columns(source_table)
+        write_columns = column_plan.write_columns if column_plan is not None else read_columns
         csv_file = data_dir / f"{target_table.ref.schema}.{target_table.ref.name}.csv"
         rows_exported = _write_table_csv(
             source=source,
             table=source_table,
-            columns=columns,
+            read_columns=read_columns,
+            write_columns=write_columns,
             csv_file=csv_file,
             migration_config=migration_config,
+            column_plan=column_plan,
         )
         exports.append(
             ManualTableExport(
@@ -80,7 +86,7 @@ def export_manual_migration_files(
                 csv_file=csv_file,
             )
         )
-        load_statements.append(_load_statement(target_table, columns, csv_file, target_dbms, target_database))
+        load_statements.append(_load_statement(target_table, write_columns, csv_file, target_dbms, target_database))
 
     load_sql_file = manual_dir / "load-data.sql"
     load_sql_file.write_text("\n\n".join(load_statements) + ("\n" if load_statements else ""), encoding="utf-8")
@@ -91,18 +97,21 @@ def _write_table_csv(
     *,
     source: ManualSourceReader,
     table: TableSchema,
-    columns: tuple[str, ...],
+    read_columns: tuple[str, ...],
+    write_columns: tuple[str, ...],
     csv_file: Path,
     migration_config: MigrationConfig,
+    column_plan: ColumnPlan | None,
 ) -> int:
     row_count = 0
-    order_by = stable_order_columns(table, columns)
+    order_by = stable_order_columns(table, read_columns)
     with csv_file.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=write_columns, extrasaction="ignore")
         writer.writeheader()
-        for batch in source.read_rows(table.ref, columns, None, migration_config.batch_size, order_by):
-            for row in batch.rows:
-                writer.writerow(_csv_row(row, columns))
+        for batch in source.read_rows(table.ref, read_columns, None, migration_config.batch_size, order_by):
+            rows = column_plan.transform_rows(batch.rows) if column_plan is not None else batch.rows
+            for row in rows:
+                writer.writerow(_csv_row(row, write_columns))
             row_count += batch.row_count
     return row_count
 

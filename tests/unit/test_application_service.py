@@ -7,6 +7,7 @@ from db_migrator.application.events import event_to_view
 from db_migrator.application.safety import evaluate_dry_run_gate
 from db_migrator.application.service import MigrationApplicationService
 from db_migrator.config.loader import load_config
+from db_migrator.config.models import Dbms
 from db_migrator.core.events import EventLevel, EventType, MigrationEvent, ProgressSnapshot, QueueEventPublisher
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
 from db_migrator.schema.models import ColumnSchema, IndexSchema, PrimaryKey, ReadCursor, RowBatch, SchemaSnapshot, TableRef, TableSchema, WriteResult
@@ -26,7 +27,14 @@ def test_service_dry_run_writes_report_with_shared_orchestration(tmp_path: Path)
 
 
 def test_service_scans_tables_for_gui_selection(tmp_path: Path) -> None:
-    service = MigrationApplicationService(FakeRegistry())
+    registry = FakeRegistry()
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(
+            _table_with_columns("target_db", "users", ("id", "email")),
+            _table_with_columns("target_db", "orders", ("id",)),
+        )
+    )
+    service = MigrationApplicationService(registry)
     config_path = _write_config(tmp_path)
 
     result = service.run_scan_tables(config=config_path)
@@ -34,6 +42,8 @@ def test_service_scans_tables_for_gui_selection(tmp_path: Path) -> None:
     assert result.success is True
     assert result.table_count == 2
     assert [table.identifier for table in result.details["tables"]] == ["public.users", "public.orders"]
+    assert [table.identifier for table in result.details["target_tables"]] == ["target_db.users", "target_db.orders"]
+    assert result.details["tables"][0].columns[0].name == "id"
 
 
 def test_service_dry_run_filters_selected_tables(tmp_path: Path) -> None:
@@ -73,8 +83,10 @@ def test_service_resolves_tunnel_endpoint_for_source_and_target(tmp_path: Path) 
     result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json")
 
     assert result.success is True
+    assert registry.source_configs[0].host == "127.0.0.1"
+    assert registry.source_configs[0].port == 15000
     assert registry.source_configs[-1].host == "127.0.0.1"
-    assert registry.source_configs[-1].port == 15000
+    assert registry.source_configs[-1].port == 15001
     assert registry.target_configs[-1].host == "127.0.0.1"
     assert registry.target_configs[-1].port == 15001
     assert [tunnel.stopped for tunnel in tunnel_factory.tunnels] == [True, True]
@@ -145,6 +157,199 @@ def test_service_apply_indexes_executes_post_data_auto_candidates(tmp_path: Path
     assert (tmp_path / "indexes.json").exists()
 
 
+def test_service_apply_ddl_executes_configured_sync_alter_candidate(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    registry.target.existing_tables = {"app_users"}
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+    source_only_columns:
+      legacy_code: add_to_target
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json", selected_tables={"public.users"})
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["ALTER TABLE `target_db`.`app_users` ADD COLUMN `legacy_code` longtext NOT NULL;"]
+
+
+def test_service_apply_ddl_executes_configured_new_target_column_name(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id",)),))
+    registry.target.existing_tables = {"app_users"}
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      legacy_id:
+        source: legacy_code
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json", selected_tables={"public.users"})
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["ALTER TABLE `target_db`.`app_users` ADD COLUMN `legacy_id` longtext NOT NULL;"]
+
+
+def test_service_apply_ddl_executes_configured_target_column_rename(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    registry.target.existing_tables = {"app_users"}
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      id_:
+        source: id
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json", selected_tables={"public.users"})
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["ALTER TABLE `target_db`.`app_users` RENAME COLUMN `id` TO `id_`;"]
+
+
+def test_service_apply_ddl_executes_existing_target_column_type_change(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(
+        tables=(_typed_table("public", "users", {"email": ("character varying(320)", CommonTypeKind.STRING, 320)}),)
+    )
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(_typed_table("target_db", "app_users", {"email": ("varchar(255)", CommonTypeKind.STRING, 255)}),)
+    )
+    registry.target.existing_tables = {"app_users"}
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json", selected_tables={"public.users"})
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["ALTER TABLE `target_db`.`app_users` MODIFY COLUMN `email` varchar(320) NOT NULL;"]
+
+
+def test_service_apply_ddl_executes_configured_target_type_override(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(
+        tables=(_typed_table("public", "users", {"email": ("varchar(255)", CommonTypeKind.STRING, 255)}),)
+    )
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(_typed_table("target_db", "app_users", {"email": ("varchar(255)", CommonTypeKind.STRING, 255)}),)
+    )
+    registry.target.existing_tables = {"app_users"}
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      email:
+        target_type: varchar(500)
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json", selected_tables={"public.users"})
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["ALTER TABLE `target_db`.`app_users` MODIFY COLUMN `email` varchar(500) NOT NULL;"]
+
+
+def test_service_migrate_data_writes_configured_new_target_column_name(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id",)),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      legacy_id:
+        source: legacy_code
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+        selected_tables={"public.users"},
+    )
+
+    assert result.success is True
+    assert registry.source.read_columns == [("id", "legacy_code")]
+    assert registry.target.written_rows[0] == ({"id": 1, "legacy_id": 1},)
+
+
+def test_service_table_preview_uses_configured_target_column_rename(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      id_:
+        source: id
+""",
+    )
+
+    result = service.run_table_preview(
+        config=config_path,
+        table_identifier="public.users",
+        target_schema="target_db",
+        target_table="app_users",
+    )
+
+    assert result.success is True
+    assert result.details["columns"] == ("id_", "email")
+    assert result.details["rows"] == ({"id_": 1, "email": 1},)
+    assert registry.source.sample_columns[-1] == ("id", "email")
+
+
 def test_service_migrate_data_publishes_events_and_returns_rows(tmp_path: Path) -> None:
     service = MigrationApplicationService(FakeRegistry())
     config_path = _write_config(tmp_path)
@@ -208,10 +413,10 @@ tables:
     assert result.output_dir == manual_dir
     assert (manual_dir / "ddl.sql").exists()
     assert (manual_dir / "load-data.sql").exists()
-    assert (manual_dir / "data" / "public.app_users.csv").exists()
+    assert (manual_dir / "data" / "target_db.app_users.csv").exists()
     assert "`app_users`" in (manual_dir / "ddl.sql").read_text(encoding="utf-8")
     assert "LOAD DATA LOCAL INFILE" in (manual_dir / "load-data.sql").read_text(encoding="utf-8")
-    assert "id" in (manual_dir / "data" / "public.app_users.csv").read_text(encoding="utf-8")
+    assert "id" in (manual_dir / "data" / "target_db.app_users.csv").read_text(encoding="utf-8")
     assert registry.target.executed_ddls == []
 
 
@@ -236,7 +441,183 @@ tables:
 
     assert result.success is True
     assert registry.source.read_tables == [TableRef(schema="public", name="users")]
-    assert registry.target.written_tables == [TableRef(schema="public", name="app_users")]
+    assert registry.target.written_tables == [TableRef(schema="target_db", name="app_users")]
+
+
+def test_service_dry_run_reports_source_only_columns_for_existing_target_table(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+    source_only_columns:
+      legacy_code: add_to_target
+""",
+    )
+
+    result = service.run_dry_run(config=config_path, output_dir=tmp_path / "reports", selected_tables={"public.users"})
+
+    summary = (tmp_path / "reports" / "summary.json").read_text(encoding="utf-8")
+    assert result.success is True
+    assert '"schema_origin": "target_existing"' in summary
+    assert "legacy_code" in summary
+    assert "ALTER TABLE `target_db`.`app_users` ADD COLUMN `legacy_code` longtext NOT NULL;" in summary
+    assert "source-only column ignored by default: legacy_code" not in summary
+
+
+def test_service_migrate_data_uses_existing_target_schema_and_migrates_source_only_columns_by_default(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+        selected_tables={"public.users"},
+    )
+
+    assert result.success is True
+    assert registry.source.read_columns == [("id", "email", "legacy_code")]
+    assert registry.target.written_tables == [TableRef(schema="target_db", name="app_users")]
+    assert registry.target.written_rows[0][0]["legacy_code"] == 1
+
+
+def test_service_sync_maps_source_key_to_target_key_column(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(_table_with_columns("target_db", "app_users", ("user_id", "email"), primary_key=("user_id",)),)
+    )
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+tables:
+  public.users:
+    target_table: app_users
+    columns:
+      user_id:
+        source: id
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+        selected_tables={"public.users"},
+    )
+
+    assert result.success is True
+    assert registry.target.upserted_batches == [("app_users", ("user_id",), ({"user_id": 1, "email": 1},))]
+    assert registry.target.sync_keys == [
+        ("app_users", ("begin", ("user_id",))),
+        ("app_users", (1,)),
+        ("app_users", ("delete", ("user_id",))),
+        ("app_users", ("end",)),
+    ]
+
+
+def test_service_migrate_data_strict_source_only_columns_allows_default_source_only_migration(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  strict_source_only_columns: true
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+        selected_tables={"public.users"},
+    )
+
+    assert result.success is True
+    assert result.rows_written == 1
+    assert registry.source.read_columns == [("id", "email", "legacy_code")]
+    assert registry.target.written_tables == [TableRef(schema="target_db", name="app_users")]
+
+
+def test_service_table_preview_returns_transformed_sample_rows(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "email", "legacy_code")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_table_preview(
+        config=config_path,
+        table_identifier="public.users",
+        target_schema="target_db",
+        target_table="app_users",
+        sample_size=30,
+    )
+
+    assert result.success is True
+    assert result.details["columns"] == ("id", "email", "legacy_code")
+    assert result.details["rows"] == ({"id": 1, "email": 1, "legacy_code": 1},)
+    assert registry.source.read_columns == []
+
+
+def test_service_table_preview_applies_unsaved_column_mapping(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(tables=(_table_with_columns("public", "users", ("id", "old_email")),))
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "app_users", ("id", "email")),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+tables:
+  public.users:
+    target_table: app_users
+""",
+    )
+
+    result = service.run_table_preview(
+        config=config_path,
+        table_identifier="public.users",
+        target_schema="target_db",
+        target_table="app_users",
+        column_mappings={"old_email": "email"},
+    )
+
+    assert result.success is True
+    assert result.details["columns"] == ("id", "email")
+    assert result.details["rows"] == ({"id": 1, "email": 1},)
+    assert registry.source.sample_columns[-1] == ("id", "old_email")
 
 
 def test_service_validate_counts_mapped_target_table(tmp_path: Path) -> None:
@@ -259,9 +640,9 @@ tables:
 
     assert result.success is True
     assert registry.source.counted_tables == [TableRef(schema="public", name="users")]
-    assert registry.target.counted_tables == [TableRef(schema="public", name="app_users")]
+    assert registry.target.counted_tables == [TableRef(schema="target_db", name="app_users")]
     summary = (tmp_path / "reports" / "summary.json").read_text(encoding="utf-8")
-    assert "public.users -> public.app_users" in summary
+    assert "public.users -> target_db.app_users" in summary
 
 
 def test_dry_run_gate_blocks_destructive_policy_without_report(tmp_path: Path) -> None:
@@ -303,11 +684,14 @@ class FakeRegistry:
     def __init__(self) -> None:
         self.source = FakeAdapter()
         self.target = FakeAdapter()
+        self.target_schema_source = FakeAdapter()
         self.source_configs = []
         self.target_configs = []
 
-    def create_source(self, _config):
-        self.source_configs.append(_config)
+    def create_source(self, config):
+        self.source_configs.append(config)
+        if config.dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+            return self.target_schema_source
         return self.source
 
     def create_target(self, _config):
@@ -332,9 +716,15 @@ class FakeDdlGenerator:
 class FakeAdapter:
     def __init__(self) -> None:
         self.snapshot = _snapshot()
+        self.existing_tables: set[str] = set()
         self.executed_ddls: list[str] = []
         self.read_tables: list[TableRef] = []
+        self.read_columns: list[tuple[str, ...]] = []
+        self.sample_columns: list[tuple[str, ...]] = []
         self.written_tables: list[TableRef] = []
+        self.written_rows: list[tuple[dict, ...]] = []
+        self.upserted_batches: list[tuple[str, tuple[str, ...], tuple[dict, ...]]] = []
+        self.sync_keys: list[tuple[str, tuple]] = []
         self.counted_tables: list[TableRef] = []
 
     def test_connection(self) -> bool:
@@ -344,7 +734,7 @@ class FakeAdapter:
         return self.snapshot
 
     def table_exists(self, _table_schema: TableSchema) -> bool:
-        return False
+        return _table_schema.ref.name in self.existing_tables
 
     def execute_ddl(self, _ddl: str):
         from db_migrator.adapters.base import ExecutionResult
@@ -364,9 +754,10 @@ class FakeAdapter:
 
     def read_rows(self, table: TableRef, _columns, _cursor, _batch_size, _order_by):
         self.read_tables.append(table)
+        self.read_columns.append(tuple(_columns))
         yield RowBatch(
             table=table,
-            rows=({"id": 1},),
+            rows=(dict.fromkeys(_columns, 1),),
             batch_number=1,
             start_offset=0,
             next_cursor=ReadCursor.offset_cursor(1),
@@ -374,10 +765,25 @@ class FakeAdapter:
 
     def write_batch(self, table_schema: TableSchema, rows: tuple[dict, ...]) -> WriteResult:
         self.written_tables.append(table_schema.ref)
+        self.written_rows.append(rows)
         return WriteResult(success=True, rows_written=len(rows), message="ok")
 
-    def upsert_batch(self, _table_schema: TableSchema, rows: tuple[dict, ...], _keys) -> WriteResult:
+    def upsert_batch(self, table_schema: TableSchema, rows: tuple[dict, ...], keys) -> WriteResult:
+        self.upserted_batches.append((table_schema.ref.name, tuple(keys), rows))
         return WriteResult(success=True, rows_written=len(rows), message="ok")
+
+    def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
+        self.sync_keys.append((table_schema.ref.name, ("begin", keys)))
+
+    def record_sync_keys(self, table_schema: TableSchema, rows: tuple[dict, ...], keys: tuple[str, ...]) -> None:
+        self.sync_keys.extend((table_schema.ref.name, tuple(row.get(key) for key in keys)) for row in rows)
+
+    def delete_rows_not_in_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> int:
+        self.sync_keys.append((table_schema.ref.name, ("delete", keys)))
+        return 0
+
+    def end_sync_keys(self, table_schema: TableSchema) -> None:
+        self.sync_keys.append((table_schema.ref.name, ("end",)))
 
     def commit(self) -> None:
         return None
@@ -387,7 +793,8 @@ class FakeAdapter:
         return 1
 
     def sample_rows(self, table: TableRef, _columns, _sample_size, _order_by, _position):
-        return ({"id": 1},)
+        self.sample_columns.append(tuple(_columns))
+        return (dict.fromkeys(_columns, 1),)
 
 
 class FakeTunnelFactory:
@@ -451,6 +858,50 @@ def _snapshot() -> SchemaSnapshot:
                 ),
             ),
         )
+    )
+
+
+def _table_with_columns(schema: str, name: str, columns: tuple[str, ...], *, primary_key: tuple[str, ...] | None = None) -> TableSchema:
+    resolved_primary_key = primary_key if primary_key is not None else (("id",) if "id" in columns else None)
+    return TableSchema(
+        ref=TableRef(schema=schema, name=name),
+        primary_key=PrimaryKey(columns=resolved_primary_key) if resolved_primary_key is not None else None,
+        columns=tuple(
+            ColumnSchema(
+                name=column,
+                source_type="integer" if column in {"id", "user_id"} else "text",
+                common_type=CommonType(
+                    kind=CommonTypeKind.INTEGER if column in {"id", "user_id"} else CommonTypeKind.TEXT,
+                    policy=TypePolicy.AUTO_CONVERT,
+                ),
+                nullable=False,
+                default=None,
+                is_generated=False,
+                generation_expression=None,
+                ordinal_position=index,
+            )
+            for index, column in enumerate(columns, start=1)
+        ),
+    )
+
+
+def _typed_table(schema: str, name: str, columns: dict[str, tuple[str, CommonTypeKind, int | None]]) -> TableSchema:
+    return TableSchema(
+        ref=TableRef(schema=schema, name=name),
+        primary_key=None,
+        columns=tuple(
+            ColumnSchema(
+                name=column,
+                source_type=source_type,
+                common_type=CommonType(kind=kind, length=length, policy=TypePolicy.AUTO_CONVERT),
+                nullable=False,
+                default=None,
+                is_generated=False,
+                generation_expression=None,
+                ordinal_position=index,
+            )
+            for index, (column, (source_type, kind, length)) in enumerate(columns.items(), start=1)
+        ),
     )
 
 
