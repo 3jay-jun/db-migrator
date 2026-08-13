@@ -989,6 +989,9 @@ class FakeAdapter:
         self.upserted_batches.append((table_schema.ref.name, tuple(keys), rows))
         return WriteResult(success=True, rows_written=len(rows), message="ok")
 
+    def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[dict, ...]) -> dict[tuple[object, ...], dict]:
+        return {}
+
     def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
         self.sync_keys.append((table_schema.ref.name, ("begin", keys)))
 

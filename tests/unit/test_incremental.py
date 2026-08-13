@@ -85,6 +85,9 @@ def test_incremental_migration_upserts_configured_tables_and_skips_missing_water
     )
 
     assert report.rows_upserted == 2
+    assert report.tables[0].watermark_start_value == "2026-01-01"
+    assert report.tables[0].watermark_end_value is None
+    assert report.tables[0].upsert_keys == ("id",)
     assert target.upserts[0][1] == ("id",)
     assert [table.status for table in report.tables] == ["completed", "skipped"]
     assert report.delete_sync_supported is False
@@ -108,7 +111,10 @@ def test_incremental_migration_skips_table_without_upsert_key() -> None:
         source=FakeIncrementalSource({"users": []}),
         target=FakeIncrementalTarget(),
         migration_config=MigrationConfig(),
-        incremental_config=IncrementalConfig(enabled=True, watermarks={"users": WatermarkConfig(column="created_at")}),
+        incremental_config=IncrementalConfig(
+            enabled=True,
+            watermarks={"users": WatermarkConfig(column="created_at", start_value="2026-01-01", end_value="2026-02-01")},
+        ),
     )
 
     assert report.tables[0].status == "skipped"
@@ -123,7 +129,10 @@ def test_write_incremental_report_outputs_delete_policy(tmp_path: Path) -> None:
         source=FakeIncrementalSource({"users": []}),
         target=FakeIncrementalTarget(),
         migration_config=MigrationConfig(),
-        incremental_config=IncrementalConfig(enabled=True, watermarks={"users": WatermarkConfig(column="created_at")}),
+        incremental_config=IncrementalConfig(
+            enabled=True,
+            watermarks={"users": WatermarkConfig(column="created_at", start_value="2026-01-01", end_value="2026-02-01")},
+        ),
     )
 
     write_incremental_report(report, tmp_path)
@@ -138,7 +147,15 @@ def test_write_incremental_report_outputs_delete_policy(tmp_path: Path) -> None:
     assert "대상 테이블 수" in html
     assert "건너뛴 테이블 수" in html
     assert "증분 기준 컬럼" in html
+    assert "watermark 범위" in html
+    assert "upsert 기준" in html
+    assert "2026-01-01 ~ 2026-02-01" in html
+    assert "id" in html
     assert "job_id=" not in html
     assert "delete_sync_supported=" not in html
     assert "Jigration Incremental Report" not in html
     assert "자동 삭제 동기화는 지원하지 않습니다." in (tmp_path / "delete_policy.txt").read_text(encoding="utf-8")
+    tables_csv = (tmp_path / "tables.csv").read_text(encoding="utf-8")
+    assert "watermark_range" in tables_csv
+    assert "upsert_keys" in tables_csv
+    assert "2026-01-01 ~ 2026-02-01" in tables_csv

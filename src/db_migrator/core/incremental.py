@@ -34,6 +34,9 @@ class IncrementalTableResult:
     rows_upserted: int
     batches_upserted: int
     watermark_column: str | None
+    watermark_start_value: str | None = None
+    watermark_end_value: str | None = None
+    upsert_keys: tuple[str, ...] = ()
     target_table: TableRef | None = None
     message: str | None = None
 
@@ -103,6 +106,8 @@ def _migrate_one_incremental_table(
             rows_upserted=0,
             batches_upserted=0,
             watermark_column=watermark.column,
+            watermark_start_value=watermark.start_value,
+            watermark_end_value=watermark.end_value,
             target_table=target_table,
             message="Upsert requires primary key or unique index.",
         )
@@ -124,6 +129,9 @@ def _migrate_one_incremental_table(
                     rows_upserted=rows_upserted,
                     batches_upserted=batches_upserted,
                     watermark_column=watermark.column,
+                    watermark_start_value=watermark.start_value,
+                    watermark_end_value=watermark.end_value,
+                    upsert_keys=keys,
                     target_table=target_table,
                     message=write_result.message,
                 )
@@ -139,6 +147,9 @@ def _migrate_one_incremental_table(
             rows_upserted=rows_upserted,
             batches_upserted=batches_upserted,
             watermark_column=watermark.column,
+            watermark_start_value=watermark.start_value,
+            watermark_end_value=watermark.end_value,
+            upsert_keys=keys,
             target_table=target_table,
             message=str(exc),
         )
@@ -149,6 +160,9 @@ def _migrate_one_incremental_table(
         rows_upserted=rows_upserted,
         batches_upserted=batches_upserted,
         watermark_column=watermark.column,
+        watermark_start_value=watermark.start_value,
+        watermark_end_value=watermark.end_value,
+        upsert_keys=keys,
         target_table=target_table,
     )
 

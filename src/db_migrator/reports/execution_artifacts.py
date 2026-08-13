@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from db_migrator.core.validation import ExecutionArtifact
+from db_migrator.core.validation import DataSyncArtifact, ExecutionArtifact
 
 
 def load_execution_artifacts(report_dir: Path) -> tuple[ExecutionArtifact, ...]:
@@ -14,6 +14,29 @@ def load_execution_artifacts(report_dir: Path) -> tuple[ExecutionArtifact, ...]:
         artifacts.extend(_load_index_execution_artifacts(index_report))
     artifacts.extend(_load_foreign_key_execution_artifacts(report_dir / "foreign-key-execution.json"))
     return tuple(artifacts)
+
+
+def load_data_sync_artifacts(report_dir: Path) -> tuple[DataSyncArtifact, ...]:
+    payload = _read_json_object(report_dir / "data-sync-execution.json")
+    if payload is None:
+        return ()
+    return tuple(
+        DataSyncArtifact(
+            schema=str(item.get("schema") or ""),
+            table=str(item.get("table") or ""),
+            status=str(item.get("status") or ""),
+            rows_inserted=_int_value(item.get("rows_inserted")),
+            rows_updated=_int_value(item.get("rows_updated")),
+            rows_deleted=_int_value(item.get("rows_deleted")),
+            rows_unchanged=_int_value(item.get("rows_unchanged")),
+            rows_processed=_int_value(item.get("rows_processed")),
+            rows_written=_int_value(item.get("rows_written")),
+            changed_rows=_int_value(item.get("changed_rows")),
+            batches_written=_int_value(item.get("batches_written")),
+            message=_optional_string(item.get("message")),
+        )
+        for item in _list_value(payload.get("tables"))
+    )
 
 
 def _load_ddl_execution_artifacts(report_path: Path) -> tuple[ExecutionArtifact, ...]:
@@ -126,3 +149,10 @@ def _optional_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0

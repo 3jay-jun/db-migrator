@@ -30,7 +30,7 @@ from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, 
 from db_migrator.core.validation_readers import SourceTargetValidationReader
 from db_migrator.application.table_mapping import ColumnPlanTargetAdapter, TargetMappingAdapter
 from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, write_dry_run_report
-from db_migrator.reports.execution_artifacts import load_execution_artifacts
+from db_migrator.reports.execution_artifacts import load_data_sync_artifacts, load_execution_artifacts
 from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.incremental_report import write_incremental_report
 from db_migrator.reports.metadata import ReportEndpoint
@@ -484,6 +484,7 @@ class MigrationApplicationService:
         checkpoint_db: Path = Path("checkpoints/migration.sqlite"),
         event_publisher: EventPublisher,
         selected_tables: set[str] | None = None,
+        output_dir: Path | None = None,
     ) -> CommandResult:
         return self._run_checkpointed_migration(
             command="migrate-data",
@@ -493,6 +494,7 @@ class MigrationApplicationService:
             event_publisher=event_publisher,
             retry_failed_only=None,
             selected_tables=selected_tables,
+            output_dir=output_dir,
         )
 
     def run_resume(
@@ -562,6 +564,7 @@ class MigrationApplicationService:
                     source_snapshot=schema_plan.target_snapshot,
                     target_snapshot=actual_target_snapshot,
                     execution_artifacts=load_execution_artifacts(resolved_output_dir),
+                    data_sync_artifacts=load_data_sync_artifacts(resolved_output_dir),
                 )
                 write_validation_report(report, resolved_output_dir)
             return CommandResult(
@@ -635,6 +638,7 @@ class MigrationApplicationService:
         event_publisher: EventPublisher,
         retry_failed_only: bool | None,
         selected_tables: set[str] | None,
+        output_dir: Path | None = None,
     ) -> CommandResult:
         try:
             with self._command_runtime(config, include_source=True, include_target=True) as runtime:
@@ -670,6 +674,7 @@ class MigrationApplicationService:
                     migration_config=original_config.migration,
                     resume_plan=resume_plan,
                     column_plans=execution_plan.column_plans,
+                    data_execution_report=(output_dir / "data-sync-execution.json") if output_dir is not None else None,
                 )
             return CommandResult(
                 command=command,

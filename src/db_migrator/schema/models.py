@@ -146,3 +146,6 @@ class WriteResult:
     success: bool
     rows_written: int
     message: str
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_unchanged: int = 0

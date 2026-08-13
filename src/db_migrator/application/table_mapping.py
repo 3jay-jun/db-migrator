@@ -21,6 +21,9 @@ class TargetMappingAdapter:
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> Any:
         return self._target.upsert_batch(self._resolver.target_schema_for(table_schema), rows, keys)
 
+    def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> Any:
+        return self._target.fetch_rows_by_keys(self._resolver.target_schema_for(table_schema), keys, rows)
+
     def count_rows(self, table: TableRef) -> int:
         return self._target.count_rows(self._resolver.target_ref_for(table))
 
@@ -59,6 +62,10 @@ class ColumnPlanTargetAdapter:
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> Any:
         plan = self._plan_for(table_schema)
         return self._target.upsert_batch(plan.target_table, plan.transform_rows(rows), plan.target_key_columns_for(keys))
+
+    def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> Any:
+        plan = self._plan_for(table_schema)
+        return self._target.fetch_rows_by_keys(plan.target_table, plan.target_key_columns_for(keys), plan.transform_rows(rows))
 
     def count_rows(self, table: TableRef) -> int:
         plan = self._plans.get(table)

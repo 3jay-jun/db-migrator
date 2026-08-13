@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep
 from typing import Protocol
@@ -33,6 +35,14 @@ class TargetBatchWriter(Protocol):
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
         """Upsert one batch to target."""
 
+    def fetch_rows_by_keys(
+        self,
+        table_schema: TableSchema,
+        keys: tuple[str, ...],
+        rows: tuple[RowData, ...],
+    ) -> dict[tuple[object, ...], RowData]:
+        """Return target rows keyed by the provided source row key values."""
+
     def commit(self) -> None:
         """Commit pending writes."""
 
@@ -59,6 +69,15 @@ class TableMigrationResult:
     rows_written: int
     batches_written: int
     message: str | None = None
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_deleted: int = 0
+    rows_unchanged: int = 0
+    rows_processed: int = 0
+
+    @property
+    def changed_rows(self) -> int:
+        return self.rows_inserted + self.rows_updated + self.rows_deleted
 
 
 @dataclass(frozen=True)
@@ -108,6 +127,7 @@ def migrate_tables(
     migration_config: MigrationConfig,
     resume_plan: ResumePlan | None = None,
     column_plans: dict[TableRef, ColumnPlan] | None = None,
+    data_execution_report: Path | None = None,
 ) -> DmlMigrationResult:
     work_items: list[TableSchema | TableMigrationResult] = []
     selected_tables = set(resume_plan.selected_tables) if resume_plan and resume_plan.selected_tables is not None else None
@@ -143,29 +163,31 @@ def migrate_tables(
             )
             for item in work_items
         ]
-        return DmlMigrationResult(job_id=job_id, tables=tuple(results))
-
-    results: list[TableMigrationResult] = [item for item in work_items if isinstance(item, TableMigrationResult)]
-    pending_tables = [item for item in work_items if isinstance(item, TableSchema)]
-    with ThreadPoolExecutor(max_workers=migration_config.parallel_table_count) as executor:
-        futures = [
-            executor.submit(
-                _migrate_one_table,
-                job_id=job_id,
-                table=table,
-                source=source,
-                target=target,
-                checkpoint_store=checkpoint_store,
-                event_publisher=event_publisher,
-                migration_config=migration_config,
-                start_cursor=_start_cursor_for_table(resume_plan, table),
-                target_lock=target_lock,
-                column_plan=(column_plans or {}).get(table.ref),
-            )
-            for table in pending_tables
-        ]
-        results.extend(future.result() for future in futures)
-    return DmlMigrationResult(job_id=job_id, tables=tuple(results))
+    else:
+        results = [item for item in work_items if isinstance(item, TableMigrationResult)]
+        pending_tables = [item for item in work_items if isinstance(item, TableSchema)]
+        with ThreadPoolExecutor(max_workers=migration_config.parallel_table_count) as executor:
+            futures = [
+                executor.submit(
+                    _migrate_one_table,
+                    job_id=job_id,
+                    table=table,
+                    source=source,
+                    target=target,
+                    checkpoint_store=checkpoint_store,
+                    event_publisher=event_publisher,
+                    migration_config=migration_config,
+                    start_cursor=_start_cursor_for_table(resume_plan, table),
+                    target_lock=target_lock,
+                    column_plan=(column_plans or {}).get(table.ref),
+                )
+                for table in pending_tables
+            ]
+            results.extend(future.result() for future in futures)
+    result = DmlMigrationResult(job_id=job_id, tables=tuple(results))
+    if data_execution_report is not None:
+        write_data_sync_execution_report(result, data_execution_report)
+    return result
 
 
 def _migrate_one_table(
@@ -191,6 +213,9 @@ def _migrate_one_table(
         event_publisher.publish(_table_failed_event(job_id, table, message))
         return TableMigrationResult(table=table.ref, status="failed", rows_written=0, batches_written=0, message=message)
     rows_written = 0
+    rows_inserted = 0
+    rows_updated = 0
+    rows_unchanged = 0
     batches_written = 0
     uncommitted_rows = 0
     pending_batches: list[_PendingBatch] = []
@@ -215,9 +240,14 @@ def _migrate_one_table(
             try:
                 with target_lock:
                     if sync_keys:
-                        write_result = target.upsert_batch(table, batch.rows, sync_keys)
+                        inserts, updates, unchanged = _classify_sync_rows(target, table, batch.rows, sync_keys, columns)
+                        changed_rows = inserts + updates
+                        write_result = target.upsert_batch(table, changed_rows, sync_keys) if changed_rows else WriteResult(success=True, rows_written=0, message="No changed rows to upsert.")
                         target.record_sync_keys(table, batch.rows, sync_keys)
                     else:
+                        inserts = batch.rows
+                        updates = ()
+                        unchanged = ()
                         write_result = target.write_batch(table, batch.rows)
             except Exception as exc:
                 checkpoint_store.save_batch_failure(job_id, batch, str(exc))
@@ -241,6 +271,9 @@ def _migrate_one_table(
                 )
 
             rows_written += write_result.rows_written
+            rows_inserted += len(inserts)
+            rows_updated += len(updates)
+            rows_unchanged += len(unchanged)
             uncommitted_rows += write_result.rows_written
             batches_written += 1
             latest_cursor = batch.next_cursor or latest_cursor
@@ -347,7 +380,69 @@ def _migrate_one_table(
         status="completed",
         rows_written=rows_written,
         batches_written=batches_written,
+        rows_inserted=rows_inserted,
+        rows_updated=rows_updated,
+        rows_deleted=rows_deleted,
+        rows_unchanged=rows_unchanged,
+        rows_processed=rows_inserted + rows_updated + rows_unchanged + rows_deleted,
     )
+
+
+def write_data_sync_execution_report(result: DmlMigrationResult, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "job_id": result.job_id,
+        "tables": [
+            {
+                "schema": table.table.schema,
+                "table": table.table.name,
+                "status": table.status,
+                "rows_inserted": table.rows_inserted,
+                "rows_updated": table.rows_updated,
+                "rows_deleted": table.rows_deleted,
+                "rows_unchanged": table.rows_unchanged,
+                "rows_processed": table.rows_processed,
+                "rows_written": table.rows_written,
+                "changed_rows": table.changed_rows,
+                "batches_written": table.batches_written,
+                "message": table.message,
+            }
+            for table in result.tables
+        ],
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _classify_sync_rows(
+    target: TargetBatchWriter,
+    table: TableSchema,
+    rows: tuple[RowData, ...],
+    keys: tuple[str, ...],
+    columns: tuple[str, ...],
+) -> tuple[tuple[RowData, ...], tuple[RowData, ...], tuple[RowData, ...]]:
+    target_rows = target.fetch_rows_by_keys(table, keys, rows)
+    inserts: list[RowData] = []
+    updates: list[RowData] = []
+    unchanged: list[RowData] = []
+    for row in rows:
+        key = _row_key(row, keys)
+        target_row = target_rows.get(key)
+        if target_row is None:
+            inserts.append(row)
+            continue
+        if _row_values_equal(row, target_row, columns):
+            unchanged.append(row)
+        else:
+            updates.append(row)
+    return tuple(inserts), tuple(updates), tuple(unchanged)
+
+
+def _row_key(row: RowData, keys: tuple[str, ...]) -> tuple[object, ...]:
+    return tuple(row.get(key) for key in keys)
+
+
+def _row_values_equal(source_row: RowData, target_row: RowData, columns: tuple[str, ...]) -> bool:
+    return all(source_row.get(column) == target_row.get(column) for column in columns)
 
 
 def _effective_batch_size(table: TableSchema, migration_config: MigrationConfig) -> int:

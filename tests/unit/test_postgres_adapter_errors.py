@@ -7,6 +7,57 @@ import pytest
 
 from db_migrator.adapters.postgres import PostgresAdapterError, PostgresSourceAdapter, PostgresTargetAdapter
 from db_migrator.config.models import SourceConfig, TargetConfig
+from db_migrator.schema.models import ColumnSchema, TableRef, TableSchema
+from db_migrator.schema.type_mapping import postgres_type_to_common
+
+
+class TupleCursor:
+    def __init__(self, rows: tuple[tuple, ...]) -> None:
+        self._rows = rows
+
+    def __enter__(self) -> "TupleCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def execute(self, _sql: str, _params: tuple | None = None) -> None:
+        return None
+
+    def fetchall(self) -> tuple[tuple, ...]:
+        return self._rows
+
+
+class TupleConnection:
+    def __init__(self, rows: tuple[tuple, ...]) -> None:
+        self._rows = rows
+
+    def __enter__(self) -> "TupleConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def cursor(self) -> TupleCursor:
+        return TupleCursor(self._rows)
+
+
+def _account_table() -> TableSchema:
+    return TableSchema(
+        ref=TableRef(schema="public", name="account"),
+        columns=(
+            ColumnSchema(
+                name="id",
+                source_type="bigint",
+                common_type=postgres_type_to_common("bigint"),
+                nullable=False,
+                default=None,
+                is_generated=False,
+                generation_expression=None,
+                ordinal_position=1,
+            ),
+        ),
+    )
 
 
 def test_source_connection_test_reports_driver_detail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,6 +104,15 @@ def test_target_connection_test_reports_driver_detail(monkeypatch: pytest.Monkey
     assert "user=migration" in message
     assert "detail=password authentication failed" in message
     assert "secret" not in message
+
+
+def test_postgres_fetch_rows_by_keys_accepts_tuple_cursor_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresTargetAdapter(TargetConfig(database="target_db", password="secret"))
+    monkeypatch.setattr(adapter, "_connect", lambda: TupleConnection(((1,),)))
+
+    rows = adapter.fetch_rows_by_keys(_account_table(), ("id",), ({"id": 1},))
+
+    assert rows == {(1,): {"id": 1}}
 
 
 def test_scan_schema_reports_connection_context(monkeypatch: pytest.MonkeyPatch) -> None:

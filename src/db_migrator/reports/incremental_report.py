@@ -24,7 +24,19 @@ def write_incremental_report(report: IncrementalMigrationReport, output_dir: Pat
 def _write_tables_csv(report: IncrementalMigrationReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["schema", "table", "status", "rows_upserted", "batches_upserted", "watermark_column", "message"])
+        writer.writerow(
+            [
+                "schema",
+                "table",
+                "status",
+                "rows_upserted",
+                "batches_upserted",
+                "watermark_column",
+                "watermark_range",
+                "upsert_keys",
+                "message",
+            ]
+        )
         for table in report.tables:
             writer.writerow(
                 [
@@ -34,6 +46,8 @@ def _write_tables_csv(report: IncrementalMigrationReport, output_path: Path) -> 
                     table.rows_upserted,
                     table.batches_upserted,
                     table.watermark_column,
+                    _watermark_range_label(table),
+                    _upsert_keys_label(table),
                     table.message,
                 ]
             )
@@ -44,7 +58,7 @@ def _write_html(report: IncrementalMigrationReport, output_path: Path) -> None:
     if not rows:
         rows = """
           <tr>
-            <td colspan="7" class="empty-state">증분 이관 대상 테이블이 없습니다.</td>
+            <td colspan="9" class="empty-state">증분 이관 대상 테이블이 없습니다.</td>
           </tr>
         """
     html = f"""<!doctype html>
@@ -208,7 +222,7 @@ def _write_html(report: IncrementalMigrationReport, output_path: Path) -> None:
       <div>
         <div class="eyebrow">증분 이관 리포트</div>
         <h1>Jigration 증분 이관 리포트</h1>
-        <p>이번 증분 실행에서 어떤 테이블에 몇 건이 반영됐고 무엇이 건너뛰어졌는지 확인하는 리포트입니다.</p>
+        <p>이번 증분 실행에서 어떤 watermark 범위를 읽었고 어떤 upsert 기준으로 target에 반영했는지 확인하는 리포트입니다.</p>
       </div>
       <div class="summary-grid">
         <div class="metric"><span>증분 이관 결과</span><strong>{escape(result_label(_report_status(report)))}</strong></div>
@@ -223,13 +237,15 @@ def _write_html(report: IncrementalMigrationReport, output_path: Path) -> None:
       <table>
         <thead>
           <tr>
-            <th style="width: 12%;">스키마</th>
-            <th style="width: 18%;">테이블명</th>
-            <th style="width: 12%;">상태</th>
-            <th style="width: 12%;">반영 행 수</th>
-            <th style="width: 10%;">배치 수</th>
-            <th style="width: 16%;">증분 기준 컬럼</th>
-            <th style="width: 20%;">메시지</th>
+            <th style="width: 10%;">스키마</th>
+            <th style="width: 16%;">테이블명</th>
+            <th style="width: 10%;">상태</th>
+            <th style="width: 10%;">반영 행 수</th>
+            <th style="width: 8%;">배치 수</th>
+            <th style="width: 14%;">증분 기준 컬럼</th>
+            <th style="width: 14%;">watermark 범위</th>
+            <th style="width: 10%;">upsert 기준</th>
+            <th style="width: 8%;">메시지</th>
           </tr>
         </thead>
         <tbody>
@@ -262,6 +278,8 @@ def _table_row(table) -> str:
             <td>{table.rows_upserted}</td>
             <td>{table.batches_upserted}</td>
             <td>{escape(table.watermark_column or "-")}</td>
+            <td>{escape(_watermark_range_label(table))}</td>
+            <td>{escape(_upsert_keys_label(table))}</td>
             <td>{escape(table.message or "-")}</td>
           </tr>
     """
@@ -281,6 +299,20 @@ def _skipped_table_count(report: IncrementalMigrationReport) -> int:
 
 def _delete_policy_message() -> str:
     return "자동 삭제 동기화는 지원하지 않습니다. 삭제 대상은 별도 파일을 검토하세요."
+
+
+def _watermark_range_label(table) -> str:
+    start_value = table.watermark_start_value or "-∞"
+    end_value = table.watermark_end_value or "+∞"
+    if table.watermark_column is None:
+        return "-"
+    return f"{start_value} ~ {end_value}"
+
+
+def _upsert_keys_label(table) -> str:
+    if not table.upsert_keys:
+        return "-"
+    return ", ".join(table.upsert_keys)
 
 
 def _table_label(table) -> str:

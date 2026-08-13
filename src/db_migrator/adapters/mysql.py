@@ -538,6 +538,24 @@ class MySqlTargetAdapter:
                 f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
             ) from exc
 
+    def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> dict[tuple[object, ...], RowData]:
+        if not rows:
+            return {}
+        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        table_sql = self._qualified_table_name(table_schema)
+        column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
+        where_sql, params = _mysql_key_lookup_predicate(keys, rows)
+        try:
+            with self._connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"SELECT {column_sql} FROM {table_sql} WHERE {where_sql}", params)
+                    fetched_rows = cursor.fetchall()
+            return {_result_row_key(_result_row_dict(row, writable_columns), keys): _result_row_dict(row, writable_columns) for row in fetched_rows}
+        except Exception as exc:
+            raise MySqlAdapterError(
+                f"Failed to fetch target rows for sync comparison: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+            ) from exc
+
     def count_rows(self, table: TableRef) -> int:
         table_sql = self._qualified_table_ref(table)
         try:
@@ -819,6 +837,25 @@ def _mysql_upsert_update_sql(update_columns: tuple[str, ...], keys: tuple[str, .
         f"{quote_mysql_identifier(column)} = VALUES({quote_mysql_identifier(column)})"
         for column in columns
     )
+
+
+def _mysql_key_lookup_predicate(keys: tuple[str, ...], rows: tuple[RowData, ...]) -> tuple[str, tuple[object, ...]]:
+    row_predicates: list[str] = []
+    params: list[object] = []
+    for row in rows:
+        row_predicates.append("(" + " AND ".join(f"{quote_mysql_identifier(key)} = %s" for key in keys) + ")")
+        params.extend(row.get(key) for key in keys)
+    return " OR ".join(row_predicates), tuple(params)
+
+
+def _result_row_key(row: RowData, keys: tuple[str, ...]) -> tuple[object, ...]:
+    return tuple(row.get(key) for key in keys)
+
+
+def _result_row_dict(row: object, columns: tuple[str, ...]) -> RowData:
+    if isinstance(row, dict):
+        return row
+    return dict(zip(columns, row))
 
 
 def _unique_warning_messages(warnings: Iterable[str]) -> tuple[str, ...]:

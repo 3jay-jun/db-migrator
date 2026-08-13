@@ -115,19 +115,42 @@ class ExecutionArtifact:
 
 
 @dataclass(frozen=True)
+class DataSyncArtifact:
+    schema: str
+    table: str
+    status: str
+    rows_inserted: int
+    rows_updated: int
+    rows_deleted: int
+    rows_unchanged: int
+    rows_processed: int
+    rows_written: int
+    changed_rows: int
+    batches_written: int
+    message: str | None = None
+
+    @property
+    def table_ref(self) -> TableRef:
+        return TableRef(schema=self.schema, name=self.table)
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     job_id: str
     tables: tuple[TableValidationResult, ...]
     metadata: ValidationMetadata
     schema_objects: tuple[SchemaObjectComparison, ...] = ()
     execution_artifacts: tuple[ExecutionArtifact, ...] = ()
+    data_sync_artifacts: tuple[DataSyncArtifact, ...] = ()
 
     @property
     def status(self) -> str:
         if any(table.status == ValidationStatus.FAILED for table in self.tables):
             return ValidationStatus.FAILED
+        if any(not artifact.success for artifact in self.execution_artifacts):
+            return ValidationStatus.FAILED
         if any(table.status == ValidationStatus.MISMATCHED for table in self.tables) or any(
-            schema_object.status in {"missing", "mismatched", "target_only"} for schema_object in self.schema_objects
+            schema_object.status in {"missing", "mismatched", "manual_review", "target_only"} for schema_object in self.schema_objects
         ):
             return ValidationStatus.MISMATCHED
         return ValidationStatus.MATCHED
@@ -158,6 +181,7 @@ def validate_tables(
     source_snapshot: SchemaSnapshot | None = None,
     target_snapshot: SchemaSnapshot | None = None,
     execution_artifacts: tuple[ExecutionArtifact, ...] = (),
+    data_sync_artifacts: tuple[DataSyncArtifact, ...] = (),
 ) -> ValidationReport:
     profile = NormalizationProfile(
         datetime_precision=verification.checksum_datetime_precision,
@@ -172,6 +196,7 @@ def validate_tables(
         if source_snapshot is not None and target_snapshot is not None
         else (),
         execution_artifacts=execution_artifacts,
+        data_sync_artifacts=data_sync_artifacts,
     )
 
 

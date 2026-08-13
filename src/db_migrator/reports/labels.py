@@ -36,7 +36,7 @@ def option_label(value: str | None) -> str:
         "manual": "수동 이관(DDL + DML)",
         "manual_ddl": "수동 이관(DDL)",
         "full": "전체 이관",
-        "skip": "덮어쓰기",
+        "skip": "건너뛰기",
         "fail": "기존 테이블이 있으면 실패",
         "compare_only": "비교만",
         "append": "추가",

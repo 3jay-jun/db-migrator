@@ -69,10 +69,14 @@ class FakeTargetWriter:
         *,
         raise_on_table: str | None = None,
         existing_rows: dict[str, int] | None = None,
+        rows_by_key: dict[str, dict[tuple, dict]] | None = None,
+        rows_deleted: int = 1,
     ) -> None:
         self.fail_on_table = fail_on_table
         self.raise_on_table = raise_on_table
         self.existing_rows = existing_rows or {}
+        self.rows_by_key = rows_by_key or {}
+        self.rows_deleted = rows_deleted
         self.written_batches: list[tuple[str, tuple[dict, ...]]] = []
         self.upserted_batches: list[tuple[str, tuple[str, ...], tuple[dict, ...]]] = []
         self.sync_keys: list[tuple[str, tuple]] = []
@@ -97,6 +101,10 @@ class FakeTargetWriter:
         self.upserted_batches.append((table_schema.ref.name, keys, rows))
         return WriteResult(success=True, rows_written=len(rows), message="upserted")
 
+    def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[dict, ...]) -> dict[tuple[object, ...], dict]:
+        table_rows = self.rows_by_key.get(table_schema.ref.name, {})
+        return {tuple(row.get(key) for key in keys): table_rows[tuple(row.get(key) for key in keys)] for row in rows if tuple(row.get(key) for key in keys) in table_rows}
+
     def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
         self.sync_keys.append((table_schema.ref.name, ("begin", keys)))
 
@@ -105,7 +113,7 @@ class FakeTargetWriter:
 
     def delete_rows_not_in_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> int:
         self.deleted_sync_tables.append(table_schema.ref.name)
-        return 1
+        return self.rows_deleted
 
     def end_sync_keys(self, table_schema: TableSchema) -> None:
         self.sync_keys.append((table_schema.ref.name, ("end",)))
@@ -422,10 +430,18 @@ def test_append_policy_writes_filtered_tables_without_target_row_preflight(tmp_p
     assert result.tables[0].status == "completed"
 
 
-def test_sync_policy_upserts_source_rows_and_deletes_target_rows_missing_from_source(tmp_path) -> None:
+def test_sync_policy_upserts_only_changed_source_rows_and_deletes_target_rows_missing_from_source(tmp_path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     users = next(table for table in snapshot.tables if table.ref.name == "users")
-    target = FakeTargetWriter(existing_rows={"users": 2})
+    target = FakeTargetWriter(
+        existing_rows={"users": 2},
+        rows_by_key={
+            "users": {
+                (1,): {"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"},
+                (2,): {"id": 2, "email": "old@example.com", "profile": {}, "created_at": "2026-01-02"},
+            }
+        },
+    )
 
     result = migrate_tables(
         job_id="job-1",
@@ -441,14 +457,44 @@ def test_sync_policy_upserts_source_rows_and_deletes_target_rows_missing_from_so
         target=target,
         checkpoint_store=CheckpointStore(tmp_path / "checkpoint.sqlite"),
         event_publisher=QueueEventPublisher(Queue()),
-        migration_config=MigrationConfig(batch_size=1, commit_interval=1, existing_table_policy=ExistingTablePolicy.SYNC),
+        migration_config=MigrationConfig(batch_size=2, commit_interval=1, existing_table_policy=ExistingTablePolicy.SYNC),
     )
 
     assert result.tables[0].status == "completed"
-    assert [batch[1] for batch in target.upserted_batches] == [("id",), ("id",)]
+    assert [batch[1] for batch in target.upserted_batches] == [("id",)]
+    assert target.upserted_batches[0][2] == ({"id": 2, "email": "b@example.com", "profile": {}, "created_at": "2026-01-02"},)
+    assert result.tables[0].rows_inserted == 0
+    assert result.tables[0].rows_updated == 1
+    assert result.tables[0].rows_unchanged == 1
+    assert result.tables[0].rows_deleted == 1
+    assert result.tables[0].changed_rows == 2
     assert ("users", (1,)) in target.sync_keys
     assert ("users", (2,)) in target.sync_keys
     assert target.deleted_sync_tables == ["users"]
+
+
+def test_sync_policy_writes_zero_changed_rows_when_source_and_target_match(tmp_path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    users = next(table for table in snapshot.tables if table.ref.name == "users")
+    rows = [{"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"}]
+    target = FakeTargetWriter(rows_by_key={"users": {(1,): rows[0]}}, rows_deleted=0)
+    report_path = tmp_path / "data-sync-execution.json"
+
+    result = migrate_tables(
+        job_id="job-1",
+        tables=(users,),
+        source=FakeSourceReader({"users": rows}),
+        target=target,
+        checkpoint_store=CheckpointStore(tmp_path / "checkpoint.sqlite"),
+        event_publisher=QueueEventPublisher(Queue()),
+        migration_config=MigrationConfig(batch_size=10, commit_interval=1, existing_table_policy=ExistingTablePolicy.SYNC),
+        data_execution_report=report_path,
+    )
+
+    assert result.rows_written == 0
+    assert target.upserted_batches == []
+    assert result.tables[0].changed_rows == 0
+    assert '"changed_rows": 0' in report_path.read_text(encoding="utf-8")
 
 
 def test_sync_policy_requires_primary_or_unique_key(tmp_path) -> None:

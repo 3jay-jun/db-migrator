@@ -9,9 +9,16 @@ from db_migrator.schema.type_mapping import postgres_type_to_common
 
 
 class FailingCursor:
-    def __init__(self, *, execute_error: Exception | None = None, executemany_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        execute_error: Exception | None = None,
+        executemany_error: Exception | None = None,
+        rows: tuple[tuple, ...] = (),
+    ) -> None:
         self._execute_error = execute_error
         self._executemany_error = executemany_error
+        self._rows = rows
 
     def __enter__(self) -> "FailingCursor":
         return self
@@ -26,6 +33,9 @@ class FailingCursor:
     def executemany(self, _sql: str, _values: list[tuple]) -> None:
         if self._executemany_error is not None:
             raise self._executemany_error
+
+    def fetchall(self) -> tuple[tuple, ...]:
+        return self._rows
 
 
 class FakeConnection:
@@ -84,3 +94,12 @@ def test_mysql_sample_rows_reports_driver_detail() -> None:
     assert "Failed to sample target rows for table: account2" in message
     assert "detail=unknown column id_" in message
     assert "secret" not in message
+
+
+def test_mysql_fetch_rows_by_keys_accepts_tuple_cursor_rows() -> None:
+    adapter = MySqlTargetAdapter(TargetConfig(database="hd_bb", password="secret"))
+    adapter._connect = lambda: FakeConnection(FailingCursor(rows=((1,),)))
+
+    rows = adapter.fetch_rows_by_keys(_account_table(), ("id",), ({"id": 1},))
+
+    assert rows == {(1,): {"id": 1}}

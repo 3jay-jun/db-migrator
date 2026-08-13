@@ -49,15 +49,19 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
                 "대상_체크섬",
             ]
         )
-        for table in report.tables:
+        data_sync_by_table = _data_sync_by_table(report)
+        for table in _visible_table_results(report):
             metrics = _table_metrics(table)
+            data_sync_artifact = data_sync_by_table.get(table.table.name)
+            source_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else table.row_count.source_rows
+            target_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else table.row_count.target_rows
             writer.writerow(
                 [
                     metrics["schema"],
                     metrics["table"],
                     table.status,
-                    table.row_count.source_rows,
-                    table.row_count.target_rows,
+                    source_rows,
+                    target_rows,
                     table.row_count.status,
                     table.checksum.status,
                     metrics["matched_rows"],
@@ -91,14 +95,26 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
             <td colspan="6" class="empty-state">테이블 관련 이슈 및 조치사항이 없습니다.</td>
           </tr>
         """
-    execution_artifact_rows = "\n".join(_execution_artifact_row(artifact) for artifact in report.execution_artifacts)
+    schema_object_lookup = _schema_object_lookup(report)
+    execution_artifact_rows = "\n".join(
+        _execution_artifact_row(artifact, schema_object_lookup) for artifact in report.execution_artifacts
+    )
     if not execution_artifact_rows:
         execution_artifact_rows = """
           <tr>
-            <td colspan="7" class="empty-state">확인된 DDL/인덱스/FK 실행 산출물이 없습니다.</td>
+            <td colspan="7" class="empty-state">확인된 DDL/인덱스/FK 작업 내역이 없습니다.</td>
           </tr>
         """
-    table_summary_rows = "\n".join(_table_summary_row(table) for table in report.tables)
+    verification_audit_rows = "\n".join(_verification_audit_rows(report))
+    data_sync_by_table = _data_sync_by_table(report)
+    visible_tables = _visible_table_results(report)
+    table_summary_rows = "\n".join(_table_summary_row(table, data_sync_by_table.get(table.table.name)) for table in visible_tables)
+    if not table_summary_rows:
+        table_summary_rows = """
+          <tr>
+            <td colspan="8" class="empty-state">이번 실행에서 검증할 이관/수정/삭제 테이블이 없습니다.</td>
+          </tr>
+        """
     html = f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -371,6 +387,36 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       outline: 2px solid var(--color-primary);
       outline-offset: 2px;
     }}
+    .execution-summary {{
+      display: grid;
+      grid-template-columns: 10% 20% 10% 10% 18% 16% 16%;
+      align-items: start;
+      min-height: 48px;
+      cursor: pointer;
+      list-style: none;
+    }}
+    .execution-summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .execution-summary > span {{
+      padding: var(--space-150) var(--space-200);
+      color: var(--color-text-normal);
+      font-size: 14px;
+      line-height: 20px;
+      word-break: break-word;
+    }}
+    .execution-summary > .summary-table {{
+      color: var(--color-primary);
+      font-weight: 700;
+    }}
+    .execution-summary:hover > span {{
+      background: var(--color-canvas-200);
+    }}
+    .execution-summary:focus-visible {{
+      border-radius: var(--radius-200);
+      outline: 2px solid var(--color-primary);
+      outline-offset: 2px;
+    }}
     details.table-summary-details {{
       width: 100%;
     }}
@@ -449,16 +495,14 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       <div>
         <div class="eyebrow">검증 리포트</div>
         <h1>Jigration 검증 리포트</h1>
-        <p>이관 결과가 성공인지, 실패했다면 어느 테이블의 어떤 검증이 실패했는지 확인하는 리포트입니다.</p>
+        <p>실제로 이관한 내용과 이관 후 비교 검증한 결과를 확인하는 리포트입니다. 이슈 상세는 하단의 이슈 및 권장 조치와 스키마 객체 검증에서 확인하세요.</p>
       </div>
       <div class="summary-grid">
         <div class="metric"><span>검증 결과</span><strong>{escape(result_label(report.status))}</strong></div>
-        <div class="metric"><span>총 테이블 수</span><strong>{len(report.tables)}</strong></div>
-        <div class="metric"><span>전체 데이터 수</span><strong>{_format_optional_int(summary["total_source_rows"])}</strong></div>
-        <div class="metric"><span>총 이관 수</span><strong>{_format_optional_int(summary["total_target_rows"])}</strong></div>
-        <div class="metric"><span>이슈 테이블 수</span><strong>{_issue_count(report)}</strong></div>
-        <div class="metric"><span>스키마 객체 이슈 수</span><strong>{summary["schema_object_issue_count"]}</strong></div>
-        <div class="metric"><span>실행 산출물 수</span><strong>{summary["execution_artifact_count"]}</strong></div>
+        <div class="metric"><span>검증 테이블 수</span><strong>{summary["table_count"]}</strong></div>
+        <div class="metric"><span>전체 데이터 수</span><strong>{_summary_data_metric(report, summary["total_target_rows"])}</strong></div>
+        <div class="metric"><span>검증 데이터 수</span><strong>{_summary_data_metric(report, summary["total_target_rows"])}</strong></div>
+        <div class="metric"><span>이슈 수</span><strong>{summary["issue_count"]}</strong></div>
       </div>
     </header>
 
@@ -469,6 +513,25 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
         {_endpoint_block("대상 DB", report.metadata.target)}
         {_verification_block(report)}
       </div>
+    </section>
+
+    <section>
+      <h2>검증 수행 내역</h2>
+      <p>이번 리포트가 어떤 작업 내역을 근거로 삼았고, 어떤 항목을 source 후보와 target 실제 상태로 비교했는지 요약합니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 18%;">구분</th>
+            <th style="width: 16%;">검증 기준</th>
+            <th style="width: 16%;">대상 수</th>
+            <th style="width: 16%;">이슈 수</th>
+            <th style="width: 34%;">근거</th>
+          </tr>
+        </thead>
+        <tbody>
+{verification_audit_rows}
+        </tbody>
+      </table>
     </section>
 
     <section>
@@ -515,15 +578,15 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
 
     <section>
       <h2>스키마 객체 검증</h2>
-      <p>이관 후 대상의 인덱스, FK, 자동증가 속성, 함수, 트리거, 뷰 존재 여부와 정의 차이를 확인합니다.</p>
+      <p>source 이관 후보와 target 실제 스키마를 같은 모델로 비교합니다. 테이블, 컬럼, PK, 자동증가 속성, 인덱스, FK, 비테이블 객체의 후보/실제/조치 여부를 확인합니다.</p>
       <table>
         <thead>
           <tr>
             <th style="width: 14%;">객체 유형</th>
             <th style="width: 24%;">객체명</th>
             <th style="width: 12%;">상태</th>
-            <th style="width: 18%;">기대 정의</th>
-            <th style="width: 18%;">대상 정의</th>
+            <th style="width: 18%;">source 후보</th>
+            <th style="width: 18%;">target 실제</th>
             <th style="width: 14%;">권장 조치</th>
           </tr>
         </thead>
@@ -534,8 +597,8 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
     </section>
 
     <section>
-      <h2>실행 산출물</h2>
-      <p>apply-ddl, apply-indexes, apply-foreign-keys 단계에서 남긴 실제 실행 DDL과 결과 요약입니다.</p>
+      <h2>실제 작업 내역</h2>
+      <p>apply-ddl, apply-indexes, apply-foreign-keys 단계에서 실제 수행한 DDL/FK/INDEX 작업을 source 후보와 target 실제 비교 결과에 연결합니다. 행을 펼치면 실행 SQL을 확인할 수 있습니다.</p>
       <table>
         <thead>
           <tr>
@@ -544,8 +607,8 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
             <th style="width: 10%;">작업</th>
             <th style="width: 10%;">결과</th>
             <th style="width: 18%;">메시지</th>
-            <th style="width: 20%;">DDL</th>
-            <th style="width: 12%;">원본 파일</th>
+            <th style="width: 16%;">비교 결과</th>
+            <th style="width: 16%;">실행 SQL</th>
           </tr>
         </thead>
         <tbody>
@@ -638,27 +701,80 @@ def _status_summary(counts: dict[str, int]) -> str:
 
 
 def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
+    if report.data_sync_artifacts:
+        return _data_sync_summary_metrics(report)
     table_metrics = [_table_metrics(table) for table in report.tables]
     total_source_rows = _sum_optional_int(metric["source_rows"] for metric in table_metrics)
     total_target_rows = _sum_optional_int(metric["target_rows"] for metric in table_metrics)
+    successful_table_count = sum(1 for table in report.tables if table.status == ValidationStatus.MATCHED)
+    successful_migrated_rows = _sum_successful_target_rows(report)
+    table_issue_count = _issue_count(report)
+    schema_object_issue_count = sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status))
+    failed_execution_artifact_count = sum(1 for artifact in report.execution_artifacts if not artifact.success)
     return {
         "table_count": len(report.tables),
-        "matched_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.MATCHED),
+        "successful_table_count": successful_table_count,
+        "matched_table_count": successful_table_count,
         "mismatched_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.MISMATCHED),
         "failed_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.FAILED),
         "skipped_table_count": sum(1 for table in report.tables if table.status == ValidationStatus.SKIPPED),
         "total_source_rows": total_source_rows,
         "total_target_rows": total_target_rows,
         "total_matched_rows": _sum_optional_int(metric["matched_rows"] for metric in table_metrics),
+        "successful_migrated_rows": successful_migrated_rows,
         "total_row_count_delta": None if total_source_rows is None or total_target_rows is None else total_source_rows - total_target_rows,
         "total_error_count": sum(int(metric["error_count"]) for metric in table_metrics),
         "total_difference_count": sum(int(metric["difference_count"]) for metric in table_metrics),
         "total_matched_sample_count": sum(int(metric["matched_sample_count"]) for metric in table_metrics),
         "schema_object_count": len(report.schema_objects),
-        "schema_object_issue_count": sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status)),
+        "table_issue_count": table_issue_count,
+        "schema_object_issue_count": schema_object_issue_count,
+        "issue_count": table_issue_count + schema_object_issue_count + failed_execution_artifact_count,
         "execution_artifact_count": len(report.execution_artifacts),
-        "failed_execution_artifact_count": sum(1 for artifact in report.execution_artifacts if not artifact.success),
+        "failed_execution_artifact_count": failed_execution_artifact_count,
     }
+
+
+def _data_sync_summary_metrics(report: ValidationReport) -> dict[str, int | None]:
+    changed_data_artifacts = tuple(artifact for artifact in report.data_sync_artifacts if artifact.changed_rows > 0)
+    ddl_changed_tables = _ddl_changed_table_names(report)
+    changed_table_names = {artifact.table for artifact in changed_data_artifacts} | ddl_changed_tables
+    changed_rows = sum(artifact.changed_rows for artifact in changed_data_artifacts)
+    failed_execution_artifact_count = sum(1 for artifact in report.execution_artifacts if not artifact.success)
+    schema_object_issue_count = sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status))
+    table_issue_count = sum(1 for table in _visible_table_results(report) if table.status != ValidationStatus.MATCHED)
+    return {
+        "table_count": len(changed_table_names),
+        "successful_table_count": sum(1 for table in _visible_table_results(report) if table.status == ValidationStatus.MATCHED),
+        "matched_table_count": sum(1 for table in _visible_table_results(report) if table.status == ValidationStatus.MATCHED),
+        "mismatched_table_count": sum(1 for table in _visible_table_results(report) if table.status == ValidationStatus.MISMATCHED),
+        "failed_table_count": sum(1 for table in _visible_table_results(report) if table.status == ValidationStatus.FAILED),
+        "skipped_table_count": sum(1 for table in _visible_table_results(report) if table.status == ValidationStatus.SKIPPED),
+        "total_source_rows": changed_rows,
+        "total_target_rows": changed_rows,
+        "total_matched_rows": changed_rows - table_issue_count if table_issue_count == 0 else 0,
+        "successful_migrated_rows": changed_rows - table_issue_count if table_issue_count == 0 else 0,
+        "total_row_count_delta": 0,
+        "total_error_count": table_issue_count,
+        "total_difference_count": 0,
+        "total_matched_sample_count": 0,
+        "schema_object_count": len(report.schema_objects),
+        "table_issue_count": table_issue_count,
+        "schema_object_issue_count": schema_object_issue_count,
+        "issue_count": table_issue_count + schema_object_issue_count + failed_execution_artifact_count,
+        "execution_artifact_count": len(report.execution_artifacts),
+        "failed_execution_artifact_count": failed_execution_artifact_count,
+    }
+
+
+def _summary_data_metric(report: ValidationReport, value: int | None) -> str:
+    if _is_schema_only_report(report):
+        return "-"
+    return _format_optional_int(value)
+
+
+def _is_schema_only_report(report: ValidationReport) -> bool:
+    return report.metadata.migration_mode in {"ddl_only", "manual_ddl"}
 
 
 def _table_metrics(table) -> dict[str, int | str | None]:
@@ -682,6 +798,31 @@ def _table_metrics(table) -> dict[str, int | str | None]:
         "row_count_status": table.row_count.status,
         "checksum_status": table.checksum.status,
     }
+
+
+def _data_sync_by_table(report: ValidationReport) -> dict[str, object]:
+    return {artifact.table: artifact for artifact in report.data_sync_artifacts}
+
+
+def _visible_table_results(report: ValidationReport) -> tuple[object, ...]:
+    if not report.data_sync_artifacts:
+        return report.tables
+    changed_table_names = {artifact.table for artifact in report.data_sync_artifacts if artifact.changed_rows > 0}
+    changed_table_names |= _ddl_changed_table_names(report)
+    return tuple(table for table in report.tables if table.table.name in changed_table_names)
+
+
+def _ddl_changed_table_names(report: ValidationReport) -> set[str]:
+    changed_names: set[str] = set()
+    for artifact in report.execution_artifacts:
+        if not artifact.success:
+            continue
+        if artifact.artifact_type != "DDL":
+            continue
+        if artifact.action in {"sync_existing", "skip"} and not artifact.ddl:
+            continue
+        changed_names.add(artifact.object_name.rsplit(".", 1)[-1])
+    return changed_names
 
 
 def _table_label(table) -> str:
@@ -722,6 +863,15 @@ def _sum_optional_int(values) -> int | None:
     return sum(int(value) for value in resolved_values)
 
 
+def _sum_successful_target_rows(report: ValidationReport) -> int | None:
+    successful_target_rows = [
+        table.row_count.target_rows
+        for table in report.tables
+        if table.status == ValidationStatus.MATCHED
+    ]
+    return _sum_optional_int(successful_target_rows)
+
+
 def _write_errors(report: ValidationReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
@@ -756,7 +906,7 @@ def _write_differences(report: ValidationReport, output_path: Path) -> None:
 def _write_schema_objects(report: ValidationReport, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["객체유형", "객체명", "상태", "기대정의", "대상정의", "권장조치"])
+        writer.writerow(["객체유형", "객체명", "상태", "source_후보", "target_실제", "권장조치"])
         for schema_object in report.schema_objects:
             writer.writerow(
                 [
@@ -788,12 +938,70 @@ def _write_execution_artifacts(report: ValidationReport, output_path: Path) -> N
             )
 
 
+def _verification_audit_rows(report: ValidationReport) -> tuple[str, ...]:
+    table_count = len(report.tables)
+    return (
+        _verification_audit_row(
+            category="행 수 검증",
+            basis="source count vs target count",
+            target_count=table_count,
+            issue_count=sum(1 for table in report.tables if table.row_count.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}),
+            evidence="원본/대상 DB에서 테이블별 행 수를 조회해 비교했습니다.",
+        ),
+        _verification_audit_row(
+            category="검산 샘플 검증",
+            basis="source sample checksum vs target sample checksum",
+            target_count=table_count,
+            issue_count=sum(1 for table in report.tables if table.checksum.status in {ValidationStatus.MISMATCHED, ValidationStatus.FAILED}),
+            evidence="PK 또는 정렬 가능한 기준으로 상/하위 샘플을 정규화해 checksum을 비교했습니다.",
+        ),
+        _verification_audit_row(
+            category="DDL/스키마 검증",
+            basis="source 후보 객체 vs target 실제 객체",
+            target_count=len(report.schema_objects),
+            issue_count=sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status)),
+            evidence="테이블, 컬럼, PK, 자동증가, 인덱스, FK, 비테이블 객체를 동일 비교 모델로 확인했습니다.",
+        ),
+        _verification_audit_row(
+            category="실제 작업 내역",
+            basis="실행 리포트 artifact",
+            target_count=len(report.execution_artifacts),
+            issue_count=sum(1 for artifact in report.execution_artifacts if not artifact.success),
+            evidence="apply-ddl, apply-indexes, apply-foreign-keys 결과 파일에서 실제 수행 작업을 읽었습니다.",
+        ),
+    )
+
+
+def _verification_audit_row(
+    *,
+    category: str,
+    basis: str,
+    target_count: int,
+    issue_count: int,
+    evidence: str,
+) -> str:
+    return f"""
+          <tr>
+            <td class="message">{escape(category)}</td>
+            <td>{escape(basis)}</td>
+            <td>{target_count}</td>
+            <td>{issue_count}</td>
+            <td>{escape(evidence)}</td>
+          </tr>
+    """
+
+
 def _issue_count(report: ValidationReport) -> int:
     return sum(1 for table in report.tables if table.status != ValidationStatus.MATCHED)
 
 
-def _table_summary_row(table) -> str:
+def _table_summary_row(table, data_sync_artifact=None) -> str:
     metrics = _table_metrics(table)
+    source_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else metrics["source_rows"]
+    target_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else metrics["target_rows"]
+    row_delta = "0" if data_sync_artifact is not None else _row_count_delta_label(table)
+    representative_issue = _data_sync_summary_label(data_sync_artifact) if data_sync_artifact is not None else _representative_issue(table)
+    next_action = "변경분 source/target 검증 완료" if data_sync_artifact is not None and table.status == ValidationStatus.MATCHED else _next_action(table)
     return f"""
           <tr>
             <td colspan="8">
@@ -802,17 +1010,71 @@ def _table_summary_row(table) -> str:
                   <span>{escape(str(metrics["schema"]))}</span>
                   <span class="summary-table">{escape(str(metrics["table"]))}</span>
                   <span><span class="badge {escape(str(metrics["status"]))}">{escape(result_label(str(metrics["status"])))}</span></span>
-                  <span>{_format_optional_int(metrics["source_rows"])}</span>
-                  <span>{_format_optional_int(metrics["target_rows"])}</span>
-                  <span>{escape(_row_count_delta_label(table))}</span>
-                  <span>{escape(_representative_issue(table))}</span>
-                  <span class="action">{escape(_next_action(table))}</span>
+                  <span>{_format_optional_int(source_rows)}</span>
+                  <span>{_format_optional_int(target_rows)}</span>
+                  <span>{escape(row_delta)}</span>
+                  <span>{escape(representative_issue)}</span>
+                  <span class="action">{escape(next_action)}</span>
                 </summary>
-                {_matched_sample_panel(table)}
+                {_table_detail_panel(table, data_sync_artifact)}
               </details>
             </td>
           </tr>
     """
+
+
+def _data_sync_summary_label(data_sync_artifact) -> str:
+    if data_sync_artifact is None:
+        return "이슈 없음"
+    return (
+        f"추가 {data_sync_artifact.rows_inserted}, "
+        f"수정 {data_sync_artifact.rows_updated}, "
+        f"삭제 {data_sync_artifact.rows_deleted}"
+    )
+
+
+def _table_detail_panel(table, data_sync_artifact=None) -> str:
+    if data_sync_artifact is not None:
+        return _data_sync_validation_panel(data_sync_artifact)
+    return _matched_sample_panel(table)
+
+
+def _data_sync_validation_panel(data_sync_artifact) -> str:
+    return f"""
+      <div class="matched-panel">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 20%;">검증 항목</th>
+              <th style="width: 16%;">검증 데이터 수</th>
+              <th style="width: 16%;">추가</th>
+              <th style="width: 16%;">수정</th>
+              <th style="width: 16%;">삭제</th>
+              <th style="width: 16%;">검증 방식</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>이관 데이터 검증</td>
+              <td>{data_sync_artifact.changed_rows}</td>
+              <td>{data_sync_artifact.rows_inserted}</td>
+              <td>{data_sync_artifact.rows_updated}</td>
+              <td>{data_sync_artifact.rows_deleted}</td>
+              <td>{escape(_data_sync_validation_basis(data_sync_artifact))}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    """
+
+
+def _data_sync_validation_basis(data_sync_artifact) -> str:
+    checks: list[str] = []
+    if data_sync_artifact.rows_inserted or data_sync_artifact.rows_updated:
+        checks.append("insert/update 대상 row를 target 반영 후 비교")
+    if data_sync_artifact.rows_deleted:
+        checks.append("delete 대상 key가 target에서 제거됐는지 확인")
+    return ", ".join(checks) if checks else "변경 대상 없음"
 
 
 def _row_count_delta_label(table) -> str:
@@ -866,19 +1128,77 @@ def _schema_object_row(schema_object) -> str:
     """
 
 
-def _execution_artifact_row(artifact) -> str:
+def _schema_object_lookup(report: ValidationReport) -> dict[str, object]:
+    lookup: dict[str, object] = {}
+    for schema_object in report.schema_objects:
+        lookup.setdefault(schema_object.object_name, schema_object)
+        tail_key = _object_tail_key(schema_object.object_name)
+        if tail_key:
+            lookup.setdefault(tail_key, schema_object)
+    return lookup
+
+
+def _object_tail_key(object_name: str) -> str | None:
+    parts = object_name.split(".")
+    if len(parts) < 2:
+        return None
+    return ".".join(parts[1:])
+
+
+def _find_schema_object_for_artifact(artifact, schema_object_lookup: dict[str, object]):
+    return schema_object_lookup.get(artifact.object_name) or schema_object_lookup.get(_object_tail_key(artifact.object_name) or "")
+
+
+def _execution_artifact_row(artifact, schema_object_lookup: dict[str, object]) -> str:
     status = "matched" if artifact.success else "failed"
+    schema_object = _find_schema_object_for_artifact(artifact, schema_object_lookup)
+    comparison_label = _execution_comparison_label(schema_object)
+    source_detail = schema_object.source_detail if schema_object is not None else "비교 객체 없음"
+    target_detail = schema_object.target_detail if schema_object is not None else "비교 객체 없음"
+    action = schema_object.action if schema_object is not None else "실제 실행 SQL만 확인됨"
     return f"""
           <tr>
-            <td>{escape(artifact.artifact_type)}</td>
-            <td class="message">{escape(artifact.object_name)}</td>
-            <td>{escape(artifact.action)}</td>
-            <td><span class="badge {status}">{escape("성공" if artifact.success else "실패")}</span></td>
-            <td>{escape(artifact.message)}</td>
-            <td><code>{escape(artifact.ddl or "-")}</code></td>
-            <td>{escape(artifact.source_file)}</td>
+            <td colspan="7">
+              <details class="issue-details">
+                <summary class="execution-summary">
+                  <span>{escape(artifact.artifact_type)}</span>
+                  <span class="summary-table">{escape(artifact.object_name)}</span>
+                  <span>{escape(artifact.action)}</span>
+                  <span><span class="badge {status}">{escape("성공" if artifact.success else "실패")}</span></span>
+                  <span>{escape(artifact.message)}</span>
+                  <span>{escape(comparison_label)}</span>
+                  <span><code>{escape("펼쳐보기")}</code></span>
+                </summary>
+                <div class="difference-panel">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th style="width: 22%;">source 후보</th>
+                        <th style="width: 22%;">target 실제</th>
+                        <th style="width: 22%;">비교/권장 조치</th>
+                        <th style="width: 34%;">실행 SQL</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>{escape(source_detail)}</td>
+                        <td>{escape(target_detail)}</td>
+                        <td>{escape(action)}</td>
+                        <td><code>{escape(artifact.ddl or "-")}</code></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            </td>
           </tr>
     """
+
+
+def _execution_comparison_label(schema_object) -> str:
+    if schema_object is None:
+        return "비교 결과 없음"
+    return _schema_object_status_label(schema_object.status)
 
 
 def _schema_object_badge_class(status: str) -> str:

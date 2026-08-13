@@ -108,7 +108,7 @@ if Signal is not None:
         ExistingTablePolicy.OVERWRITE,
     )
     EXISTING_TABLE_POLICY_LABELS = {
-        ExistingTablePolicy.SKIP: "덮어쓰기",
+        ExistingTablePolicy.SKIP: "건너뛰기",
         ExistingTablePolicy.APPEND: "추가",
         ExistingTablePolicy.SYNC: "동기화",
         ExistingTablePolicy.OVERWRITE: "덮어쓰기",
@@ -645,6 +645,7 @@ if Signal is not None:
                 checkpoint_db=checkpoint_db,
                 event_publisher=publisher,
                 selected_tables=selected_tables,
+                output_dir=output_dir,
             )
             if not data_result.success:
                 return data_result
@@ -710,6 +711,7 @@ if Signal is not None:
                 checkpoint_db=checkpoint_db,
                 event_publisher=publisher,
                 selected_tables=selected_tables,
+                output_dir=output_dir,
             )
             if not data_result.success:
                 return data_result

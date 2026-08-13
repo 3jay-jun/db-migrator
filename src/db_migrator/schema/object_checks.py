@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from db_migrator.config.models import Dbms
-from db_migrator.schema.models import ForeignKeySchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,8 @@ def build_index_plan(snapshot: SchemaSnapshot, *, target_dbms: Dbms) -> tuple[In
 
 
 def compare_schema_objects(source: SchemaSnapshot, target: SchemaSnapshot) -> tuple[SchemaObjectComparison, ...]:
-    comparisons = list(_compare_auto_increment_columns(source, target))
+    comparisons = list(_compare_table_definitions(source, target))
+    comparisons.extend(_compare_auto_increment_columns(source, target))
 
     source_indexes = {_index_key(table.ref, index): (table.ref, index) for table in source.tables for index in table.indexes}
     target_indexes = {_index_key(table.ref, index): (table.ref, index) for table in target.tables for index in table.indexes}
@@ -58,6 +59,140 @@ def compare_schema_objects(source: SchemaSnapshot, target: SchemaSnapshot) -> tu
         for key in sorted(set(source_objects) | set(target_objects))
     )
     return tuple(comparison for comparison in comparisons if comparison is not None)
+
+
+def _compare_table_definitions(source: SchemaSnapshot, target: SchemaSnapshot) -> tuple[SchemaObjectComparison, ...]:
+    source_tables = {(table.ref.schema, table.ref.name): table for table in source.tables}
+    target_tables = {(table.ref.schema, table.ref.name): table for table in target.tables}
+    comparisons: list[SchemaObjectComparison] = []
+    for key in sorted(set(source_tables) | set(target_tables)):
+        source_table = source_tables.get(key)
+        target_table = target_tables.get(key)
+        comparisons.extend(_compare_table_presence(key, source_table, target_table))
+        if source_table is None or target_table is None:
+            continue
+        comparisons.extend(_compare_columns(source_table, target_table))
+        comparisons.append(_compare_primary_key(source_table, target_table))
+    return tuple(comparison for comparison in comparisons if comparison is not None)
+
+
+def _compare_table_presence(
+    key: tuple[str, str],
+    source_table: TableSchema | None,
+    target_table: TableSchema | None,
+) -> tuple[SchemaObjectComparison, ...]:
+    object_name = ".".join(key)
+    if source_table is None:
+        return (
+            SchemaObjectComparison(
+                object_type="테이블",
+                object_name=object_name,
+                status="target_only",
+                source_detail="-",
+                target_detail="있음",
+                action="source 후보에 없는 target 테이블입니다. 기존 target 잔여 테이블인지 확인하세요.",
+            ),
+        )
+    if target_table is None:
+        return (
+            SchemaObjectComparison(
+                object_type="테이블",
+                object_name=object_name,
+                status="missing",
+                source_detail=_table_detail(source_table),
+                target_detail="-",
+                action="source 이관 후보 테이블이 target에 없습니다. apply-ddl 실행 결과와 대상 스키마를 확인하세요.",
+            ),
+        )
+    if len(source_table.columns) == len(target_table.columns):
+        status = "matched"
+        action = "테이블 존재 여부가 일치합니다. 컬럼/PK/인덱스/FK 상세 비교 결과를 함께 확인하세요."
+    else:
+        status = "mismatched"
+        action = "source 후보와 target 실제 테이블의 컬럼 수가 다릅니다. 컬럼별 비교 결과와 실행 DDL을 확인하세요."
+    return (
+        SchemaObjectComparison(
+            object_type="테이블",
+            object_name=object_name,
+            status=status,
+            source_detail=_table_detail(source_table),
+            target_detail=_table_detail(target_table),
+            action=action,
+        ),
+    )
+
+
+def _compare_columns(source_table: TableSchema, target_table: TableSchema) -> tuple[SchemaObjectComparison, ...]:
+    source_columns = {column.name: column for column in source_table.columns}
+    target_columns = {column.name: column for column in target_table.columns}
+    comparisons: list[SchemaObjectComparison] = []
+    for column_name in sorted(set(source_columns) | set(target_columns)):
+        source_column = source_columns.get(column_name)
+        target_column = target_columns.get(column_name)
+        object_name = f"{source_table.ref.schema}.{source_table.ref.name}.{column_name}"
+        if source_column is None:
+            comparisons.append(
+                SchemaObjectComparison(
+                    object_type="컬럼",
+                    object_name=object_name,
+                    status="target_only",
+                    source_detail="-",
+                    target_detail=_column_detail(target_column),
+                    action="source 후보에 없는 target 컬럼입니다. 기존 target 잔여 컬럼 또는 컬럼 매핑 결과인지 확인하세요.",
+                )
+            )
+            continue
+        if target_column is None:
+            comparisons.append(
+                SchemaObjectComparison(
+                    object_type="컬럼",
+                    object_name=object_name,
+                    status="missing",
+                    source_detail=_column_detail(source_column),
+                    target_detail="-",
+                    action="source 후보 컬럼이 target에 없습니다. ADD COLUMN 실행 결과와 컬럼 매핑을 확인하세요.",
+                )
+            )
+            continue
+        if _column_signature(source_column) == _column_signature(target_column):
+            comparisons.append(
+                SchemaObjectComparison(
+                    object_type="컬럼",
+                    object_name=object_name,
+                    status="matched",
+                    source_detail=_column_detail(source_column),
+                    target_detail=_column_detail(target_column),
+                    action="추가 조치가 필요하지 않습니다.",
+                )
+            )
+            continue
+        comparisons.append(
+            SchemaObjectComparison(
+                object_type="컬럼",
+                object_name=object_name,
+                status="mismatched",
+                source_detail=_column_detail(source_column),
+                target_detail=_column_detail(target_column),
+                action="컬럼 타입, nullable, default, generated, auto increment 정의가 source 후보와 target 실제 상태에서 다른지 확인하세요.",
+            )
+        )
+    return tuple(comparisons)
+
+
+def _compare_primary_key(source_table: TableSchema, target_table: TableSchema) -> SchemaObjectComparison:
+    object_name = f"{source_table.ref.schema}.{source_table.ref.name}.PK"
+    source_detail = _primary_key_detail(source_table)
+    target_detail = _primary_key_detail(target_table)
+    status = "matched" if source_detail == target_detail else "mismatched"
+    action = "추가 조치가 필요하지 않습니다." if status == "matched" else "PK 컬럼 구성이 source 후보와 target 실제 상태에서 다릅니다. 테이블 생성 DDL을 확인하세요."
+    return SchemaObjectComparison(
+        object_type="PK",
+        object_name=object_name,
+        status=status,
+        source_detail=source_detail,
+        target_detail=target_detail,
+        action=action,
+    )
 
 
 def _compare_auto_increment_columns(source: SchemaSnapshot, target: SchemaSnapshot) -> tuple[SchemaObjectComparison, ...]:
@@ -338,6 +473,37 @@ def _foreign_key_detail(foreign_key: ForeignKeySchema) -> str:
         f"columns=({', '.join(foreign_key.columns)}), "
         f"references={referenced_table}({', '.join(foreign_key.referenced_columns)})"
     )
+
+
+def _table_detail(table: TableSchema) -> str:
+    primary_key = _primary_key_detail(table)
+    return f"columns={len(table.columns)}, pk={primary_key}, indexes={len(table.indexes)}, fks={len(table.foreign_keys)}"
+
+
+def _column_detail(column: ColumnSchema | None) -> str:
+    if column is None:
+        return "-"
+    nullable = "nullable" if column.nullable else "not null"
+    default = f", default={column.default}" if column.default is not None else ""
+    generated = ", generated" if column.is_generated else ""
+    auto_increment = ", auto_increment" if column.auto_increment else ""
+    return f"type={column.common_type.kind.value}, source_type={column.source_type}, {nullable}{default}{generated}{auto_increment}"
+
+
+def _column_signature(column: ColumnSchema) -> tuple[str, bool, str | None, bool, str | None]:
+    return (
+        column.common_type.kind.value,
+        column.nullable,
+        column.default,
+        column.is_generated,
+        column.generation_expression,
+    )
+
+
+def _primary_key_detail(table: TableSchema) -> str:
+    if table.primary_key is None or not table.primary_key.columns:
+        return "-"
+    return f"({', '.join(table.primary_key.columns)})"
 
 
 def _object_type_label(kind: SchemaObjectKind) -> str:
