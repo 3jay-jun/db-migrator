@@ -54,6 +54,22 @@ def test_safety_guard_requires_dry_run_before_production_destructive_policy() ->
     assert SafetyRiskCode.DRY_RUN_REQUIRED.value in decision.blocking_reasons
 
 
+def test_safety_guard_allows_overwrite_policy_when_no_destructive_candidates() -> None:
+    decision = TargetSafetyGuard().evaluate(
+        SafetyGuardInput(
+            target=TargetConfig(environment=TargetEnvironment.PRODUCTION),
+            safety=SafetyConfig(),
+            existing_table_policy=ExistingTablePolicy.OVERWRITE,
+            table_count=1,
+            estimated_rows=100,
+            dry_run_report_exists=False,
+            destructive_table_count=0,
+        )
+    )
+
+    assert decision.status is SafetyDecisionStatus.ALLOWED
+
+
 def test_safety_guard_treats_sync_as_destructive_policy() -> None:
     decision = TargetSafetyGuard().evaluate(
         SafetyGuardInput(

@@ -117,7 +117,7 @@ type 변환 warning, generated column, 예약어/대소문자 identifier warning
 uv run db-migrator apply-ddl --config config.yml --output-file reports/live/ddl-execution.json
 ```
 
-target DB에 `CREATE TABLE`을 실행합니다. `migration.existing_table_policy`가 `skip`이면 이미 존재하는 table은 건너뜁니다.
+target DB에 `CREATE TABLE`을 실행합니다. `migration.existing_table_policy`가 `skip`이면 이미 존재하는 table은 DDL만 건너뛰고 데이터 이관 대상에는 포함합니다.
 외래키까지 적용하려면 `migration.apply_foreign_keys: true`를 명시하세요. 기본값은 `false`라서 table 생성과 FK 적용을 분리해 검토할 수 있습니다.
 
 5. 데이터 이관
@@ -198,12 +198,12 @@ uv run db-migrator migrate-data --help
 | `verification.pk_range_checksum` | PK range checksum 옵션 | `false` |
 
 `existing_table_policy` 값:
-- `skip`: 기존 table은 건너뜀
-- `append`: 기존 table에 insert
-- `sync`: source 기준으로 target row를 upsert/delete
-- `overwrite`: 기존 target table을 drop 후 다시 생성
+- `skip`: 기존 table에는 DML만 실행하고, 없는 table은 생성 후 적재
+- `append`: source에는 있지만 target에는 없는 table만 생성 후 적재
+- `sync`: source 선택 범위를 기준으로 target table/data를 맞춤
+- `overwrite`: source/target 공통 table만 drop 후 다시 생성하고, target에 없는 source table은 일반 생성
 
-운영 환경에서 destructive 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. `sync`, `overwrite`는 target 데이터를 삭제하거나 덮어쓸 수 있으므로 처음 검증은 `skip`으로 시작하세요. `overwrite` DDL 실행 기록은 리포트 디렉터리의 `overwrite-audit.sqlite`에 남습니다.
+운영 환경에서 destructive 후보가 있는 정책을 사용할 때는 `safety` 설정이 차단할 수 있습니다. `sync`, `overwrite`는 target 데이터를 삭제하거나 덮어쓸 수 있으므로 처음 검증은 `skip`으로 시작하세요. `overwrite` DDL 실행 기록은 실제 덮어쓰기 후보에 한해 리포트 디렉터리의 `overwrite-audit.sqlite`에 남습니다.
 
 ## 운영 기준 동기화
 
@@ -216,10 +216,12 @@ migration:
   throttle_sleep_ms: 0
 ```
 
-`sync` 정책은 source에 있는 row는 target에 upsert하고, source에 없는 target row는 삭제합니다. 즉 source가 SSOT이며, target의 불일치 데이터는 source 기준으로 정정됩니다.
+`sync` 정책은 source 선택 범위를 SSOT로 보고 target을 맞춥니다. source에만 있는 table은 생성 후 적재하고, source/target 공통 table은 source row를 upsert한 뒤 source에 없는 target row를 삭제합니다. 전체 table 실행에서는 source에 없는 target-only table도 drop 후보가 됩니다.
 
 주의사항:
 - `sync`는 PK 또는 unique key가 있는 table에서만 실행됩니다. key가 없으면 row identity를 안정적으로 판단할 수 없어 실패 처리합니다.
+- 선택 table 실행에서는 선택 범위 밖 target table을 drop하지 않습니다.
+- target-only table drop 후보가 선택 범위 밖 FK에서 참조되면 drop을 실행하지 않고 blocked 결과로 남깁니다.
 - target 삭제가 포함되는 destructive 정책입니다. 운영 target에서는 dry-run 리포트와 safety 설정을 먼저 확인하세요.
 - table 내부 batch는 병렬화하지 않습니다. `parallel_table_count`는 table 단위 병렬 처리만 수행해 checkpoint 순서를 단순하게 유지합니다.
 - `throttle_sleep_ms`가 0보다 크면 batch commit 후 지정 시간만큼 대기해 source/target 부하를 낮춥니다.

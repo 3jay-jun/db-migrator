@@ -25,6 +25,7 @@ class SafetyGuardInput:
     table_count: int
     estimated_rows: int | None
     dry_run_report_exists: bool
+    destructive_table_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,7 @@ class TargetSafetyGuard:
         if _has_production_keyword(guard_input.target):
             warnings.append(SafetyRiskCode.PRODUCTION_KEYWORD_DETECTED.value)
 
-        if not _is_destructive_policy(guard_input.existing_table_policy):
+        if not _has_destructive_work(guard_input):
             return SafetyDecision(status=SafetyDecisionStatus.ALLOWED, warnings=tuple(warnings))
 
         is_production = guard_input.target.environment is TargetEnvironment.PRODUCTION
@@ -74,6 +75,12 @@ def _is_destructive_policy(existing_table_policy: ExistingTablePolicy) -> bool:
         ExistingTablePolicy.TRUNCATE_RELOAD,
         ExistingTablePolicy.OVERWRITE,
     }
+
+
+def _has_destructive_work(guard_input: SafetyGuardInput) -> bool:
+    if guard_input.destructive_table_count is not None:
+        return guard_input.destructive_table_count > 0
+    return _is_destructive_policy(guard_input.existing_table_policy)
 
 
 def _has_production_keyword(target: TargetConfig) -> bool:

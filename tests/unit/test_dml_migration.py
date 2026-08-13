@@ -405,21 +405,21 @@ def test_migrate_tables_reruns_completed_checkpoint_when_target_is_empty(tmp_pat
     assert stale_events[0].message.startswith("Checkpoint stale: users.")
 
 
-def test_append_mode_blocks_existing_target_rows(tmp_path) -> None:
+def test_append_policy_writes_filtered_tables_without_target_row_preflight(tmp_path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     users = next(table for table in snapshot.tables if table.ref.name == "users")
 
     result = migrate_tables(
         job_id="job-1",
         tables=(users,),
-        source=FakeSourceReader({"users": []}),
+        source=FakeSourceReader({"users": [{"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"}]}),
         target=FakeTargetWriter(existing_rows={"users": 1}),
         checkpoint_store=CheckpointStore(tmp_path / "checkpoint.sqlite"),
         event_publisher=QueueEventPublisher(Queue()),
         migration_config=MigrationConfig(existing_table_policy=ExistingTablePolicy.APPEND),
     )
 
-    assert result.tables[0].status == "blocked"
+    assert result.tables[0].status == "completed"
 
 
 def test_sync_policy_upserts_source_rows_and_deletes_target_rows_missing_from_source(tmp_path) -> None:

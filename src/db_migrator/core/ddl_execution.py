@@ -7,7 +7,11 @@ from typing import Protocol
 
 from db_migrator.adapters.mysql import ExecutionResult
 from db_migrator.adapters.registry import DbmsAdapterRegistry, default_adapter_registry
-from db_migrator.config.models import AppConfig, ExistingTablePolicy
+from db_migrator.config.models import AppConfig
+from db_migrator.core.existing_table_policy import (
+    ExistingTableExecutionPlan,
+    build_legacy_existing_table_execution_plan,
+)
 from db_migrator.core.overwrite_audit import OverwriteAuditStore
 from db_migrator.core.safety_guard import SafetyGuardInput, TargetSafetyGuard
 from db_migrator.schema.column_plan import ColumnPlan
@@ -61,16 +65,24 @@ def execute_schema_ddl(
     report_output_path: Path,
     registry: DbmsAdapterRegistry | None = None,
     column_plans: dict[TableRef, ColumnPlan] | None = None,
+    execution_plan: ExistingTableExecutionPlan | None = None,
 ) -> DdlExecutionSummary:
+    plan = execution_plan or _legacy_execution_plan(
+        snapshot=snapshot,
+        executor=executor,
+        config=config,
+        column_plans=column_plans,
+    )
     dry_run_report_exists = _dry_run_report_exists(config)
     guard_decision = TargetSafetyGuard().evaluate(
         SafetyGuardInput(
             target=config.target,
             safety=config.safety,
             existing_table_policy=config.migration.existing_table_policy,
-            table_count=len(snapshot.tables),
-            estimated_rows=sum(table.estimated_rows or 0 for table in snapshot.tables),
+            table_count=len(plan.ddl_items),
+            estimated_rows=sum(item.target_table.estimated_rows or 0 for item in plan.ddl_items),
             dry_run_report_exists=dry_run_report_exists,
+            destructive_table_count=plan.destructive_table_count,
         )
     )
 
@@ -88,29 +100,54 @@ def execute_schema_ddl(
     generator = adapter_registry.create_ddl_generator(config.target.dbms, target_database=config.target.database)
     audit_store = (
         OverwriteAuditStore(report_output_path.with_name("overwrite-audit.sqlite"))
-        if config.migration.existing_table_policy is ExistingTablePolicy.OVERWRITE
+        if plan.overwrite_candidates
         else None
     )
-    audit_run_id = audit_store.start_run(config=config, table_count=len(snapshot.tables)) if audit_store is not None else None
+    audit_run_id = audit_store.start_run(config=config, table_count=len(plan.overwrite_candidates)) if audit_store is not None else None
     table_results = []
     try:
-        for table in snapshot.tables:
-            table_exists = executor.table_exists(table)
-            if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.SKIP:
-                table_results.append(_skipped_table_result(table, "Target table already exists."))
+        for item in plan.ddl_items:
+            table = item.target_table
+            if item.action == "skip":
+                table_results.append(_skipped_table_result(table, item.message))
                 continue
 
-            if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.SYNC:
+            if item.action == "blocked":
+                table_results.append(
+                    DdlTableExecutionResult(
+                        schema=table.ref.schema,
+                        table=table.ref.name,
+                        action="blocked",
+                        success=False,
+                        message=item.message,
+                    )
+                )
+                continue
+
+            if item.action == "drop_target_only":
+                drop_result = executor.drop_table(table)
+                table_results.append(
+                    DdlTableExecutionResult(
+                        schema=table.ref.schema,
+                        table=table.ref.name,
+                        action="drop_target_only",
+                        success=drop_result.success,
+                        message=drop_result.message,
+                    )
+                )
+                continue
+
+            if item.action == "sync_existing":
                 table_results.append(
                     DdlTableExecutionResult(
                         schema=table.ref.schema,
                         table=table.ref.name,
                         action="sync_existing",
                         success=True,
-                        message="Target table already exists; CREATE skipped for sync policy.",
+                        message=item.message,
                     )
                 )
-                for ddl in _sync_alter_candidates(table, column_plans):
+                for ddl in _sync_alter_candidates(table, column_plans or plan.column_plans):
                     execution_result = executor.execute_ddl(ddl)
                     table_results.append(
                         DdlTableExecutionResult(
@@ -124,7 +161,7 @@ def execute_schema_ddl(
                     )
                 continue
 
-            if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.TRUNCATE_RELOAD:
+            if item.action == "truncate":
                 truncate_result = executor.truncate_table(table)
                 table_results.append(
                     DdlTableExecutionResult(
@@ -137,7 +174,7 @@ def execute_schema_ddl(
                 )
                 continue
 
-            if table_exists and config.migration.existing_table_policy is ExistingTablePolicy.OVERWRITE:
+            if item.action == "overwrite":
                 drop_result = executor.drop_table(table)
                 _record_overwrite_action(audit_store, audit_run_id, table=table, action="drop", result=drop_result)
                 table_results.append(
@@ -152,14 +189,15 @@ def execute_schema_ddl(
 
             ddl_result = generator.generate_create_table(table)
             execution_result = executor.execute_ddl(ddl_result.ddl)
-            _record_overwrite_action(
-                audit_store,
-                audit_run_id,
-                table=table,
-                action="create",
-                result=execution_result,
-                ddl=ddl_result.ddl,
-            )
+            if item.action == "overwrite":
+                _record_overwrite_action(
+                    audit_store,
+                    audit_run_id,
+                    table=table,
+                    action="create",
+                    result=execution_result,
+                    ddl=ddl_result.ddl,
+                )
             table_results.append(
                 DdlTableExecutionResult(
                     schema=table.ref.schema,
@@ -201,6 +239,22 @@ def _dry_run_report_exists(config: AppConfig) -> bool:
     if config.migration.dry_run_report_path is None:
         return False
     return Path(config.migration.dry_run_report_path).exists()
+
+
+def _legacy_execution_plan(
+    *,
+    snapshot: SchemaSnapshot,
+    executor: TargetDdlExecutor,
+    config: AppConfig,
+    column_plans: dict[TableRef, ColumnPlan] | None,
+) -> ExistingTableExecutionPlan:
+    target_exists = {table.ref: executor.table_exists(table) for table in snapshot.tables}
+    return build_legacy_existing_table_execution_plan(
+        tables=snapshot.tables,
+        policy=config.migration.existing_table_policy,
+        target_exists=target_exists,
+        column_plans=column_plans,
+    )
 
 
 def _skipped_table_result(table: TableSchema, message: str) -> DdlTableExecutionResult:

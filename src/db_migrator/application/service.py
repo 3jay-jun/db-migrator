@@ -20,6 +20,7 @@ from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_d
 from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables, stable_order_columns
 from db_migrator.core.engine import MigrationEngine
 from db_migrator.core.events import EventPublisher, MigrationEvent, QueueEventPublisher
+from db_migrator.core.existing_table_policy import build_existing_table_execution_plan
 from db_migrator.core.health import run_health_checks
 from db_migrator.core.incremental import migrate_incremental_tables
 from db_migrator.core.indexes import execute_index_ddls
@@ -286,22 +287,29 @@ class MigrationApplicationService:
                 target_scan_snapshot = self._load_target_snapshot(app_config, safety_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
                 schema_plan = self._resolve_schema_plan(safety_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
+                execution_plan = build_existing_table_execution_plan(
+                    schema_plan,
+                    safety_config.migration.existing_table_policy,
+                    include_target_only_sync=selected_tables is None,
+                )
                 resolved_output_file = output_file or Path(safety_config.report.output_dir) / "ddl-execution.json"
                 summary = execute_schema_ddl(
                     config=safety_config,
-                    snapshot=schema_plan.target_snapshot,
+                    snapshot=execution_plan.ddl_snapshot,
                     executor=runtime.target,
                     report_output_path=resolved_output_file,
                     registry=self._registry,
-                    column_plans=schema_plan.column_plans,
+                    column_plans=execution_plan.column_plans,
+                    execution_plan=execution_plan,
                 )
+            failed_count = sum(1 for table in summary.tables if not table.success)
             return CommandResult(
                 command="apply-ddl",
-                success=True,
-                message=f"ddl_execution_report={resolved_output_file} tables={len(summary.tables)} warnings={len(summary.warnings)}",
+                success=failed_count == 0,
+                message=f"ddl_execution_report={resolved_output_file} tables={len(summary.tables)} warnings={len(summary.warnings)} failed={failed_count}",
                 output_file=resolved_output_file,
                 table_count=len(summary.tables),
-                warning_count=len(summary.warnings),
+                warning_count=len(summary.warnings) + failed_count,
                 details={"allowed": summary.allowed, "blocking_reasons": summary.blocking_reasons},
             )
         except _KNOWN_ERRORS as exc:
@@ -639,24 +647,29 @@ class MigrationApplicationService:
                 target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
                 snapshot = _filter_snapshot(snapshot, selected_tables)
                 schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
-                target = ColumnPlanTargetAdapter(runtime.target, schema_plan.column_plans)
+                execution_plan = build_existing_table_execution_plan(
+                    schema_plan,
+                    original_config.migration.existing_table_policy,
+                    include_target_only_sync=selected_tables is None,
+                )
+                target = ColumnPlanTargetAdapter(runtime.target, execution_plan.column_plans)
                 resume_plan = None
                 if retry_failed_only is not None:
                     resume_plan = (
                         build_retry_failed_plan(original_config.job.name, checkpoint_store)
                         if retry_failed_only
-                        else build_resume_plan(original_config.job.name, snapshot.tables, checkpoint_store)
+                        else build_resume_plan(original_config.job.name, execution_plan.dml_source_tables, checkpoint_store)
                     )
                 result = migrate_tables(
                     job_id=original_config.job.name,
-                    tables=snapshot.tables,
+                    tables=execution_plan.dml_source_tables,
                     source=runtime.source,
                     target=target,
                     checkpoint_store=checkpoint_store,
                     event_publisher=event_publisher,
                     migration_config=original_config.migration,
                     resume_plan=resume_plan,
-                    column_plans=schema_plan.column_plans,
+                    column_plans=execution_plan.column_plans,
                 )
             return CommandResult(
                 command=command,

@@ -90,6 +90,23 @@ def test_execute_schema_ddl_skips_existing_table_when_policy_is_skip(tmp_path: P
     assert len(executor.executed_ddls) == 1
 
 
+def test_execute_schema_ddl_append_creates_only_missing_target_tables(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    executor = FakeDdlExecutor(existing_tables={"users"})
+
+    summary = execute_schema_ddl(
+        config=AppConfig(migration=MigrationConfig(existing_table_policy=ExistingTablePolicy.APPEND)),
+        snapshot=snapshot,
+        executor=executor,
+        report_output_path=tmp_path / "ddl-execution.json",
+    )
+
+    assert summary.tables[0].action == "skip"
+    assert "missing target tables" in summary.tables[0].message
+    assert len(executor.executed_ddls) == 1
+    assert "`orders`" in executor.executed_ddls[0]
+
+
 def test_execute_schema_ddl_skips_existing_table_when_policy_is_sync(tmp_path: Path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     executor = FakeDdlExecutor(existing_tables={"users"})
@@ -285,9 +302,10 @@ def test_execute_schema_ddl_overwrites_existing_table_and_writes_audit_log(tmp_p
     with sqlite3.connect(tmp_path / "overwrite-audit.sqlite") as connection:
         runs = connection.execute("select job_id, status, table_count from overwrite_runs").fetchall()
         actions = connection.execute("select source_table, action, status from overwrite_table_actions").fetchall()
-    assert runs == [("db-migration-job", "completed", 2)]
+    assert runs == [("db-migration-job", "completed", 1)]
     assert ("users", "drop", "completed") in actions
     assert ("users", "create", "completed") in actions
+    assert ("orders", "create", "completed") not in actions
 
 
 def test_execute_schema_ddl_never_applies_foreign_keys_even_when_enabled(tmp_path: Path) -> None:

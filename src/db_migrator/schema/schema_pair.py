@@ -29,6 +29,7 @@ class ResolvedTablePair:
 @dataclass(frozen=True)
 class SchemaPairPlan:
     pairs: tuple[ResolvedTablePair, ...]
+    target_only_tables: tuple[TableSchema, ...] = ()
 
     @property
     def source_snapshot(self) -> SchemaSnapshot:
@@ -70,7 +71,13 @@ class SchemaPairResolver:
                     column_plan=build_column_plan(config=self._config, source_table=source_table, target_table=target_table),
                 )
             )
-        return SchemaPairPlan(pairs=tuple(pairs))
+        matched_target_keys = {_table_key(pair.target_table.ref) for pair in pairs}
+        target_only_tables = tuple(
+            table
+            for key, table in sorted(target_tables.items(), key=lambda item: item[0])
+            if key not in matched_target_keys
+        )
+        return SchemaPairPlan(pairs=tuple(pairs), target_only_tables=target_only_tables)
 
     def _mapped_target_table(self, source_table: TableSchema) -> TableSchema:
         mapped = self._table_mapping.target_schema_for(source_table)

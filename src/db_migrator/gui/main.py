@@ -108,8 +108,8 @@ if Signal is not None:
         ExistingTablePolicy.OVERWRITE,
     )
     EXISTING_TABLE_POLICY_LABELS = {
-        ExistingTablePolicy.SKIP: "건너뛰기",
-        ExistingTablePolicy.APPEND: "추가 적재",
+        ExistingTablePolicy.SKIP: "덮어쓰기",
+        ExistingTablePolicy.APPEND: "추가",
         ExistingTablePolicy.SYNC: "동기화",
         ExistingTablePolicy.OVERWRITE: "덮어쓰기",
     }
@@ -1501,10 +1501,17 @@ if Signal is not None:
             except ConfigLoadError as exc:
                 QMessageBox.warning(self, "설정 오류", str(exc))
                 return False
+            destructive_candidate_count = None
             if app_config.migration.existing_table_policy is ExistingTablePolicy.OVERWRITE:
-                if not self._confirm_overwrite_operation(operation, app_config):
+                overwrite_candidates = self._selected_existing_target_tables()
+                destructive_candidate_count = len(overwrite_candidates)
+                if overwrite_candidates and not self._confirm_overwrite_operation(operation, app_config, overwrite_candidates):
                     return False
-            gate = evaluate_dry_run_gate(app_config, self._last_dry_run_report)
+            gate = evaluate_dry_run_gate(
+                app_config,
+                self._last_dry_run_report,
+                destructive_candidate_count=destructive_candidate_count,
+            )
             if not gate.allowed:
                 QMessageBox.warning(self, "검토 실행 필요", gate.message)
                 return False
@@ -1529,22 +1536,36 @@ if Signal is not None:
         def _selected_migration_mode(self) -> MigrationMode:
             return GUI_MIGRATION_MODES_BY_LABEL.get(self.migration_mode.currentText(), MigrationMode.DDL_AND_DML)
 
-        def _confirm_overwrite_operation(self, operation: str, app_config: AppConfig) -> bool:
-            selected = sorted(self._selected_tables() or [])
-            table_lines = "\n".join(selected[:20])
-            if len(selected) > 20:
-                table_lines += f"\n... 외 {len(selected) - 20}개"
+        def _confirm_overwrite_operation(self, operation: str, app_config: AppConfig, candidates: tuple[str, ...]) -> bool:
+            table_lines = "\n".join(candidates[:20])
+            if len(candidates) > 20:
+                table_lines += f"\n... 외 {len(candidates) - 20}개"
             warning = (
                 f"{operation}은 overwrite 정책으로 실행됩니다.\n\n"
-                "대상 DB의 기존 테이블이 삭제되고 다시 생성될 수 있습니다.\n"
+                "아래 대상 DB 기존 테이블이 삭제되고 다시 생성될 수 있습니다.\n"
                 "이 작업은 target 데이터를 잃게 만들 수 있으며 자동 백업 테이블은 아직 생성하지 않습니다.\n"
                 "실행 기록은 overwrite-audit.sqlite에 남습니다.\n\n"
                 f"대상 DB: {app_config.target.host}/{app_config.target.database}\n"
-                f"대상 테이블:\n{table_lines}\n\n"
+                f"덮어쓰기 대상 테이블:\n{table_lines}\n\n"
                 "계속하려면 OVERWRITE를 입력하세요."
             )
             entered, ok = QInputDialog.getText(self, "Overwrite 확인", warning)
             return ok and entered == "OVERWRITE"
+
+        def _selected_existing_target_tables(self) -> tuple[str, ...]:
+            selected: list[str] = []
+            config = self._current_form_config()
+            for index in range(self.table_list.count()):
+                item = self.table_list.item(index)
+                if not bool(item.data(TABLE_SELECTED_ROLE)):
+                    continue
+                identifier = str(item.data(TABLE_ID_ROLE))
+                source_schema, source_table = identifier.rsplit(".", 1)
+                target_schema = str(item.data(TARGET_SCHEMA_ROLE) or _default_target_schema_name(config, source_schema))
+                target_table = str(item.data(TARGET_TABLE_ROLE) or source_table)
+                if _is_existing_target_table(self._target_table_options, target_schema, target_table, self._last_dry_run_tables.get(identifier, {})):
+                    selected.append(f"{target_schema}.{target_table}")
+            return tuple(sorted(selected))
 
         def _ensure_tables_selected(self) -> bool:
             if self.table_list.count() > 0 and not self._selected_tables():

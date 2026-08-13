@@ -534,16 +534,9 @@ def _preflight_table_result(
     checkpoint = checkpoint_store.latest_checkpoint_for_table(job_id, table.ref)
     if migration_config.existing_table_policy is ExistingTablePolicy.APPEND:
         if checkpoint is not None:
-            message = "Append mode blocked because this job already has checkpoints for the table."
-            event_publisher.publish(_table_failed_event(job_id, table, message))
-            return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
-        count_rows = getattr(target, "count_rows", None)
-        if callable(count_rows):
-            target_rows = count_rows(table.ref)
-            if target_rows > 0:
-                message = f"Append mode blocked because target table already has {target_rows} rows."
-                event_publisher.publish(_table_failed_event(job_id, table, message))
-                return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
+            message = "Append policy skipped this table because this job already has checkpoints for it."
+            event_publisher.publish(_table_skipped_event(job_id, table, message, status="append_checkpoint_exists"))
+            return TableMigrationResult(table=table.ref, status="skipped", rows_written=0, batches_written=0, message=message)
 
     if (
         resume_plan is None

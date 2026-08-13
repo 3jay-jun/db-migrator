@@ -144,6 +144,156 @@ safety:
     assert result.table_count == 2
 
 
+def test_service_append_policy_apply_ddl_creates_only_missing_target_tables(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "users", ("id",)),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: append
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json")
+
+    assert result.success is True
+    assert registry.target.executed_ddls == ["CREATE TABLE `target_db`.`orders` (`id` int)"]
+
+
+def test_service_append_policy_migrate_data_writes_only_missing_target_tables(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.target_schema_source.snapshot = SchemaSnapshot(tables=(_table_with_columns("target_db", "users", ("id",)),))
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: append
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+    )
+
+    assert result.success is True
+    assert registry.source.read_tables == [TableRef(schema="public", name="orders")]
+    assert registry.target.written_tables == [TableRef(schema="target_db", name="orders")]
+
+
+def test_service_sync_policy_apply_ddl_drops_target_only_tables_for_full_scope(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    child = _table_with_columns("target_db", "zzz_child", ("id", "parent_id"))
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(
+            _table_with_columns("target_db", "users", ("id",)),
+            _table_with_columns("target_db", "aaa_parent", ("id",)),
+            TableSchema(
+                ref=child.ref,
+                primary_key=child.primary_key,
+                columns=child.columns,
+                foreign_keys=(
+                    ForeignKeySchema(
+                        name="zzz_child_parent_id_fkey",
+                        columns=("parent_id",),
+                        referenced_table=TableRef(schema="target_db", name="aaa_parent"),
+                        referenced_columns=("id",),
+                    ),
+                ),
+            ),
+        )
+    )
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json")
+
+    assert result.success is True
+    assert registry.target.dropped_tables == [
+        TableRef(schema="target_db", name="zzz_child"),
+        TableRef(schema="target_db", name="aaa_parent"),
+    ]
+    assert registry.target.executed_ddls == ["CREATE TABLE `target_db`.`orders` (`id` int)"]
+
+
+def test_service_sync_policy_selected_tables_do_not_drop_target_tables_outside_scope(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(
+            _table_with_columns("target_db", "users", ("id",)),
+            _table_with_columns("target_db", "legacy_logs", ("id",)),
+        )
+    )
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+""",
+    )
+
+    result = service.run_apply_ddl(
+        config=config_path,
+        output_file=tmp_path / "ddl-execution.json",
+        selected_tables={"public.users"},
+    )
+
+    assert result.success is True
+    assert registry.target.dropped_tables == []
+    assert registry.target.executed_ddls == []
+
+
+def test_service_sync_policy_blocks_target_only_drop_referenced_by_kept_table(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    users = _table_with_columns("target_db", "users", ("id", "legacy_id"))
+    registry.target_schema_source.snapshot = SchemaSnapshot(
+        tables=(
+            TableSchema(
+                ref=users.ref,
+                primary_key=users.primary_key,
+                columns=users.columns,
+                foreign_keys=(
+                    ForeignKeySchema(
+                        name="users_legacy_id_fkey",
+                        columns=("legacy_id",),
+                        referenced_table=TableRef(schema="target_db", name="legacy_lookup"),
+                        referenced_columns=("id",),
+                    ),
+                ),
+            ),
+            _table_with_columns("target_db", "legacy_lookup", ("id",)),
+        )
+    )
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  existing_table_policy: sync
+""",
+    )
+
+    result = service.run_apply_ddl(config=config_path, output_file=tmp_path / "ddl-execution.json")
+
+    assert result.success is False
+    assert registry.target.dropped_tables == []
+    payload = json.loads((tmp_path / "ddl-execution.json").read_text(encoding="utf-8"))
+    blocked = [table for table in payload["tables"] if table["action"] == "blocked"]
+    assert blocked[0]["table"] == "legacy_lookup"
+    assert "users_legacy_id_fkey" in blocked[0]["message"]
+
+
 def test_service_apply_indexes_executes_post_data_auto_candidates(tmp_path: Path) -> None:
     registry = FakeRegistry()
     service = MigrationApplicationService(registry)
@@ -783,6 +933,7 @@ class FakeAdapter:
         self.snapshot = _snapshot()
         self.existing_tables: set[str] = set()
         self.executed_ddls: list[str] = []
+        self.dropped_tables: list[TableRef] = []
         self.read_tables: list[TableRef] = []
         self.read_columns: list[tuple[str, ...]] = []
         self.sample_columns: list[tuple[str, ...]] = []
@@ -815,6 +966,7 @@ class FakeAdapter:
     def drop_table(self, _table_schema: TableSchema):
         from db_migrator.adapters.base import ExecutionResult
 
+        self.dropped_tables.append(_table_schema.ref)
         return ExecutionResult(success=True, message="ok")
 
     def read_rows(self, table: TableRef, _columns, _cursor, _batch_size, _order_by):

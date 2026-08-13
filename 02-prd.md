@@ -457,9 +457,9 @@ Checksum Sample Verification은 단순 row count 비교로 발견하기 어려�
 - 선택 테이블
 - 기간별 조건 이관
 - truncate 후 재적재
-- append
+- target에 없는 테이블만 추가 적재
 - upsert(v1.1)
-- 기존 테이블 있으면 skip
+- 기존 테이블은 DDL만 건너뛰고 데이터 적재
 - batch size
 - commit interval
 - parallel table count

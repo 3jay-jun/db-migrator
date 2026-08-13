@@ -661,13 +661,16 @@ truncate/reload:
 
 ### 15.1 대상 테이블이 이미 존재하는 경우
 
-- 기본값: `skip + compare report`
+- 기본값: `skip`
 - 옵션:
-  - append
+  - skip: target 기존 테이블은 DDL만 건너뛰고 DML은 실행한다. target에 없는 source 테이블은 생성 후 적재한다.
+  - append: source에는 있고 target에는 없는 테이블만 생성 후 적재한다. source/target 공통 테이블은 DDL/DML 모두 건너뛴다.
+  - sync: source 선택 범위를 기준으로 source-only table은 생성/적재하고, 공통 table은 PK/unique key 기준 upsert 후 source에 없는 target row를 삭제한다. 전체 table 실행에서는 source에 없는 target-only table을 drop 후보로 처리하되, 선택 table 실행에서는 선택 범위 밖 target table을 삭제하지 않는다.
   - truncate_reload
   - upsert(v1.1)
+  - overwrite: source/target 공통 테이블만 drop 후 source DDL로 재생성한다. target에 없는 source 테이블은 일반 생성이며 overwrite 확인 대상이 아니다.
   - compare_only
-- production에서 truncate/drop/overwrite는 Safety Guard 대상이다.
+- production에서 실제 truncate/drop/overwrite/delete 후보가 있으면 Safety Guard 대상이다.
 
 ### 15.2 PK 없는 테이블
 

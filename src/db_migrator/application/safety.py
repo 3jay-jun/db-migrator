@@ -20,10 +20,20 @@ DESTRUCTIVE_POLICIES = {
 }
 
 
-def evaluate_dry_run_gate(config: AppConfig, dry_run_report_path: Path | None) -> DryRunGateDecision:
+def evaluate_dry_run_gate(
+    config: AppConfig,
+    dry_run_report_path: Path | None,
+    *,
+    destructive_candidate_count: int | None = None,
+) -> DryRunGateDecision:
     """Return whether a GUI-triggered write operation can run after dry-run review."""
+    has_destructive_policy = (
+        destructive_candidate_count > 0
+        if destructive_candidate_count is not None
+        else config.migration.existing_table_policy in DESTRUCTIVE_POLICIES
+    )
     requires_dry_run = (
-        config.migration.existing_table_policy in DESTRUCTIVE_POLICIES
+        has_destructive_policy
         or config.target.environment is TargetEnvironment.PRODUCTION
     )
     if not requires_dry_run:
