@@ -755,9 +755,9 @@ def _warning_action(normalized_message: str) -> str:
     if "uuid" in normalized_message:
         return "UUID 저장에 char(36)이 적합한지 확인하고 primary key/index 크기와 성능 영향을 검토하세요."
     if "generated column" in normalized_message:
-        return "apply-ddl 실행 전에 generated column 표현식을 MySQL/MariaDB 기준으로 재작성하고 테스트하세요."
+        return "테이블 생성 SQL 실행 전에 generated column 표현식을 MySQL/MariaDB 기준으로 재작성하고 테스트하세요."
     if "array" in normalized_message:
-        return "apply-ddl 실행 전에 JSON text 또는 child table 등 명시적인 target 모델을 결정하세요."
+        return "테이블 생성 SQL 실행 전에 JSON text 또는 child table 등 명시적인 대상 모델을 결정하세요."
     if "offset resume only" in normalized_message:
         return "resume/retry 안정성을 높이려면 기본키 또는 unique index 추가 가능 여부를 검토하세요."
     if "source-only column selected as alter candidate" in normalized_message:
@@ -769,8 +769,8 @@ def _warning_action(normalized_message: str) -> str:
     if "unresolved target column" in normalized_message:
         return "target 필수 컬럼을 채울 source/default/null mapping을 config에 추가하세요."
     if "requires manual review" in normalized_message:
-        return "apply-ddl 실행 전에 명시적인 타입 매핑 또는 custom migration rule을 정의하세요."
-    return "apply-ddl 실행 전에 생성된 DDL과 애플리케이션 동작 영향을 검토하세요."
+        return "테이블 생성 SQL 실행 전에 명시적인 타입 매핑 또는 별도 이관 규칙을 정의하세요."
+    return "테이블 생성 SQL 실행 전에 생성된 SQL과 애플리케이션 동작 영향을 검토하세요."
 
 
 def _manual_review_object_count(report: DryRunReport) -> int:

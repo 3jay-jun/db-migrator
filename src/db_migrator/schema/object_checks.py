@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from db_migrator.config.models import Dbms
-from db_migrator.schema.models import IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.models import ForeignKeySchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
 
 
 @dataclass(frozen=True)
@@ -38,9 +38,18 @@ def build_index_plan(snapshot: SchemaSnapshot, *, target_dbms: Dbms) -> tuple[In
 
 
 def compare_schema_objects(source: SchemaSnapshot, target: SchemaSnapshot) -> tuple[SchemaObjectComparison, ...]:
+    comparisons = list(_compare_auto_increment_columns(source, target))
+
     source_indexes = {_index_key(table.ref, index): (table.ref, index) for table in source.tables for index in table.indexes}
     target_indexes = {_index_key(table.ref, index): (table.ref, index) for table in target.tables for index in table.indexes}
-    comparisons = [_compare_index(key, source_indexes.get(key), target_indexes.get(key)) for key in sorted(set(source_indexes) | set(target_indexes))]
+    comparisons.extend(_compare_index(key, source_indexes.get(key), target_indexes.get(key)) for key in sorted(set(source_indexes) | set(target_indexes)))
+
+    source_foreign_keys = {_foreign_key_key(table.ref, foreign_key): (table.ref, foreign_key) for table in source.tables for foreign_key in table.foreign_keys}
+    target_foreign_keys = {_foreign_key_key(table.ref, foreign_key): (table.ref, foreign_key) for table in target.tables for foreign_key in table.foreign_keys}
+    comparisons.extend(
+        _compare_foreign_key(key, source_foreign_keys.get(key), target_foreign_keys.get(key))
+        for key in sorted(set(source_foreign_keys) | set(target_foreign_keys))
+    )
 
     source_objects = {_object_key(schema_object): schema_object for schema_object in source.non_table_objects}
     target_objects = {_object_key(schema_object): schema_object for schema_object in target.non_table_objects}
@@ -49,6 +58,54 @@ def compare_schema_objects(source: SchemaSnapshot, target: SchemaSnapshot) -> tu
         for key in sorted(set(source_objects) | set(target_objects))
     )
     return tuple(comparison for comparison in comparisons if comparison is not None)
+
+
+def _compare_auto_increment_columns(source: SchemaSnapshot, target: SchemaSnapshot) -> tuple[SchemaObjectComparison, ...]:
+    target_tables = {(table.ref.schema, table.ref.name): table for table in target.tables}
+    comparisons: list[SchemaObjectComparison] = []
+    for source_table in source.tables:
+        target_table = target_tables.get((source_table.ref.schema, source_table.ref.name))
+        target_columns = {column.name: column for column in target_table.columns} if target_table is not None else {}
+        for source_column in source_table.columns:
+            if not source_column.auto_increment:
+                continue
+            target_column = target_columns.get(source_column.name)
+            object_name = f"{source_table.ref.schema}.{source_table.ref.name}.{source_column.name}"
+            if target_column is None:
+                comparisons.append(
+                    SchemaObjectComparison(
+                        object_type="컬럼 속성",
+                        object_name=object_name,
+                        status="missing",
+                        source_detail="원본 자동증가",
+                        target_detail="-",
+                        action="대상 테이블/컬럼이 없거나 이름 매핑이 다릅니다. 테이블 생성 SQL과 컬럼 매핑을 확인하세요.",
+                    )
+                )
+                continue
+            if target_column.auto_increment:
+                comparisons.append(
+                    SchemaObjectComparison(
+                        object_type="컬럼 속성",
+                        object_name=object_name,
+                        status="matched",
+                        source_detail="원본 자동증가",
+                        target_detail="AUTO_INCREMENT",
+                        action="추가 조치가 필요하지 않습니다.",
+                    )
+                )
+                continue
+            comparisons.append(
+                SchemaObjectComparison(
+                    object_type="컬럼 속성",
+                    object_name=object_name,
+                    status="mismatched",
+                    source_detail="원본 자동증가",
+                    target_detail="AUTO_INCREMENT 누락",
+                    action="대상 컬럼에 AUTO_INCREMENT가 누락되었습니다. ALTER TABLE ... MODIFY ... AUTO_INCREMENT 적용 또는 테이블 생성 SQL 재생성을 검토하세요.",
+                )
+            )
+    return tuple(comparisons)
 
 
 def _build_index_plan_item(table: TableSchema, index: IndexSchema, *, target_dbms: Dbms) -> IndexPlanItem:
@@ -136,6 +193,55 @@ def _compare_index(
     )
 
 
+def _compare_foreign_key(
+    key: tuple[str, str, str],
+    source_item: tuple[TableRef, ForeignKeySchema] | None,
+    target_item: tuple[TableRef, ForeignKeySchema] | None,
+) -> SchemaObjectComparison | None:
+    if source_item is None and target_item is None:
+        return None
+    if source_item is None:
+        target_ref, target_foreign_key = target_item or (TableRef("", ""), ForeignKeySchema("", (), TableRef("", ""), ()))
+        return SchemaObjectComparison(
+            object_type="FK",
+            object_name=_foreign_key_label(target_ref, target_foreign_key),
+            status="target_only",
+            source_detail="-",
+            target_detail=_foreign_key_detail(target_foreign_key),
+            action="source에 없는 target FK입니다. 기존 target 잔여 제약인지 확인하세요.",
+        )
+    if target_item is None:
+        source_ref, source_foreign_key = source_item
+        return SchemaObjectComparison(
+            object_type="FK",
+            object_name=_foreign_key_label(source_ref, source_foreign_key),
+            status="missing",
+            source_detail=_foreign_key_detail(source_foreign_key),
+            target_detail="-",
+            action="apply-foreign-keys 실행 결과와 target 제약 조건을 확인하세요.",
+        )
+
+    source_ref, source_foreign_key = source_item
+    _, target_foreign_key = target_item
+    if _foreign_key_signature(source_foreign_key) == _foreign_key_signature(target_foreign_key):
+        return SchemaObjectComparison(
+            object_type="FK",
+            object_name=_foreign_key_label(source_ref, source_foreign_key),
+            status="matched",
+            source_detail=_foreign_key_detail(source_foreign_key),
+            target_detail=_foreign_key_detail(target_foreign_key),
+            action="추가 조치가 필요하지 않습니다.",
+        )
+    return SchemaObjectComparison(
+        object_type="FK",
+        object_name=_foreign_key_label(source_ref, source_foreign_key),
+        status="mismatched",
+        source_detail=_foreign_key_detail(source_foreign_key),
+        target_detail=_foreign_key_detail(target_foreign_key),
+        action="FK 컬럼, 참조 테이블, 참조 컬럼 순서를 source 기준과 맞춰 재검토하세요.",
+    )
+
+
 def _compare_schema_object(
     key: tuple[str, str, str],
     source_object: SchemaObjectSummary | None,
@@ -196,6 +302,10 @@ def _index_key(table: TableRef, index: IndexSchema) -> tuple[str, str, str]:
     return (table.schema, table.name, index.name)
 
 
+def _foreign_key_key(table: TableRef, foreign_key: ForeignKeySchema) -> tuple[str, str, str]:
+    return (table.schema, table.name, foreign_key.name)
+
+
 def _object_key(schema_object: SchemaObjectSummary) -> tuple[str, str, str]:
     return (schema_object.kind.value, schema_object.schema, schema_object.name)
 
@@ -212,6 +322,22 @@ def _index_detail(index: IndexSchema) -> str:
     unique = "unique" if index.unique else "non-unique"
     method = f", method={index.method}" if index.method else ""
     return f"{unique}, columns=({', '.join(index.columns)}){method}"
+
+
+def _foreign_key_signature(foreign_key: ForeignKeySchema) -> tuple[tuple[str, ...], tuple[str, str], tuple[str, ...]]:
+    return (foreign_key.columns, (foreign_key.referenced_table.schema, foreign_key.referenced_table.name), foreign_key.referenced_columns)
+
+
+def _foreign_key_label(table: TableRef, foreign_key: ForeignKeySchema) -> str:
+    return f"{table.schema}.{table.name}.{foreign_key.name}"
+
+
+def _foreign_key_detail(foreign_key: ForeignKeySchema) -> str:
+    referenced_table = f"{foreign_key.referenced_table.schema}.{foreign_key.referenced_table.name}"
+    return (
+        f"columns=({', '.join(foreign_key.columns)}), "
+        f"references={referenced_table}({', '.join(foreign_key.referenced_columns)})"
+    )
 
 
 def _object_type_label(kind: SchemaObjectKind) -> str:

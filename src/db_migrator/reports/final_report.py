@@ -18,6 +18,7 @@ def write_validation_report(report: ValidationReport, output_dir: Path) -> None:
     _write_errors(report, output_dir / "errors.csv")
     _write_differences(report, output_dir / "differences.csv")
     _write_schema_objects(report, output_dir / "schema-objects.csv")
+    _write_execution_artifacts(report, output_dir / "execution-artifacts.csv")
 
 
 def _write_json(report: ValidationReport, output_path: Path) -> None:
@@ -88,6 +89,13 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
         issue_rows = """
           <tr>
             <td colspan="6" class="empty-state">테이블 관련 이슈 및 조치사항이 없습니다.</td>
+          </tr>
+        """
+    execution_artifact_rows = "\n".join(_execution_artifact_row(artifact) for artifact in report.execution_artifacts)
+    if not execution_artifact_rows:
+        execution_artifact_rows = """
+          <tr>
+            <td colspan="7" class="empty-state">확인된 DDL/인덱스/FK 실행 산출물이 없습니다.</td>
           </tr>
         """
     table_summary_rows = "\n".join(_table_summary_row(table) for table in report.tables)
@@ -450,6 +458,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
         <div class="metric"><span>총 이관 수</span><strong>{_format_optional_int(summary["total_target_rows"])}</strong></div>
         <div class="metric"><span>이슈 테이블 수</span><strong>{_issue_count(report)}</strong></div>
         <div class="metric"><span>스키마 객체 이슈 수</span><strong>{summary["schema_object_issue_count"]}</strong></div>
+        <div class="metric"><span>실행 산출물 수</span><strong>{summary["execution_artifact_count"]}</strong></div>
       </div>
     </header>
 
@@ -506,7 +515,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
 
     <section>
       <h2>스키마 객체 검증</h2>
-      <p>이관 후 대상의 인덱스, 함수, 트리거, 뷰 존재 여부와 인덱스 정의 차이를 확인합니다.</p>
+      <p>이관 후 대상의 인덱스, FK, 자동증가 속성, 함수, 트리거, 뷰 존재 여부와 정의 차이를 확인합니다.</p>
       <table>
         <thead>
           <tr>
@@ -520,6 +529,27 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
         </thead>
         <tbody>
 {schema_object_rows}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>실행 산출물</h2>
+      <p>apply-ddl, apply-indexes, apply-foreign-keys 단계에서 남긴 실제 실행 DDL과 결과 요약입니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 10%;">유형</th>
+            <th style="width: 20%;">객체명</th>
+            <th style="width: 10%;">작업</th>
+            <th style="width: 10%;">결과</th>
+            <th style="width: 18%;">메시지</th>
+            <th style="width: 20%;">DDL</th>
+            <th style="width: 12%;">원본 파일</th>
+          </tr>
+        </thead>
+        <tbody>
+{execution_artifact_rows}
         </tbody>
       </table>
     </section>
@@ -626,6 +656,8 @@ def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
         "total_matched_sample_count": sum(int(metric["matched_sample_count"]) for metric in table_metrics),
         "schema_object_count": len(report.schema_objects),
         "schema_object_issue_count": sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status)),
+        "execution_artifact_count": len(report.execution_artifacts),
+        "failed_execution_artifact_count": sum(1 for artifact in report.execution_artifacts if not artifact.success),
     }
 
 
@@ -738,6 +770,24 @@ def _write_schema_objects(report: ValidationReport, output_path: Path) -> None:
             )
 
 
+def _write_execution_artifacts(report: ValidationReport, output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["유형", "객체명", "작업", "성공여부", "메시지", "DDL", "원본파일"])
+        for artifact in report.execution_artifacts:
+            writer.writerow(
+                [
+                    artifact.artifact_type,
+                    artifact.object_name,
+                    artifact.action,
+                    artifact.success,
+                    artifact.message,
+                    artifact.ddl,
+                    artifact.source_file,
+                ]
+            )
+
+
 def _issue_count(report: ValidationReport) -> int:
     return sum(1 for table in report.tables if table.status != ValidationStatus.MATCHED)
 
@@ -812,6 +862,21 @@ def _schema_object_row(schema_object) -> str:
             <td>{escape(schema_object.source_detail)}</td>
             <td>{escape(schema_object.target_detail)}</td>
             <td class="action">{escape(schema_object.action)}</td>
+          </tr>
+    """
+
+
+def _execution_artifact_row(artifact) -> str:
+    status = "matched" if artifact.success else "failed"
+    return f"""
+          <tr>
+            <td>{escape(artifact.artifact_type)}</td>
+            <td class="message">{escape(artifact.object_name)}</td>
+            <td>{escape(artifact.action)}</td>
+            <td><span class="badge {status}">{escape("성공" if artifact.success else "실패")}</span></td>
+            <td>{escape(artifact.message)}</td>
+            <td><code>{escape(artifact.ddl or "-")}</code></td>
+            <td>{escape(artifact.source_file)}</td>
           </tr>
     """
 

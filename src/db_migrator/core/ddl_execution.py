@@ -8,7 +8,6 @@ from typing import Protocol
 from db_migrator.adapters.mysql import ExecutionResult
 from db_migrator.adapters.registry import DbmsAdapterRegistry, default_adapter_registry
 from db_migrator.config.models import AppConfig, ExistingTablePolicy
-from db_migrator.core.foreign_keys import generate_foreign_key_ddls
 from db_migrator.core.overwrite_audit import OverwriteAuditStore
 from db_migrator.core.safety_guard import SafetyGuardInput, TargetSafetyGuard
 from db_migrator.schema.column_plan import ColumnPlan
@@ -176,14 +175,12 @@ def execute_schema_ddl(
             audit_store.finish_run(audit_run_id, status="failed", message=str(exc))
         raise
 
-    foreign_key_results = _execute_foreign_key_ddls(config=config, snapshot=snapshot, executor=executor)
-
     summary = DdlExecutionSummary(
         allowed=True,
         blocking_reasons=(),
         warnings=guard_decision.warnings,
         tables=tuple(table_results),
-        foreign_keys=foreign_key_results,
+        foreign_keys=(),
     )
     write_ddl_execution_summary(summary, report_output_path)
     if audit_store is not None and audit_run_id is not None:
@@ -198,45 +195,6 @@ def write_ddl_execution_summary(summary: DdlExecutionSummary, report_output_path
         json.dumps(asdict(summary), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
-
-def _execute_foreign_key_ddls(
-    *,
-    config: AppConfig,
-    snapshot: SchemaSnapshot,
-    executor: TargetDdlExecutor,
-) -> tuple[DdlTableExecutionResult, ...]:
-    if not config.migration.apply_foreign_keys:
-        return ()
-    if config.migration.existing_table_policy is ExistingTablePolicy.SYNC:
-        return ()
-
-    results: list[DdlTableExecutionResult] = []
-    for foreign_key_ddl in generate_foreign_key_ddls(snapshot, target_dbms=config.target.dbms):
-        try:
-            execution_result = executor.execute_ddl(foreign_key_ddl.ddl)
-            results.append(
-                DdlTableExecutionResult(
-                    schema="",
-                    table=foreign_key_ddl.table,
-                    action="add_foreign_key",
-                    success=execution_result.success,
-                    message=execution_result.message,
-                    ddl=foreign_key_ddl.ddl,
-                )
-            )
-        except Exception as exc:
-            results.append(
-                DdlTableExecutionResult(
-                    schema="",
-                    table=foreign_key_ddl.table,
-                    action="add_foreign_key",
-                    success=False,
-                    message=str(exc),
-                    ddl=foreign_key_ddl.ddl,
-                )
-            )
-    return tuple(results)
 
 
 def _dry_run_report_exists(config: AppConfig) -> bool:

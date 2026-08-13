@@ -337,7 +337,7 @@ if Signal is not None:
             form = QFormLayout(group)
             self.migration_mode = _combo(list(GUI_MIGRATION_MODES_BY_LABEL))
             self.existing_table_policy = _policy_combo()
-            self.apply_foreign_keys = QCheckBox("테이블 생성 후 외래키 적용")
+            self.apply_foreign_keys = QCheckBox("데이터 이관 후 외래키 적용")
             self.migration_mode.currentTextChanged.connect(self._sync_foreign_key_option)
             self.apply_foreign_keys.toggled.connect(self._remember_manual_foreign_key_option)
             self.batch_size = _spin(1, 10_000_000)
@@ -648,6 +648,14 @@ if Signal is not None:
             )
             if not data_result.success:
                 return data_result
+            foreign_key_result = self._service.run_apply_foreign_keys(
+                config=config,
+                schema_file=schema_file,
+                output_file=output_dir / "foreign-key-execution.json",
+                selected_tables=selected_tables,
+            )
+            if not foreign_key_result.success:
+                return foreign_key_result
             post_index_result = self._service.run_apply_indexes(
                 config=config,
                 schema_file=schema_file,
@@ -1087,12 +1095,12 @@ if Signal is not None:
                 if mode == "기본 이관":
                     self.apply_foreign_keys.setChecked(True)
                     self.apply_foreign_keys.setEnabled(False)
-                    self.apply_foreign_keys.setToolTip("기본 이관은 테이블 생성 후 외래키를 자동 적용합니다.")
+                    self.apply_foreign_keys.setToolTip("기본 이관은 데이터 이관 성공 후 외래키를 자동 적용합니다.")
                     return
                 if mode == "테이블 이관":
                     self.apply_foreign_keys.setEnabled(True)
                     self.apply_foreign_keys.setChecked(self._manual_apply_foreign_keys)
-                    self.apply_foreign_keys.setToolTip("필요한 경우 테이블 생성 이후 외래키 DDL을 함께 적용합니다.")
+                    self.apply_foreign_keys.setToolTip("필요한 경우 데이터 이관 이후 외래키 DDL을 함께 적용합니다.")
                     return
                 self.apply_foreign_keys.setChecked(False)
                 self.apply_foreign_keys.setEnabled(False)

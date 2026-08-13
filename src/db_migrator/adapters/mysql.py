@@ -105,7 +105,8 @@ class MySqlSourceAdapter:
         for row in columns:
             table_name = str(row["table_name"])
             source_type = _format_mysql_source_type(row)
-            is_generated = "GENERATED" in str(row["extra"]).upper()
+            extra = str(row["extra"]).upper()
+            is_generated = "GENERATED" in extra
             common_type = self._source_type_mapper(source_type, is_generated=is_generated)
             grouped_columns[table_name].append(
                 ColumnSchema(
@@ -117,6 +118,7 @@ class MySqlSourceAdapter:
                     is_generated=is_generated,
                     generation_expression=row["generation_expression"],
                     ordinal_position=int(row["ordinal_position"]),
+                    auto_increment="AUTO_INCREMENT" in extra,
                     warnings=common_type.warnings,
                 )
             )
@@ -696,7 +698,8 @@ class MySqlDdlGenerator:
     def _column_definition(self, column: ColumnSchema) -> str:
         column_type = self._target_type_mapper(column.common_type)
         null_sql = "NULL" if column.nullable else "NOT NULL"
-        return f"  {quote_mysql_identifier(column.name)} {column_type} {null_sql}"
+        auto_increment_sql = " AUTO_INCREMENT" if column.auto_increment else ""
+        return f"  {quote_mysql_identifier(column.name)} {column_type} {null_sql}{auto_increment_sql}"
 
 
 def qualify_mysql_table_name(table_schema: TableSchema, *, target_database: str | None = None) -> str:

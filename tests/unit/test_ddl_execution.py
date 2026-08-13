@@ -6,7 +6,6 @@ import pytest
 from db_migrator.adapters.mysql import ExecutionResult
 from db_migrator.config.models import (
     AppConfig,
-    Dbms,
     ExistingTablePolicy,
     MigrationConfig,
     SafetyConfig,
@@ -291,10 +290,9 @@ def test_execute_schema_ddl_overwrites_existing_table_and_writes_audit_log(tmp_p
     assert ("users", "create", "completed") in actions
 
 
-def test_execute_schema_ddl_can_apply_postgres_foreign_keys(tmp_path: Path) -> None:
+def test_execute_schema_ddl_never_applies_foreign_keys_even_when_enabled(tmp_path: Path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     config = AppConfig(
-        target=TargetConfig(dbms=Dbms.POSTGRESQL, port=5432),
         migration=MigrationConfig(apply_foreign_keys=True),
     )
     executor = FakeDdlExecutor()
@@ -306,9 +304,9 @@ def test_execute_schema_ddl_can_apply_postgres_foreign_keys(tmp_path: Path) -> N
         report_output_path=tmp_path / "ddl-execution.json",
     )
 
-    assert len(summary.foreign_keys) == 1
-    assert summary.foreign_keys[0].action == "add_foreign_key"
-    assert 'ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_user_id_fkey"' in executor.executed_ddls[-1]
+    assert summary.foreign_keys == ()
+    assert len(executor.executed_ddls) == 2
+    assert all("FOREIGN KEY" not in ddl for ddl in executor.executed_ddls)
 
 
 def _table(schema: str, name: str, columns: tuple[str, ...]) -> TableSchema:

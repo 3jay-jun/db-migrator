@@ -22,6 +22,7 @@ from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
 from db_migrator.core.dml_migration import migrate_tables
 from db_migrator.core.events import EventLevel, EventPublisher, EventType, MigrationEvent, QueueEventPublisher
+from db_migrator.core.foreign_keys import execute_foreign_key_ddls, generate_foreign_key_ddls
 from db_migrator.core.indexes import execute_index_ddls
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation import ValidationStatus
@@ -419,6 +420,14 @@ def _run_migration_flow(
         event_publisher=dml_event_publisher,
         migration_config=app_config.migration,
     )
+
+    if app_config.migration.apply_foreign_keys:
+        foreign_key_ddls = generate_foreign_key_ddls(target_snapshot, target_dbms=app_config.target.dbms)
+        foreign_key_results = execute_foreign_key_ddls(ddls=foreign_key_ddls, executor=target)
+        if any(not result.success for result in foreign_key_results):
+            failed = next(result for result in foreign_key_results if not result.success)
+            raise RuntimeError(f"Self-test foreign key execution failed: {failed.table}.{failed.constraint_name} {failed.message}")
+        _publish_selftest_event(event_publisher, app_config.job.name, EventType.PLAN_CREATED, "Target foreign keys executed.")
 
     execute_index_ddls(
         config=app_config,

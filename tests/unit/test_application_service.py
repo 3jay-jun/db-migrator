@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from queue import Queue
 
@@ -10,7 +11,7 @@ from db_migrator.config.loader import load_config
 from db_migrator.config.models import Dbms
 from db_migrator.core.events import EventLevel, EventType, MigrationEvent, ProgressSnapshot, QueueEventPublisher
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
-from db_migrator.schema.models import ColumnSchema, IndexSchema, PrimaryKey, ReadCursor, RowBatch, SchemaSnapshot, TableRef, TableSchema, WriteResult
+from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, IndexSchema, PrimaryKey, ReadCursor, RowBatch, SchemaSnapshot, TableRef, TableSchema, WriteResult
 
 
 def test_service_dry_run_writes_report_with_shared_orchestration(tmp_path: Path) -> None:
@@ -155,6 +156,38 @@ def test_service_apply_indexes_executes_post_data_auto_candidates(tmp_path: Path
     assert "`target_db`.`users`" in registry.target.executed_ddls[-1]
     assert "`idx_users_email`" in registry.target.executed_ddls[-1]
     assert (tmp_path / "indexes.json").exists()
+
+
+def test_service_apply_foreign_keys_executes_mapped_target_constraints(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.source.snapshot = SchemaSnapshot(
+        tables=(
+            _table_with_columns("public", "users", ("id",)),
+            TableSchema(
+                ref=TableRef(schema="public", name="orders"),
+                primary_key=PrimaryKey(columns=("id",)),
+                columns=_table_with_columns("public", "orders", ("id", "user_id")).columns,
+                foreign_keys=(
+                    ForeignKeySchema(
+                        name="orders_user_id_fkey",
+                        columns=("user_id",),
+                        referenced_table=TableRef(schema="public", name="users"),
+                        referenced_columns=("id",),
+                    ),
+                ),
+            ),
+        )
+    )
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(tmp_path)
+
+    result = service.run_apply_foreign_keys(config=config_path, output_file=tmp_path / "foreign-keys.json")
+
+    assert result.success is True
+    assert registry.target.executed_ddls == [
+        "ALTER TABLE `target_db`.`orders` ADD CONSTRAINT `orders_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `target_db`.`users` (`id`);"
+    ]
+    assert (tmp_path / "foreign-keys.json").exists()
 
 
 def test_service_apply_ddl_executes_configured_sync_alter_candidate(tmp_path: Path) -> None:
@@ -643,6 +676,38 @@ tables:
     assert registry.target.counted_tables == [TableRef(schema="target_db", name="app_users")]
     summary = (tmp_path / "reports" / "summary.json").read_text(encoding="utf-8")
     assert "public.users -> target_db.app_users" in summary
+
+
+def test_service_validate_loads_prior_execution_artifacts(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(tmp_path)
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    (reports_dir / "ddl-execution.json").write_text(
+        json.dumps(
+            {
+                "tables": [
+                    {
+                        "schema": "target_db",
+                        "table": "users",
+                        "action": "create",
+                        "success": True,
+                        "message": "ok",
+                        "ddl": "CREATE TABLE `target_db`.`users` (`id` int);",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = service.run_validate(config=config_path, output_dir=reports_dir)
+
+    assert result.success is True
+    summary = json.loads((reports_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["summary"]["execution_artifact_count"] == 1
+    assert summary["execution_artifacts"][0]["object_name"] == "target_db.users"
 
 
 def test_dry_run_gate_blocks_destructive_policy_without_report(tmp_path: Path) -> None:

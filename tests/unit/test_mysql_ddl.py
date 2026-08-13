@@ -69,6 +69,31 @@ def test_generate_create_table_can_qualify_with_target_database() -> None:
     assert "`public`.`users`" not in result.ddl
 
 
+def test_generate_create_table_preserves_auto_increment_column_property() -> None:
+    table = TableSchema(
+        ref=TableRef(schema="public", name="privacy_body"),
+        columns=(
+            ColumnSchema(
+                name="id",
+                source_type="bigint",
+                common_type=postgres_type_to_common("bigint"),
+                nullable=False,
+                default="nextval('privacy_body_id_seq'::regclass)",
+                is_generated=False,
+                generation_expression=None,
+                ordinal_position=1,
+                auto_increment=True,
+            ),
+        ),
+        primary_key=PrimaryKey(columns=("id",)),
+    )
+
+    result = MySqlDdlGenerator().generate_create_table(table)
+
+    assert "`id` bigint NOT NULL AUTO_INCREMENT" in result.ddl
+    assert "PRIMARY KEY (`id`)" in result.ddl
+
+
 def test_mysql_row_values_normalize_driver_specific_python_values() -> None:
     table = TableSchema(
         ref=TableRef(schema="public", name="documents"),

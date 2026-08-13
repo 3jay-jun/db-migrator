@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
@@ -22,11 +23,13 @@ from db_migrator.core.events import EventPublisher, MigrationEvent, QueueEventPu
 from db_migrator.core.health import run_health_checks
 from db_migrator.core.incremental import migrate_incremental_tables
 from db_migrator.core.indexes import execute_index_ddls
+from db_migrator.core.foreign_keys import execute_foreign_key_ddls, generate_foreign_key_ddls
 from db_migrator.core.manual_migration import export_manual_migration_files
 from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.core.validation_readers import SourceTargetValidationReader
 from db_migrator.application.table_mapping import ColumnPlanTargetAdapter, TargetMappingAdapter
 from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, write_dry_run_report
+from db_migrator.reports.execution_artifacts import load_execution_artifacts
 from db_migrator.reports.final_report import write_validation_report
 from db_migrator.reports.incremental_report import write_incremental_report
 from db_migrator.reports.metadata import ReportEndpoint
@@ -347,6 +350,41 @@ class MigrationApplicationService:
         except _KNOWN_ERRORS as exc:
             return _failure("apply-indexes", exc)
 
+    def run_apply_foreign_keys(
+        self,
+        *,
+        config: Path,
+        schema_file: Path | None = None,
+        output_file: Path | None = None,
+        selected_tables: set[str] | None = None,
+    ) -> CommandResult:
+        try:
+            with self._command_runtime(config, include_source=True, include_target=True) as runtime:
+                assert runtime.source is not None
+                assert runtime.target is not None
+                app_config = runtime.resolved
+                original_config = runtime.original
+                snapshot = self._load_snapshot(app_config.source.schema_name, runtime.source, schema_file, source_dbms=app_config.source.dbms)
+                target_scan_snapshot = self._load_target_snapshot(app_config, original_config)
+                snapshot = _filter_snapshot(snapshot, selected_tables)
+                schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=target_scan_snapshot)
+                foreign_key_ddls = generate_foreign_key_ddls(schema_plan.target_snapshot, target_dbms=original_config.target.dbms)
+                results = execute_foreign_key_ddls(ddls=foreign_key_ddls, executor=runtime.target)
+                resolved_output_file = output_file or Path(original_config.report.output_dir) / "foreign-key-execution.json"
+                _write_foreign_key_execution_report(foreign_key_ddls, results, resolved_output_file)
+            failed_count = sum(1 for result in results if not result.success)
+            return CommandResult(
+                command="apply-foreign-keys",
+                success=failed_count == 0,
+                message=f"foreign_key_execution_report={resolved_output_file} foreign_keys={len(results)} failed={failed_count}",
+                output_file=resolved_output_file,
+                table_count=len({result.table for result in results}),
+                warning_count=failed_count,
+                details={"foreign_keys": results},
+            )
+        except _KNOWN_ERRORS + (ValueError, OSError) as exc:
+            return _failure("apply-foreign-keys", exc)
+
     def run_generate_manual_ddl(
         self,
         *,
@@ -505,6 +543,7 @@ class MigrationApplicationService:
                 snapshot = _filter_snapshot(snapshot, selected_tables)
                 actual_target_snapshot = self._load_target_snapshot(app_config, original_config)
                 schema_plan = self._resolve_schema_plan(original_config, source_snapshot=snapshot, target_snapshot=actual_target_snapshot)
+                resolved_output_dir = output_dir or Path(original_config.report.output_dir)
                 report = validate_tables(
                     job_id=original_config.job.name,
                     tables=schema_plan.source_snapshot.tables,
@@ -514,8 +553,8 @@ class MigrationApplicationService:
                     target_table_resolver=lambda table: schema_plan.column_plans[table].target_table.ref,
                     source_snapshot=schema_plan.target_snapshot,
                     target_snapshot=actual_target_snapshot,
+                    execution_artifacts=load_execution_artifacts(resolved_output_dir),
                 )
-                resolved_output_dir = output_dir or Path(original_config.report.output_dir)
                 write_validation_report(report, resolved_output_dir)
             return CommandResult(
                 command="validate",
@@ -742,6 +781,21 @@ def _apply_preview_column_mappings(table_config: TableRunConfig, column_mappings
 
 def _schema_origin_by_source_key(schema_plan: SchemaPairPlan):
     return {_table_identifier(pair.source_table): pair.schema_origin for pair in schema_plan.pairs}
+
+
+def _write_foreign_key_execution_report(foreign_key_ddls, results, output_file: Path) -> None:
+    ddl_by_key = {(ddl.table, ddl.constraint_name): ddl.ddl for ddl in foreign_key_ddls}
+    payload = {
+        "foreign_keys": [
+            {
+                **asdict(result),
+                "ddl": ddl_by_key.get((result.table, result.constraint_name)),
+            }
+            for result in results
+        ]
+    }
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _table_selection(table: TableSchema) -> TableSelection:

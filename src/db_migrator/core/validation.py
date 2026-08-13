@@ -104,11 +104,23 @@ class TableValidationResult:
 
 
 @dataclass(frozen=True)
+class ExecutionArtifact:
+    artifact_type: str
+    object_name: str
+    action: str
+    success: bool
+    message: str
+    source_file: str
+    ddl: str | None = None
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     job_id: str
     tables: tuple[TableValidationResult, ...]
     metadata: ValidationMetadata
     schema_objects: tuple[SchemaObjectComparison, ...] = ()
+    execution_artifacts: tuple[ExecutionArtifact, ...] = ()
 
     @property
     def status(self) -> str:
@@ -145,6 +157,7 @@ def validate_tables(
     target_table_resolver: Callable[[TableRef], TableRef] | None = None,
     source_snapshot: SchemaSnapshot | None = None,
     target_snapshot: SchemaSnapshot | None = None,
+    execution_artifacts: tuple[ExecutionArtifact, ...] = (),
 ) -> ValidationReport:
     profile = NormalizationProfile(
         datetime_precision=verification.checksum_datetime_precision,
@@ -158,6 +171,7 @@ def validate_tables(
         schema_objects=compare_schema_objects(source_snapshot, target_snapshot)
         if source_snapshot is not None and target_snapshot is not None
         else (),
+        execution_artifacts=execution_artifacts,
     )
 
 

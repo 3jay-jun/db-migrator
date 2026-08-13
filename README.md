@@ -392,6 +392,8 @@ DB 접속은 성공했지만 `source.schema`가 없거나 metadata 조회 권한
 
 ## 참고 문서
 
+- 에이전트 진입점: `AGENTS.md`
+- 상세 작업 규칙: `Codex.md`
 - 명령 요약: `docs/generated/cli-reference.md`
 - 샘플 설정: `docs/product-specs/sample-configs.md`
 - 전체 구현 계획: `05-plan.md`

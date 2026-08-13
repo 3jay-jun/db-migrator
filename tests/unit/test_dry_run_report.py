@@ -4,7 +4,7 @@ from pathlib import Path
 from db_migrator.reports.dry_run import DryRunMetadata, build_dry_run_report, write_dry_run_report
 from db_migrator.reports.metadata import ReportEndpoint
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
-from db_migrator.schema.models import ColumnSchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.models import ColumnSchema, IndexSchema, PrimaryKey, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -116,6 +116,31 @@ def test_dry_run_report_warns_offset_fallback_for_table_without_unique_key() -> 
     report = build_dry_run_report(snapshot, target_database="target_db")
 
     assert "offset 기준 resume" in report.tables[0].warnings[0].message
+
+
+def test_dry_run_report_shows_auto_increment_only_in_target_ddl() -> None:
+    table = TableSchema(
+        ref=TableRef(schema="public", name="privacy_body"),
+        columns=(
+            ColumnSchema(
+                name="id",
+                source_type="bigint",
+                common_type=CommonType(kind=CommonTypeKind.BIGINT, policy=TypePolicy.AUTO_CONVERT),
+                nullable=False,
+                default="nextval('privacy_body_id_seq'::regclass)",
+                is_generated=False,
+                generation_expression=None,
+                ordinal_position=1,
+                auto_increment=True,
+            ),
+        ),
+        primary_key=PrimaryKey(columns=("id",)),
+    )
+
+    report = build_dry_run_report(SchemaSnapshot(tables=(table,)), target_database="target_db")
+
+    assert "AUTO_INCREMENT" in report.tables[0].target_ddl
+    assert report.tables[0].warnings == ()
 
 
 def test_dry_run_report_checks_unsupported_schema_objects() -> None:

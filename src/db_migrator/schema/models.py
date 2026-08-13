@@ -61,6 +61,7 @@ class ColumnSchema:
     is_generated: bool
     generation_expression: str | None
     ordinal_position: int
+    auto_increment: bool = False
     warnings: tuple[SchemaWarning, ...] = field(default_factory=tuple)
 
 

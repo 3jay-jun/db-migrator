@@ -1,6 +1,7 @@
-# Codex.md — DB Migrator 작업 규칙
+# Codex.md — DB Migrator 상세 작업 규칙
 
-Codex가 이 DB 마이그레이션 도구 프로젝트에서 작업할 때 따르는 세션 규칙입니다.
+Codex가 이 DB 마이그레이션 도구 프로젝트에서 작업할 때 따르는 상세 세션 규칙입니다.
+짧은 세션 진입점은 `AGENTS.md`이고, 이 파일은 세부 운영 규칙과 체크리스트를 보관합니다.
 
 ---
 
@@ -8,11 +9,10 @@ Codex가 이 DB 마이그레이션 도구 프로젝트에서 작업할 때 따�
 
 아래 순서로 현재 작업 범위를 확인합니다.
 
-1. `AGENTS.md` — 프로젝트 공통 설계 원칙, SSOT, SOLID/DDD 규칙
-2. `02-prd.md` — 제품 요구사항과 v1.0/v1.1 범위
-3. `03-Preplan.md` — 아키텍처, 도메인 모델, 마일스톤, 검증 정책
-4. `05-plan.md` — 현재 구현 계획과 완료 상태가 있는 경우 확인
-5. `docs/exec-plans/active/` — 활성 Phase 체크리스트가 있는 경우 확인
+1. `02-prd.md` — 제품 요구사항과 v1.0/v1.1 범위
+2. `03-Preplan.md` — 아키텍처, 도메인 모델, 마일스톤, 검증 정책
+3. `05-plan.md` — 현재 구현 계획과 완료 상태가 있는 경우 확인
+4. `docs/exec-plans/active/` — 활성 Phase 체크리스트가 있는 경우 확인
 
 경로 표기는 반드시 실제 디렉터리 구분자를 포함합니다. 예: `docs/exec-plans/active/phase1-project-skeleton.md`.
 

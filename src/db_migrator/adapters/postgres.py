@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -331,12 +332,13 @@ class PostgresSourceAdapter:
         grouped_columns: dict[str, list[ColumnSchema]] = defaultdict(list)
         for row in columns:
             table_name = str(row["table_name"])
+            column_name = str(row["column_name"])
             source_type = _format_source_type(row)
             is_generated = row["is_generated"] == "ALWAYS"
             common_type = self._source_type_mapper(source_type, is_generated=is_generated)
             grouped_columns[table_name].append(
                 ColumnSchema(
-                    name=str(row["column_name"]),
+                    name=column_name,
                     source_type=source_type,
                     common_type=common_type,
                     nullable=row["is_nullable"] == "YES",
@@ -344,6 +346,11 @@ class PostgresSourceAdapter:
                     is_generated=is_generated,
                     generation_expression=row["generation_expression"],
                     ordinal_position=int(row["ordinal_position"]),
+                    auto_increment=_is_postgres_auto_increment_column(
+                        row,
+                        common_type=common_type,
+                        primary_key_columns=tuple(primary_keys[table_name]),
+                    ),
                     warnings=common_type.warnings,
                 )
             )
@@ -505,6 +512,8 @@ class PostgresSourceAdapter:
                 column_default,
                 is_generated,
                 generation_expression,
+                is_identity,
+                identity_generation,
                 ordinal_position
             from information_schema.columns
             where table_schema = %s
@@ -730,6 +739,27 @@ def _postgres_index_manual_review_reason(
     if expression is not None:
         return "Expression index requires manual conversion."
     return None
+
+
+_POSTGRES_NEXTVAL_DEFAULT_PATTERN = re.compile(r"^nextval\('[^']+'::regclass\)$", re.IGNORECASE)
+
+
+def _is_postgres_auto_increment_column(
+    row: dict[str, Any],
+    *,
+    common_type: CommonType,
+    primary_key_columns: tuple[str, ...],
+) -> bool:
+    if common_type.kind not in {CommonTypeKind.SMALLINT, CommonTypeKind.INTEGER, CommonTypeKind.BIGINT}:
+        return False
+    if primary_key_columns != (str(row["column_name"]),):
+        return False
+    if str(row.get("is_identity") or "").upper() == "YES":
+        return True
+    column_default = row.get("column_default")
+    if not isinstance(column_default, str):
+        return False
+    return bool(_POSTGRES_NEXTVAL_DEFAULT_PATTERN.match(column_default.strip()))
 
 
 def _format_source_type(row: dict[str, Any]) -> str:

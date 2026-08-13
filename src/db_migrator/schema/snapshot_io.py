@@ -93,6 +93,7 @@ def _parse_column(raw_column: Any, snapshot_path: Path, *, source_dbms: Dbms) ->
         is_generated=is_generated,
         generation_expression=raw_column.get("generation_expression"),
         ordinal_position=int(raw_column.get("ordinal_position", 0)),
+        auto_increment=bool(raw_column.get("auto_increment", False)),
         warnings=common_type.warnings,
     )
 

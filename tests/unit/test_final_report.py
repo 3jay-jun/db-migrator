@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from db_migrator.config.models import VerificationConfig
-from db_migrator.core.validation import ValidationEndpoint, ValidationMetadata, validate_tables
+from db_migrator.core.validation import ExecutionArtifact, ValidationEndpoint, ValidationMetadata, validate_tables
 from db_migrator.reports.final_report import write_validation_report
-from db_migrator.schema.models import IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot
+from db_migrator.schema.models import ForeignKeySchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -219,3 +220,106 @@ def test_write_validation_report_includes_schema_object_mismatches(tmp_path: Pat
     assert "idx_users_email" in schema_objects_csv
     assert "idx_users_profile_expr" in schema_objects_csv
     assert "active_users" in schema_objects_csv
+
+
+def test_write_validation_report_flags_missing_auto_increment_column_property(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    source_table = snapshot.tables[0]
+    expected_id = replace(source_table.columns[0], auto_increment=True)
+    expected = SchemaSnapshot(tables=(replace(source_table, columns=(expected_id, *source_table.columns[1:])),))
+    actual_id = replace(source_table.columns[0], auto_increment=False)
+    actual = SchemaSnapshot(tables=(replace(source_table, columns=(actual_id, *source_table.columns[1:])),))
+
+    report = validate_tables(
+        job_id="job-1",
+        tables=(source_table,),
+        reader=MatchingReader(),
+        verification=VerificationConfig(),
+        source_snapshot=expected,
+        target_snapshot=actual,
+    )
+
+    write_validation_report(report, tmp_path)
+
+    assert report.status == "mismatched"
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["summary"]["schema_object_issue_count"] == 1
+    schema_objects_csv = (tmp_path / "schema-objects.csv").read_text(encoding="utf-8")
+    assert "컬럼 속성" in schema_objects_csv
+    assert "AUTO_INCREMENT 누락" in schema_objects_csv
+
+
+def test_write_validation_report_includes_execution_artifacts(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    report = validate_tables(
+        job_id="job-1",
+        tables=(snapshot.tables[0],),
+        reader=MatchingReader(),
+        verification=VerificationConfig(),
+        execution_artifacts=(
+            ExecutionArtifact(
+                artifact_type="DDL",
+                object_name="target_db.users",
+                action="create",
+                success=True,
+                message="ok",
+                ddl="CREATE TABLE `target_db`.`users` (`id` int);",
+                source_file="ddl-execution.json",
+            ),
+            ExecutionArtifact(
+                artifact_type="INDEX",
+                object_name="target_db.users.idx_users_email",
+                action="post_data",
+                success=True,
+                message="ok",
+                ddl="CREATE INDEX `idx_users_email` ON `target_db`.`users` (`email`);",
+                source_file="index-execution-post_data.json",
+            ),
+        ),
+    )
+
+    write_validation_report(report, tmp_path)
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["summary"]["execution_artifact_count"] == 2
+    assert summary["execution_artifacts"][0]["ddl"].startswith("CREATE TABLE")
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert "실행 산출물" in html
+    assert "target_db.users.idx_users_email" in html
+    execution_artifacts_csv = (tmp_path / "execution-artifacts.csv").read_text(encoding="utf-8")
+    assert "CREATE INDEX" in execution_artifacts_csv
+
+
+def test_write_validation_report_compares_foreign_key_objects(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    users = snapshot.tables[0]
+    orders = replace(
+        users,
+        ref=TableRef(schema="public", name="orders"),
+        foreign_keys=(
+            ForeignKeySchema(
+                name="orders_user_id_fkey",
+                columns=("user_id",),
+                referenced_table=TableRef(schema="public", name="users"),
+                referenced_columns=("id",),
+            ),
+        ),
+    )
+    expected = SchemaSnapshot(tables=(users, orders))
+    actual = SchemaSnapshot(tables=(users, replace(orders, foreign_keys=())))
+
+    report = validate_tables(
+        job_id="job-1",
+        tables=(users,),
+        reader=MatchingReader(),
+        verification=VerificationConfig(),
+        source_snapshot=expected,
+        target_snapshot=actual,
+    )
+
+    write_validation_report(report, tmp_path)
+
+    assert report.status == "mismatched"
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert "orders_user_id_fkey" in html
+    assert "apply-foreign-keys" in html

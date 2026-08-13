@@ -35,3 +35,35 @@ def test_load_schema_snapshot_uses_source_dbms_for_missing_common_type(tmp_path)
     assert common_type.kind is CommonTypeKind.BIGINT
     assert common_type.policy is TypePolicy.WARN_CONVERT
     assert common_type.warnings[0].code == "mysql_unsigned_warning"
+
+
+def test_load_schema_snapshot_preserves_auto_increment_column_property(tmp_path) -> None:
+    snapshot_path = tmp_path / "postgres_snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "tables": [
+                    {
+                        "schema": "public",
+                        "name": "privacy_body",
+                        "primary_key": ["id"],
+                        "columns": [
+                            {
+                                "name": "id",
+                                "source_type": "bigint",
+                                "nullable": False,
+                                "default": "nextval('privacy_body_id_seq'::regclass)",
+                                "auto_increment": True,
+                                "ordinal_position": 1,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = load_schema_snapshot_from_json(snapshot_path, source_dbms=Dbms.POSTGRESQL)
+
+    assert snapshot.tables[0].columns[0].auto_increment is True
