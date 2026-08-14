@@ -74,6 +74,7 @@ class SshTunnelConfig(BaseModel):
     remote_port: int | None = Field(default=None, gt=0, le=65535)
     local_host: str = Field(default="127.0.0.1", min_length=1)
     local_port: int = Field(default=0, ge=0, le=65535)
+    keepalive_interval_seconds: float = Field(default=30.0, ge=0)
 
 
 class SourceConfig(BaseModel):

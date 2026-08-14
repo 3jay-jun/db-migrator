@@ -8,6 +8,7 @@ from typing import Callable, Iterable, Protocol
 from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
+from db_migrator.adapters.connection_reuse import ReusableConnection
 from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
 from db_migrator.config.models import SourceConfig, TargetConfig, WatermarkConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
@@ -66,6 +67,7 @@ class MySqlSourceAdapter:
     def __init__(self, config: SourceConfig, source_type_mapper: SourceTypeMapper | None = None) -> None:
         self._config = config
         self._source_type_mapper = source_type_mapper or mysql_type_to_common
+        self._validation_connection = ReusableConnection(lambda: self._connect(), autocommit=True)
 
     def test_connection(self) -> bool:
         try:
@@ -184,11 +186,12 @@ class MySqlSourceAdapter:
     def count_rows(self, table: TableRef) -> int:
         table_sql = qualify_mysql_table_ref(table)
         try:
-            with self._connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"SELECT COUNT(*) AS row_count FROM {table_sql}")
-                    return int(cursor.fetchone()["row_count"])
+            connection = self._validation_connection.get()
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) AS row_count FROM {table_sql}")
+                return int(cursor.fetchone()["row_count"])
         except Exception as exc:
+            self._validation_connection.reset()
             raise MySqlAdapterError(f"MySQL/MariaDB row count failed for table: {table.name}") from exc
 
     def sample_rows(
@@ -205,11 +208,12 @@ class MySqlSourceAdapter:
         table_sql = qualify_mysql_table_ref(table)
         order_sql = _mysql_order_by_clause(order_by, position=position)
         try:
-            with self._connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
-                    return tuple(dict(row) for row in cursor.fetchall())
+            connection = self._validation_connection.get()
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
+                return tuple(dict(row) for row in cursor.fetchall())
         except Exception as exc:
+            self._validation_connection.reset()
             raise MySqlAdapterError(f"MySQL/MariaDB sample rows failed for table: {table.name}") from exc
 
     def read_incremental_rows(
@@ -264,6 +268,9 @@ class MySqlSourceAdapter:
             charset="utf8mb4",
             cursorclass=DictCursor,
         )
+
+    def close(self) -> None:
+        self._validation_connection.close()
 
     def _fetch_columns(self, connection, schema: str) -> list[dict]:
         query = """
@@ -446,6 +453,7 @@ class MySqlTargetAdapter:
     def __init__(self, config: TargetConfig) -> None:
         self._config = config
         self._dml_connection = None
+        self._validation_connection = ReusableConnection(lambda: self._connect(), autocommit=True)
 
     def test_connection(self) -> bool:
         try:
@@ -559,11 +567,12 @@ class MySqlTargetAdapter:
     def count_rows(self, table: TableRef) -> int:
         table_sql = self._qualified_table_ref(table)
         try:
-            with self._connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
-                    return int(cursor.fetchone()[0])
+            connection = self._validation_connection.get()
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
+                return int(cursor.fetchone()[0])
         except Exception as exc:
+            self._validation_connection.reset()
             raise MySqlAdapterError(
                 f"Failed to count target rows for table: {table.name}. detail={safe_error_detail(exc)}"
             ) from exc
@@ -640,13 +649,14 @@ class MySqlTargetAdapter:
         column_sql = ", ".join(quote_mysql_identifier(column) for column in columns)
         table_sql = self._qualified_table_ref(table)
         try:
-            with self._connect() as connection:
-                with connection.cursor() as cursor:
-                    order_sql = _mysql_order_by_clause(order_by, position=position)
-                    cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
-                    rows = cursor.fetchall()
+            connection = self._validation_connection.get()
+            with connection.cursor() as cursor:
+                order_sql = _mysql_order_by_clause(order_by, position=position)
+                cursor.execute(f"SELECT {column_sql} FROM {table_sql}{order_sql} LIMIT %s", (sample_size,))
+                rows = cursor.fetchall()
             return tuple(dict(zip(columns, row, strict=True)) for row in rows)
         except Exception as exc:
+            self._validation_connection.reset()
             raise MySqlAdapterError(
                 f"Failed to sample target rows for table: {table.name}. detail={safe_error_detail(exc)}"
             ) from exc
@@ -656,6 +666,7 @@ class MySqlTargetAdapter:
             self._dml_connection.commit()
 
     def close(self) -> None:
+        self._validation_connection.close()
         if self._dml_connection is not None:
             self._dml_connection.close()
             self._dml_connection = None

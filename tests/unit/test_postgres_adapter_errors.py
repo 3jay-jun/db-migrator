@@ -42,6 +42,41 @@ class TupleConnection:
         return TupleCursor(self._rows)
 
 
+class CountCursor:
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    def __enter__(self) -> "CountCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def execute(self, _sql: str, _params: tuple | None = None) -> None:
+        return None
+
+    def fetchone(self) -> tuple[int]:
+        return (self._count,)
+
+
+class CountConnection:
+    def __init__(self, count: int) -> None:
+        self._count = count
+        self.closed = False
+
+    def __enter__(self) -> "CountConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def cursor(self) -> CountCursor:
+        return CountCursor(self._count)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FailingCursor:
     def __init__(self, message: str) -> None:
         self._message = message
@@ -201,6 +236,59 @@ def test_source_count_rows_reports_validation_query_context(monkeypatch: pytest.
     assert 'sql=select count(*) from "public"."account"' in message
     assert "detail=server closed the connection unexpectedly" in message
     assert "secret" not in message
+
+
+def test_source_count_rows_retries_transient_connection_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresSourceAdapter(SourceConfig(database="legacy", user="readonly", password="secret"))
+    attempts = {"count": 0}
+
+    def connect() -> object:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("connection failed: could not receive data from server: Software caused connection abort")
+        return CountConnection(7)
+
+    monkeypatch.setattr("db_migrator.adapters.postgres.sleep", lambda _seconds: None)
+    monkeypatch.setattr(adapter, "_connect", connect)
+
+    assert adapter.count_rows(TableRef(schema="public", name="account")) == 7
+    assert attempts["count"] == 3
+
+
+def test_source_validation_queries_reuse_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresSourceAdapter(SourceConfig(database="legacy", user="readonly", password="secret"))
+    attempts = {"count": 0}
+
+    def connect() -> CountConnection:
+        attempts["count"] += 1
+        return CountConnection(7)
+
+    monkeypatch.setattr(adapter, "_connect", connect)
+
+    table = TableRef(schema="public", name="account")
+    assert adapter.count_rows(table) == 7
+    assert adapter.count_rows(table) == 7
+    assert attempts["count"] == 1
+
+
+def test_source_count_rows_does_not_retry_non_transient_query_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresSourceAdapter(SourceConfig(database="legacy", user="readonly", password="secret"))
+    attempts = {"count": 0}
+
+    def connect() -> object:
+        attempts["count"] += 1
+        return FailingConnection("permission denied for table account")
+
+    monkeypatch.setattr("db_migrator.adapters.postgres.sleep", lambda _seconds: None)
+    monkeypatch.setattr(adapter, "_connect", connect)
+
+    with pytest.raises(PostgresAdapterError) as exc_info:
+        adapter.count_rows(TableRef(schema="public", name="account"))
+
+    message = str(exc_info.value)
+    assert attempts["count"] == 1
+    assert "attempts=1" in message
+    assert "permission denied for table account" in message
 
 
 def test_target_sample_rows_reports_validation_query_context(monkeypatch: pytest.MonkeyPatch) -> None:

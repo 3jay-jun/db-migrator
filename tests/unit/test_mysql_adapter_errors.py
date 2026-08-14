@@ -41,6 +41,7 @@ class FailingCursor:
 class FakeConnection:
     def __init__(self, cursor: FailingCursor) -> None:
         self._cursor = cursor
+        self.closed = False
 
     def __enter__(self) -> "FakeConnection":
         return self
@@ -50,6 +51,34 @@ class FakeConnection:
 
     def cursor(self) -> FailingCursor:
         return self._cursor
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class CountCursor:
+    def __enter__(self) -> "CountCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def execute(self, _sql: str, _params: tuple | None = None) -> None:
+        return None
+
+    def fetchone(self) -> tuple[int]:
+        return (7,)
+
+
+class CountConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def cursor(self) -> CountCursor:
+        return CountCursor()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _account_table() -> TableSchema:
@@ -110,3 +139,19 @@ def test_mysql_fetch_rows_by_keys_accepts_tuple_cursor_rows() -> None:
     rows = adapter.fetch_rows_by_keys(_account_table(), ("id",), ({"id": 1},))
 
     assert rows == {(1,): {"id": 1}}
+
+
+def test_mysql_target_validation_queries_reuse_connection() -> None:
+    adapter = MySqlTargetAdapter(TargetConfig(database="hd_bb", password="secret"))
+    attempts = {"count": 0}
+
+    def connect() -> CountConnection:
+        attempts["count"] += 1
+        return CountConnection()
+
+    adapter._connect = connect
+
+    table = TableRef(schema="hd_bb", name="account2")
+    assert adapter.count_rows(table) == 7
+    assert adapter.count_rows(table) == 7
+    assert attempts["count"] == 1

@@ -120,21 +120,42 @@ def test_tunnel_manager_uses_explicit_remote_endpoint(tmp_path: Path) -> None:
     assert factory.tunnels[0].endpoint_port == 5432
 
 
+def test_tunnel_manager_preserves_keepalive_config(tmp_path: Path) -> None:
+    key_file, known_hosts = _tunnel_files(tmp_path)
+    config = AppConfig.model_validate(
+        {
+            "source": {
+                "tunnel": {
+                    **_tunnel_config(key_file, known_hosts),
+                    "keepalive_interval_seconds": 15,
+                },
+            }
+        }
+    )
+    factory = FakeTunnelFactory()
+
+    with TunnelManager(factory).open(config, include_source=True, include_target=False):
+        pass
+
+    assert factory.tunnels[0].config.keepalive_interval_seconds == 15
+
+
 class FakeTunnelFactory:
     def __init__(self) -> None:
         self.tunnels: list[FakeTunnel] = []
 
     def create(self, *, label: str, endpoint_host: str, endpoint_port: int, config):
-        tunnel = FakeTunnel(label=label, endpoint_host=endpoint_host, endpoint_port=endpoint_port, local_port=15000 + len(self.tunnels))
+        tunnel = FakeTunnel(label=label, endpoint_host=endpoint_host, endpoint_port=endpoint_port, local_port=15000 + len(self.tunnels), config=config)
         self.tunnels.append(tunnel)
         return tunnel
 
 
 class FakeTunnel:
-    def __init__(self, *, label: str, endpoint_host: str, endpoint_port: int, local_port: int) -> None:
+    def __init__(self, *, label: str, endpoint_host: str, endpoint_port: int, local_port: int, config) -> None:
         self.label = label
         self.endpoint_host = endpoint_host
         self.endpoint_port = endpoint_port
+        self.config = config
         self.local_bind_host = "127.0.0.1"
         self.local_bind_port = local_port
         self.started = False

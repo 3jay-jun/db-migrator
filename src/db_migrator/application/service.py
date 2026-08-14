@@ -735,6 +735,7 @@ class MigrationApplicationService:
                     target = self._registry.create_target(resolved_config.resolved.target)
                 yield CommandRuntime(config=resolved_config, source=source, target=target)
             finally:
+                _close_adapter(source)
                 _close_adapter(target)
 
 

@@ -83,6 +83,7 @@ source:
     remote_host: pg.internal
     remote_port: 5432
     local_port: 0
+    keepalive_interval_seconds: 15
 target:
   tunnel:
     enabled: true
@@ -105,6 +106,7 @@ target:
     assert config.source.tunnel.private_key_passphrase_env == "SSH_KEY_PASSPHRASE"
     assert config.source.tunnel.remote_host == "pg.internal"
     assert config.source.tunnel.remote_port == 5432
+    assert config.source.tunnel.keepalive_interval_seconds == 15
     assert config.target.tunnel.auth_type is SshAuthenticationType.PASSWORD
     assert config.target.tunnel.ssh_password == "ssh-secret"
     assert config.target.tunnel.local_port == 13306

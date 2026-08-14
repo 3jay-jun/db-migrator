@@ -5,10 +5,12 @@ import re
 from collections import defaultdict
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from time import sleep
 from typing import Any, Callable, Iterable, Protocol
 from uuid import UUID
 
 from db_migrator.adapters.base import DdlResult, ExecutionResult
+from db_migrator.adapters.connection_reuse import ReusableConnection
 from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
 from db_migrator.config.models import WatermarkConfig
 from db_migrator.config.models import SourceConfig, TargetConfig
@@ -37,6 +39,10 @@ class PostgresAdapterError(RuntimeError):
     pass
 
 
+_POSTGRES_VALIDATION_MAX_ATTEMPTS = 3
+_POSTGRES_VALIDATION_RETRY_SLEEP_SECONDS = 0.2
+
+
 class SourceTypeMapper(Protocol):
     def __call__(self, source_type: str, *, is_generated: bool = False) -> CommonType:
         """Map a source DBMS type into the common schema type."""
@@ -46,6 +52,7 @@ class PostgresTargetAdapter:
     def __init__(self, config: TargetConfig) -> None:
         self._config = config
         self._dml_connection = None
+        self._validation_connection = ReusableConnection(lambda: self._connect(), autocommit=True)
 
     def test_connection(self) -> bool:
         try:
@@ -166,16 +173,23 @@ class PostgresTargetAdapter:
     def count_rows(self, table: TableRef) -> int:
         table_sql = _qualified_postgres_table_ref(table)
         sql = f"select count(*) as row_count from {table_sql}"
-        try:
-            with self._connect() as connection:
+        for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
+            try:
+                connection = self._validation_connection.get()
                 with connection.cursor() as cursor:
                     cursor.execute(sql)
                     row = cursor.fetchone()
                     return int(row["row_count"] if isinstance(row, dict) else row[0])
-        except Exception as exc:
-            raise PostgresAdapterError(
-                _postgres_validation_error_message(self._config, "row count", table, sql, exc)
-            ) from exc
+            except Exception as exc:
+                if _is_transient_postgres_validation_error(exc):
+                    self._validation_connection.reset()
+                if _should_retry_postgres_validation(exc, attempt):
+                    sleep(_POSTGRES_VALIDATION_RETRY_SLEEP_SECONDS * attempt)
+                    continue
+                raise PostgresAdapterError(
+                    _postgres_validation_error_message(self._config, "row count", table, sql, exc, attempts=attempt)
+                ) from exc
+        raise AssertionError("unreachable")
 
     def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
         temp_table = _postgres_sync_temp_table_name(table_schema)
@@ -241,31 +255,40 @@ class PostgresTargetAdapter:
         table_sql = _qualified_postgres_table_ref(table)
         order_sql = _postgres_order_by_clause(order_by, position=position)
         sql = f"select {column_sql} from {table_sql}{order_sql} limit %s"
-        try:
-            with self._connect() as connection:
+        for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
+            try:
+                connection = self._validation_connection.get()
                 with connection.cursor() as cursor:
                     cursor.execute(sql, (sample_size,))
                     return tuple(dict(row) for row in cursor.fetchall())
-        except Exception as exc:
-            raise PostgresAdapterError(
-                _postgres_validation_error_message(
-                    self._config,
-                    "sample rows",
-                    table,
-                    sql,
-                    exc,
-                    columns=columns,
-                    sample_size=sample_size,
-                    order_by=order_by,
-                    position=position,
-                )
-            ) from exc
+            except Exception as exc:
+                if _is_transient_postgres_validation_error(exc):
+                    self._validation_connection.reset()
+                if _should_retry_postgres_validation(exc, attempt):
+                    sleep(_POSTGRES_VALIDATION_RETRY_SLEEP_SECONDS * attempt)
+                    continue
+                raise PostgresAdapterError(
+                    _postgres_validation_error_message(
+                        self._config,
+                        "sample rows",
+                        table,
+                        sql,
+                        exc,
+                        columns=columns,
+                        sample_size=sample_size,
+                        order_by=order_by,
+                        position=position,
+                        attempts=attempt,
+                    )
+                ) from exc
+        raise AssertionError("unreachable")
 
     def commit(self) -> None:
         if self._dml_connection is not None:
             self._dml_connection.commit()
 
     def close(self) -> None:
+        self._validation_connection.close()
         if self._dml_connection is not None:
             self._dml_connection.close()
             self._dml_connection = None
@@ -327,6 +350,7 @@ class PostgresSourceAdapter:
     def __init__(self, config: SourceConfig, source_type_mapper: SourceTypeMapper | None = None) -> None:
         self._config = config
         self._source_type_mapper = source_type_mapper or postgres_type_to_common
+        self._validation_connection = ReusableConnection(lambda: self._connect(), autocommit=True)
 
     def test_connection(self) -> bool:
         try:
@@ -449,16 +473,23 @@ class PostgresSourceAdapter:
     def count_rows(self, table: TableRef) -> int:
         table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
         sql = f"select count(*) from {table_sql}"
-        try:
-            with self._connect() as connection:
+        for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
+            try:
+                connection = self._validation_connection.get()
                 with connection.cursor() as cursor:
                     cursor.execute(sql)
                     row = cursor.fetchone()
                     return int(row["count"] if isinstance(row, dict) else row[0])
-        except Exception as exc:
-            raise PostgresAdapterError(
-                _postgres_validation_error_message(self._config, "row count", table, sql, exc)
-            ) from exc
+            except Exception as exc:
+                if _is_transient_postgres_validation_error(exc):
+                    self._validation_connection.reset()
+                if _should_retry_postgres_validation(exc, attempt):
+                    sleep(_POSTGRES_VALIDATION_RETRY_SLEEP_SECONDS * attempt)
+                    continue
+                raise PostgresAdapterError(
+                    _postgres_validation_error_message(self._config, "row count", table, sql, exc, attempts=attempt)
+                ) from exc
+        raise AssertionError("unreachable")
 
     def sample_rows(
         self,
@@ -474,25 +505,33 @@ class PostgresSourceAdapter:
         table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
         order_sql = _postgres_order_by_clause(order_by, position=position)
         sql = f"select {column_sql} from {table_sql}{order_sql} limit %s"
-        try:
-            with self._connect() as connection:
+        for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
+            try:
+                connection = self._validation_connection.get()
                 with connection.cursor() as cursor:
                     cursor.execute(sql, (sample_size,))
                     return tuple(dict(row) for row in cursor.fetchall())
-        except Exception as exc:
-            raise PostgresAdapterError(
-                _postgres_validation_error_message(
-                    self._config,
-                    "sample rows",
-                    table,
-                    sql,
-                    exc,
-                    columns=columns,
-                    sample_size=sample_size,
-                    order_by=order_by,
-                    position=position,
-                )
-            ) from exc
+            except Exception as exc:
+                if _is_transient_postgres_validation_error(exc):
+                    self._validation_connection.reset()
+                if _should_retry_postgres_validation(exc, attempt):
+                    sleep(_POSTGRES_VALIDATION_RETRY_SLEEP_SECONDS * attempt)
+                    continue
+                raise PostgresAdapterError(
+                    _postgres_validation_error_message(
+                        self._config,
+                        "sample rows",
+                        table,
+                        sql,
+                        exc,
+                        columns=columns,
+                        sample_size=sample_size,
+                        order_by=order_by,
+                        position=position,
+                        attempts=attempt,
+                    )
+                ) from exc
+        raise AssertionError("unreachable")
 
     def read_incremental_rows(
         self,
@@ -546,6 +585,9 @@ class PostgresSourceAdapter:
             password=self._config.password,
             row_factory=dict_row_factory(),
         )
+
+    def close(self) -> None:
+        self._validation_connection.close()
 
     def _fetch_columns(self, connection: Any, schema: str) -> list[dict[str, Any]]:
         query = """
@@ -976,6 +1018,7 @@ def _postgres_validation_error_message(
     sample_size: int | None = None,
     order_by: tuple[str, ...] = (),
     position: SamplePosition | None = None,
+    attempts: int = 1,
 ) -> str:
     parts = [
         f"PostgreSQL {action} failed for table: {table.schema}.{table.name}.",
@@ -984,6 +1027,7 @@ def _postgres_validation_error_message(
         f"database={config.database}",
         f"user={config.user}",
         f"sql={_compact_sql(sql)}",
+        f"attempts={attempts}",
     ]
     if columns:
         parts.append(f"columns={','.join(columns)}")
@@ -995,6 +1039,29 @@ def _postgres_validation_error_message(
         parts.append(f"position={position.value}")
     parts.append(f"detail={safe_error_detail(exc)}")
     return " ".join(parts)
+
+
+def _should_retry_postgres_validation(exc: Exception, attempt: int) -> bool:
+    if attempt >= _POSTGRES_VALIDATION_MAX_ATTEMPTS:
+        return False
+    return _is_transient_postgres_validation_error(exc)
+
+
+def _is_transient_postgres_validation_error(exc: Exception) -> bool:
+    detail = safe_error_detail(exc).lower()
+    return any(
+        phrase in detail
+        for phrase in (
+            "connection failed",
+            "connection refused",
+            "connection reset",
+            "connection abort",
+            "could not receive data from server",
+            "server closed the connection unexpectedly",
+            "terminating connection",
+            "connection lost",
+        )
+    )
 
 
 def _first_row_value(row: Any) -> Any:

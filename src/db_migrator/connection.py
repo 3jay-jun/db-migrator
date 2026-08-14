@@ -139,6 +139,7 @@ class SshConnectionTester:
                 look_for_keys=False,
                 allow_agent=False,
             )
+            _set_ssh_keepalive(client, config.keepalive_interval_seconds)
         except Exception as exc:
             raise TunnelError(f"{label} SSH connection failed: {_safe_tunnel_error(exc)}") from exc
         finally:
@@ -173,7 +174,7 @@ class SshTunnel:
                 ssh_host_key=ssh_host_key,
                 remote_bind_address=(self._endpoint_host, self._endpoint_port),
                 local_bind_address=(self._config.local_host, self._config.local_port),
-                set_keepalive=30.0,
+                set_keepalive=self._config.keepalive_interval_seconds,
             )
             self._forwarder.start()
         except (BaseSSHTunnelForwarderError, HandlerSSHTunnelForwarderError) as exc:
@@ -246,6 +247,12 @@ def _ssh_password(config: SshTunnelConfig) -> str | None:
 
 def _known_hosts_path(config: SshTunnelConfig) -> Path:
     return Path(config.known_hosts_path).expanduser() if config.known_hosts_path else Path.home() / ".ssh" / "known_hosts"
+
+
+def _set_ssh_keepalive(client: Any, interval_seconds: float) -> None:
+    transport = client.get_transport()
+    if transport is not None:
+        transport.set_keepalive(interval_seconds)
 
 
 def _safe_tunnel_error(exc: Exception) -> str:

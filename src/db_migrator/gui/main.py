@@ -1876,8 +1876,12 @@ if Signal is not None:
             advanced_form = QFormLayout(advanced_group)
             self.local_host = QLineEdit(config.local_host)
             self.known_hosts = QLineEdit(config.known_hosts_path or str(Path.home() / ".ssh" / "known_hosts"))
+            self.keepalive_interval = _spin(0, 3600)
+            self.keepalive_interval.setValue(int(config.keepalive_interval_seconds))
+            self.keepalive_interval.setToolTip("0이면 SSH keepalive를 비활성화합니다.")
             advanced_form.addRow("터널 로컬 호스트", self.local_host)
             advanced_form.addRow("known_hosts", _path_row(self.known_hosts, self._choose_known_hosts, "찾기"))
+            advanced_form.addRow("Keepalive 초", self.keepalive_interval)
             layout.addWidget(advanced_group)
 
             actions = QHBoxLayout()
@@ -1914,6 +1918,7 @@ if Signal is not None:
                 remote_port=self.remote_port.value(),
                 local_host=self.local_host.text().strip() or "127.0.0.1",
                 local_port=self.local_port.value(),
+                keepalive_interval_seconds=float(self.keepalive_interval.value()),
             )
 
         def _sync_auth_fields(self, _value: str | None = None) -> None:

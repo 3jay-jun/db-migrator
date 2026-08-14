@@ -75,6 +75,17 @@ def test_service_connection_tests_use_configured_adapters(tmp_path: Path) -> Non
     assert target_result.success is True
 
 
+def test_service_closes_source_adapter_after_command(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(tmp_path)
+
+    result = service.run_scan_tables(config=config_path)
+
+    assert result.success is True
+    assert registry.source.closed is True
+
+
 def test_service_resolves_tunnel_endpoint_for_source_and_target(tmp_path: Path) -> None:
     registry = FakeRegistry()
     tunnel_factory = FakeTunnelFactory()
@@ -942,6 +953,7 @@ class FakeAdapter:
         self.upserted_batches: list[tuple[str, tuple[str, ...], tuple[dict, ...]]] = []
         self.sync_keys: list[tuple[str, tuple]] = []
         self.counted_tables: list[TableRef] = []
+        self.closed = False
 
     def test_connection(self) -> bool:
         return True
@@ -1015,6 +1027,9 @@ class FakeAdapter:
     def sample_rows(self, table: TableRef, _columns, _sample_size, _order_by, _position):
         self.sample_columns.append(tuple(_columns))
         return (dict.fromkeys(_columns, 1),)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeTunnelFactory:
