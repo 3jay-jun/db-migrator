@@ -86,6 +86,17 @@ def test_service_closes_source_adapter_after_command(tmp_path: Path) -> None:
     assert registry.source.closed is True
 
 
+def test_service_closes_target_schema_scan_adapter_after_command(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(tmp_path)
+
+    result = service.run_scan_tables(config=config_path)
+
+    assert result.success is True
+    assert registry.target_schema_source.closed is True
+
+
 def test_service_resolves_tunnel_endpoint_for_source_and_target(tmp_path: Path) -> None:
     registry = FakeRegistry()
     tunnel_factory = FakeTunnelFactory()

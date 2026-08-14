@@ -113,6 +113,7 @@ def _migrate_one_incremental_table(
         )
 
     rows_upserted = 0
+    uncommitted_rows = 0
     batches_upserted = 0
     try:
         for batch in source.read_incremental_rows(
@@ -136,10 +137,13 @@ def _migrate_one_incremental_table(
                     message=write_result.message,
                 )
             rows_upserted += write_result.rows_written
+            uncommitted_rows += write_result.rows_written
             batches_upserted += 1
-            if rows_upserted >= migration_config.commit_interval:
+            if uncommitted_rows >= migration_config.commit_interval:
                 target.commit()
-        target.commit()
+                uncommitted_rows = 0
+        if uncommitted_rows > 0:
+            target.commit()
     except Exception as exc:
         return IncrementalTableResult(
             table=table.ref,

@@ -93,6 +93,37 @@ def test_incremental_migration_upserts_configured_tables_and_skips_missing_water
     assert report.delete_sync_supported is False
 
 
+def test_incremental_migration_commits_by_uncommitted_rows() -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    source = FakeIncrementalSource(
+        {
+            "users": [
+                {"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"},
+                {"id": 2, "email": "b@example.com", "profile": {}, "created_at": "2026-01-02"},
+                {"id": 3, "email": "c@example.com", "profile": {}, "created_at": "2026-01-03"},
+                {"id": 4, "email": "d@example.com", "profile": {}, "created_at": "2026-01-04"},
+                {"id": 5, "email": "e@example.com", "profile": {}, "created_at": "2026-01-05"},
+            ]
+        }
+    )
+    target = FakeIncrementalTarget()
+
+    report = migrate_incremental_tables(
+        job_id="job-1",
+        tables=(snapshot.tables[0],),
+        source=source,
+        target=target,
+        migration_config=MigrationConfig(batch_size=1, commit_interval=2),
+        incremental_config=IncrementalConfig(
+            enabled=True,
+            watermarks={"users": WatermarkConfig(column="created_at", start_value="2026-01-01")},
+        ),
+    )
+
+    assert report.rows_upserted == 5
+    assert target.commit_count == 3
+
+
 def test_incremental_migration_skips_table_without_upsert_key() -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     users = next(table for table in snapshot.tables if table.ref.name == "users")

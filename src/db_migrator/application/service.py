@@ -702,7 +702,10 @@ class MigrationApplicationService:
 
     def _load_target_snapshot(self, app_config: AppConfig, original_config: AppConfig) -> SchemaSnapshot:
         target_schema_reader = self._registry.create_source(_target_schema_scan_config(app_config, original_config))
-        return target_schema_reader.scan_schema(_target_schema_name(original_config))
+        try:
+            return target_schema_reader.scan_schema(_target_schema_name(original_config))
+        finally:
+            _close_adapter(target_schema_reader)
 
     def _resolve_schema_plan(
         self,
