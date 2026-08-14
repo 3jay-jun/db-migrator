@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from db_migrator.core.validation import (
     validate_tables,
 )
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
-from db_migrator.schema.models import ColumnSchema, PrimaryKey, SamplePosition, TableRef, TableSchema
+from db_migrator.schema.models import ColumnSchema, PrimaryKey, SamplePosition, SchemaSnapshot, TableRef, TableSchema
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -92,6 +93,34 @@ def test_validate_tables_matches_equal_counts_and_samples() -> None:
     assert ("source", "orders", SamplePosition.LAST) in reader.sample_calls
     assert ("target", "orders", SamplePosition.FIRST) in reader.sample_calls
     assert ("target", "orders", SamplePosition.LAST) in reader.sample_calls
+
+
+def test_validate_tables_treats_target_only_schema_objects_as_informational() -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    users = next(table for table in snapshot.tables if table.ref.name == "users")
+    user_log = replace(users, ref=TableRef(schema="public", name="user_log"))
+    reader = FakeValidationReader(
+        counts={
+            ("source", "users"): 1,
+            ("target", "users"): 1,
+        },
+        samples={
+            ("source", "users"): ({"id": 1, "email": "a@example.com"},),
+            ("target", "users"): ({"id": 1, "email": "a@example.com"},),
+        },
+    )
+
+    report = validate_tables(
+        job_id="job-1",
+        tables=(users,),
+        reader=reader,
+        verification=VerificationConfig(),
+        source_snapshot=SchemaSnapshot(tables=(users,)),
+        target_snapshot=SchemaSnapshot(tables=(users, user_log)),
+    )
+
+    assert report.status == ValidationStatus.MATCHED
+    assert any(schema_object.status == "target_only" and schema_object.object_name == "public.user_log" for schema_object in report.schema_objects)
 
 
 def test_validate_tables_normalizes_boolean_tinyint_values() -> None:

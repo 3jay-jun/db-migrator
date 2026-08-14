@@ -27,6 +27,14 @@ class MismatchingReader:
         return ({"id": 1, "email": "target@example.com"},)
 
 
+class FailingValidationReader:
+    def count_rows(self, side: str, table) -> int:
+        raise RuntimeError(f"{side} row count unavailable")
+
+    def sample_rows(self, side: str, table_schema, sample_size: int) -> tuple[dict, ...]:
+        raise RuntimeError(f"{side} sample unavailable")
+
+
 def test_write_validation_report_outputs_json_csv_html_and_errors(tmp_path: Path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     report = validate_tables(
@@ -279,6 +287,34 @@ def test_write_validation_report_flags_missing_auto_increment_column_property(tm
     assert "AUTO_INCREMENT 누락" in schema_objects_csv
 
 
+def test_write_validation_report_keeps_target_only_schema_objects_informational(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    source_table = snapshot.tables[0]
+    target_only_table = replace(source_table, ref=TableRef(schema="public", name="user_log"))
+    report = validate_tables(
+        job_id="job-1",
+        tables=(source_table,),
+        reader=MatchingReader(),
+        verification=VerificationConfig(),
+        source_snapshot=SchemaSnapshot(tables=(source_table,)),
+        target_snapshot=SchemaSnapshot(tables=(source_table, target_only_table)),
+    )
+
+    write_validation_report(report, tmp_path)
+
+    assert report.status == "matched"
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["summary"]["schema_object_issue_count"] == 0
+    assert summary["summary"]["schema_object_warning_count"] == 1
+    assert summary["summary"]["warning_count"] == 1
+    assert summary["summary"]["issue_count"] == 0
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert '<div class="metric"><span>경고 수</span><strong>1</strong></div>' in html
+    schema_objects_csv = (tmp_path / "schema-objects.csv").read_text(encoding="utf-8")
+    assert "public.user_log" in schema_objects_csv
+    assert "target_only" in schema_objects_csv
+
+
 def test_write_validation_report_includes_execution_artifacts(tmp_path: Path) -> None:
     snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
     report = validate_tables(
@@ -418,6 +454,42 @@ def test_write_validation_report_uses_changed_sync_rows_as_summary_scope(tmp_pat
     assert "insert/update 대상 row를 target 반영 후 비교" in html
     assert "id=1" not in html
     assert "orders" not in (tmp_path / "tables.csv").read_text(encoding="utf-8")
+
+
+def test_write_validation_report_keeps_failed_validation_counts_separate_from_sync_rows(tmp_path: Path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    table_name = snapshot.tables[0].ref.name
+    report = validate_tables(
+        job_id="job-1",
+        tables=(snapshot.tables[0],),
+        reader=FailingValidationReader(),
+        verification=VerificationConfig(),
+        data_sync_artifacts=(
+            DataSyncArtifact(
+                schema="public",
+                table=table_name,
+                status="completed",
+                rows_inserted=17,
+                rows_updated=0,
+                rows_deleted=0,
+                rows_unchanged=0,
+                rows_processed=17,
+                rows_written=17,
+                changed_rows=17,
+                batches_written=1,
+            ),
+        ),
+    )
+
+    write_validation_report(report, tmp_path)
+
+    html = (tmp_path / "summary.html").read_text(encoding="utf-8")
+    assert "source row count unavailable" in html
+    assert "이관 데이터 검증" in html
+    assert "<td>17</td>" in html
+    assert "<span>-</span>" in html
+    tables_csv = (tmp_path / "tables.csv").read_text(encoding="utf-8")
+    assert "failed,,,failed,failed" in tables_csv
 
 
 def test_write_validation_report_shows_zero_scope_when_sync_has_no_changes(tmp_path: Path) -> None:

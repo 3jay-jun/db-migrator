@@ -14,9 +14,11 @@ from db_migrator.config.models import (
     TableRunConfig,
 )
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
+from db_migrator.core.existing_table_policy import build_existing_table_execution_plan
 from db_migrator.schema.column_plan import build_column_plan
 from db_migrator.schema.common_types import CommonType, CommonTypeKind, TypePolicy
 from db_migrator.schema.models import ColumnSchema, PrimaryKey, SchemaSnapshot, TableRef, TableSchema
+from db_migrator.schema.schema_pair import ResolvedTablePair, SchemaOrigin, SchemaPairPlan
 from db_migrator.schema.snapshot_io import load_schema_snapshot_from_json
 
 
@@ -148,6 +150,43 @@ def test_execute_schema_ddl_applies_sync_alter_candidates(tmp_path: Path) -> Non
     assert summary.tables[0].action == "sync_existing"
     assert summary.tables[1].action == "alter_table"
     assert executor.executed_ddls == ["ALTER TABLE `public`.`users` ADD COLUMN `legacy_code` longtext NOT NULL;"]
+
+
+def test_overwrite_create_uses_column_plan_target_table_for_source_only_columns(tmp_path: Path) -> None:
+    source_table = _table("public", "users", ("id", "email", "legacy_code"))
+    existing_target_table = _table("target_db", "app_users", ("id", "email"))
+    config = AppConfig(
+        migration=MigrationConfig(existing_table_policy=ExistingTablePolicy.OVERWRITE),
+        tables={"public.users": TableRunConfig.model_validate({"target_table": "app_users"})},
+    )
+    column_plan = build_column_plan(config=config, source_table=source_table, target_table=existing_target_table)
+    execution_plan = build_existing_table_execution_plan(
+        SchemaPairPlan(
+            pairs=(
+                ResolvedTablePair(
+                    source_table=source_table,
+                    target_table=existing_target_table,
+                    schema_origin=SchemaOrigin.TARGET_EXISTING,
+                    column_plan=column_plan,
+                ),
+            )
+        ),
+        ExistingTablePolicy.OVERWRITE,
+    )
+    executor = FakeDdlExecutor(existing_tables={"app_users"})
+
+    summary = execute_schema_ddl(
+        config=config,
+        snapshot=execution_plan.ddl_snapshot,
+        executor=executor,
+        report_output_path=tmp_path / "ddl-execution.json",
+        column_plans=execution_plan.column_plans,
+        execution_plan=execution_plan,
+    )
+
+    assert summary.tables[0].action == "drop"
+    assert summary.tables[1].action == "create"
+    assert "`legacy_code` longtext NOT NULL" in executor.executed_ddls[0]
 
 
 def test_execute_schema_ddl_applies_configured_new_target_column_candidates(tmp_path: Path) -> None:

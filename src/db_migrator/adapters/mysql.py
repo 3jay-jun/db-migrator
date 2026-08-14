@@ -510,7 +510,7 @@ class MySqlTargetAdapter:
             return WriteResult(success=True, rows_written=len(rows), message="Batch written.")
         except Exception as exc:
             raise MySqlAdapterError(
-                f"Failed to write target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+                _mysql_write_error_message(self._config, "write target batch", table_schema, sql, writable_columns, len(rows), exc)
             ) from exc
 
     def upsert_batch(self, table_schema: TableSchema, rows: tuple[RowData, ...], keys: tuple[str, ...]) -> WriteResult:
@@ -535,7 +535,7 @@ class MySqlTargetAdapter:
             return WriteResult(success=True, rows_written=len(rows), message="Batch upserted.")
         except Exception as exc:
             raise MySqlAdapterError(
-                f"Failed to upsert target batch for table: {table_schema.ref.name}. detail={safe_error_detail(exc)}"
+                _mysql_write_error_message(self._config, "upsert target batch", table_schema, sql, writable_columns, len(rows), exc)
             ) from exc
 
     def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> dict[tuple[object, ...], RowData]:
@@ -705,7 +705,7 @@ class MySqlDdlGenerator:
 
         table_name = qualify_mysql_table_name(table_schema, target_database=self._target_database)
         ddl_body = ",\n".join(column_lines)
-        ddl = f"CREATE TABLE {table_name} (\n{ddl_body}\n);"
+        ddl = f"CREATE TABLE {table_name} (\n{ddl_body}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
         warnings = _unique_warning_messages(
             warning.message
             for column in table_schema.columns
@@ -856,6 +856,30 @@ def _result_row_dict(row: object, columns: tuple[str, ...]) -> RowData:
     if isinstance(row, dict):
         return row
     return dict(zip(columns, row))
+
+
+def _mysql_write_error_message(
+    config: TargetConfig,
+    action: str,
+    table_schema: TableSchema,
+    sql: str,
+    columns: tuple[str, ...],
+    row_count: int,
+    exc: Exception,
+) -> str:
+    return " ".join(
+        (
+            f"Failed to {action} for table: {table_schema.ref.schema}.{table_schema.ref.name}.",
+            f"host={config.host}",
+            f"port={config.port}",
+            f"database={config.database}",
+            f"user={config.user}",
+            f"columns={','.join(columns)}",
+            f"row_count={row_count}",
+            f"sql={_compact_sql(sql)}",
+            f"detail={safe_error_detail(exc)}",
+        )
+    )
 
 
 def _unique_warning_messages(warnings: Iterable[str]) -> tuple[str, ...]:

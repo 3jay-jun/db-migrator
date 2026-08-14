@@ -43,6 +43,7 @@ def test_generate_create_table_uses_common_type_mapping_and_primary_key() -> Non
     assert "`id` int NOT NULL" in result.ddl
     assert "`email` varchar(255) NOT NULL" in result.ddl
     assert "PRIMARY KEY (`id`)" in result.ddl
+    assert result.ddl.endswith(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;")
 
 
 def test_generate_create_table_can_qualify_with_target_database() -> None:

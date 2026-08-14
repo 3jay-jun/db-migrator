@@ -90,10 +90,11 @@ def build_legacy_existing_table_execution_plan(
 
 
 def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> ExistingTableDdlItem:
+    ddl_target_table = pair.column_plan.target_table
     if not pair.target_exists:
         return ExistingTableDdlItem(
             source_table=pair.source_table,
-            target_table=pair.target_table,
+            target_table=ddl_target_table,
             target_exists=False,
             action="create",
             message="Target table does not exist; CREATE will run.",
@@ -102,7 +103,7 @@ def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> 
     if policy is ExistingTablePolicy.APPEND:
         return ExistingTableDdlItem(
             source_table=pair.source_table,
-            target_table=pair.target_table,
+            target_table=ddl_target_table,
             target_exists=True,
             action="skip",
             message="Target table already exists; append policy migrates only missing target tables.",
@@ -111,7 +112,7 @@ def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> 
     if policy is ExistingTablePolicy.SYNC:
         return ExistingTableDdlItem(
             source_table=pair.source_table,
-            target_table=pair.target_table,
+            target_table=ddl_target_table,
             target_exists=True,
             action="sync_existing",
             message="Target table already exists; CREATE skipped for sync policy.",
@@ -121,7 +122,7 @@ def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> 
     if policy is ExistingTablePolicy.TRUNCATE_RELOAD:
         return ExistingTableDdlItem(
             source_table=pair.source_table,
-            target_table=pair.target_table,
+            target_table=ddl_target_table,
             target_exists=True,
             action="truncate",
             message="Target table already exists; TRUNCATE will run before DML.",
@@ -131,7 +132,7 @@ def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> 
     if policy is ExistingTablePolicy.OVERWRITE:
         return ExistingTableDdlItem(
             source_table=pair.source_table,
-            target_table=pair.target_table,
+            target_table=ddl_target_table,
             target_exists=True,
             action="overwrite",
             message="Target table already exists; DROP and CREATE will run.",
@@ -140,7 +141,7 @@ def _ddl_item_for_pair(pair: ResolvedTablePair, policy: ExistingTablePolicy) -> 
 
     return ExistingTableDdlItem(
         source_table=pair.source_table,
-        target_table=pair.target_table,
+        target_table=ddl_target_table,
         target_exists=True,
         action="skip",
         message="Target table already exists; CREATE skipped and DML is allowed.",

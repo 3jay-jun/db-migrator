@@ -49,19 +49,15 @@ def _write_csv(report: ValidationReport, output_path: Path) -> None:
                 "대상_체크섬",
             ]
         )
-        data_sync_by_table = _data_sync_by_table(report)
         for table in _visible_table_results(report):
             metrics = _table_metrics(table)
-            data_sync_artifact = data_sync_by_table.get(table.table.name)
-            source_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else table.row_count.source_rows
-            target_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else table.row_count.target_rows
             writer.writerow(
                 [
                     metrics["schema"],
                     metrics["table"],
                     table.status,
-                    source_rows,
-                    target_rows,
+                    table.row_count.source_rows,
+                    table.row_count.target_rows,
                     table.row_count.status,
                     table.checksum.status,
                     metrics["matched_rows"],
@@ -312,7 +308,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
       background: var(--color-success-soft);
       color: var(--color-success-text);
     }}
-    .badge.mismatched, .badge.skipped {{
+    .badge.mismatched, .badge.skipped, .badge.warning {{
       background: var(--color-warning-soft);
       color: var(--color-warning-text);
       border: 1px solid var(--color-warning-border);
@@ -502,6 +498,7 @@ def _write_html(report: ValidationReport, output_path: Path) -> None:
         <div class="metric"><span>검증 테이블 수</span><strong>{summary["table_count"]}</strong></div>
         <div class="metric"><span>전체 데이터 수</span><strong>{_summary_data_metric(report, summary["total_target_rows"])}</strong></div>
         <div class="metric"><span>검증 데이터 수</span><strong>{_summary_data_metric(report, summary["total_target_rows"])}</strong></div>
+        <div class="metric"><span>경고 수</span><strong>{summary["warning_count"]}</strong></div>
         <div class="metric"><span>이슈 수</span><strong>{summary["issue_count"]}</strong></div>
       </div>
     </header>
@@ -710,6 +707,7 @@ def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
     successful_migrated_rows = _sum_successful_target_rows(report)
     table_issue_count = _issue_count(report)
     schema_object_issue_count = sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status))
+    schema_object_warning_count = _schema_object_warning_count(report)
     failed_execution_artifact_count = sum(1 for artifact in report.execution_artifacts if not artifact.success)
     return {
         "table_count": len(report.tables),
@@ -729,6 +727,8 @@ def _summary_metrics(report: ValidationReport) -> dict[str, int | None]:
         "schema_object_count": len(report.schema_objects),
         "table_issue_count": table_issue_count,
         "schema_object_issue_count": schema_object_issue_count,
+        "schema_object_warning_count": schema_object_warning_count,
+        "warning_count": schema_object_warning_count,
         "issue_count": table_issue_count + schema_object_issue_count + failed_execution_artifact_count,
         "execution_artifact_count": len(report.execution_artifacts),
         "failed_execution_artifact_count": failed_execution_artifact_count,
@@ -742,6 +742,7 @@ def _data_sync_summary_metrics(report: ValidationReport) -> dict[str, int | None
     changed_rows = sum(artifact.changed_rows for artifact in changed_data_artifacts)
     failed_execution_artifact_count = sum(1 for artifact in report.execution_artifacts if not artifact.success)
     schema_object_issue_count = sum(1 for schema_object in report.schema_objects if _is_schema_object_action_required(schema_object.status))
+    schema_object_warning_count = _schema_object_warning_count(report)
     table_issue_count = sum(1 for table in _visible_table_results(report) if table.status != ValidationStatus.MATCHED)
     return {
         "table_count": len(changed_table_names),
@@ -761,6 +762,8 @@ def _data_sync_summary_metrics(report: ValidationReport) -> dict[str, int | None
         "schema_object_count": len(report.schema_objects),
         "table_issue_count": table_issue_count,
         "schema_object_issue_count": schema_object_issue_count,
+        "schema_object_warning_count": schema_object_warning_count,
+        "warning_count": schema_object_warning_count,
         "issue_count": table_issue_count + schema_object_issue_count + failed_execution_artifact_count,
         "execution_artifact_count": len(report.execution_artifacts),
         "failed_execution_artifact_count": failed_execution_artifact_count,
@@ -995,12 +998,19 @@ def _issue_count(report: ValidationReport) -> int:
     return sum(1 for table in report.tables if table.status != ValidationStatus.MATCHED)
 
 
+def _schema_object_warning_count(report: ValidationReport) -> int:
+    return sum(1 for schema_object in report.schema_objects if _is_schema_object_warning(schema_object.status))
+
+
 def _table_summary_row(table, data_sync_artifact=None) -> str:
     metrics = _table_metrics(table)
-    source_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else metrics["source_rows"]
-    target_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else metrics["target_rows"]
-    row_delta = "0" if data_sync_artifact is not None else _row_count_delta_label(table)
-    representative_issue = _data_sync_summary_label(data_sync_artifact) if data_sync_artifact is not None else _representative_issue(table)
+    migrated_rows = data_sync_artifact.changed_rows if data_sync_artifact is not None else metrics["target_rows"]
+    row_delta = _row_count_delta_label(table)
+    representative_issue = (
+        _data_sync_summary_label(data_sync_artifact)
+        if data_sync_artifact is not None and table.status == ValidationStatus.MATCHED
+        else _representative_issue(table)
+    )
     next_action = "변경분 source/target 검증 완료" if data_sync_artifact is not None and table.status == ValidationStatus.MATCHED else _next_action(table)
     return f"""
           <tr>
@@ -1010,8 +1020,8 @@ def _table_summary_row(table, data_sync_artifact=None) -> str:
                   <span>{escape(str(metrics["schema"]))}</span>
                   <span class="summary-table">{escape(str(metrics["table"]))}</span>
                   <span><span class="badge {escape(str(metrics["status"]))}">{escape(result_label(str(metrics["status"])))}</span></span>
-                  <span>{_format_optional_int(source_rows)}</span>
-                  <span>{_format_optional_int(target_rows)}</span>
+                  <span>{_format_optional_int(metrics["source_rows"])}</span>
+                  <span>{_format_optional_int(migrated_rows)}</span>
                   <span>{escape(row_delta)}</span>
                   <span>{escape(representative_issue)}</span>
                   <span class="action">{escape(next_action)}</span>
@@ -1207,7 +1217,7 @@ def _schema_object_badge_class(status: str) -> str:
     if status == "manual_review":
         return "skipped"
     if status == "target_only":
-        return "skipped"
+        return "warning"
     return "mismatched"
 
 
@@ -1222,11 +1232,15 @@ def _schema_object_status_label(status: str) -> str:
 
 
 def _is_schema_object_issue(status: str) -> bool:
-    return status in {"missing", "mismatched", "target_only"}
+    return status in {"missing", "mismatched"}
+
+
+def _is_schema_object_warning(status: str) -> bool:
+    return status == "target_only"
 
 
 def _is_schema_object_action_required(status: str) -> bool:
-    return status != "matched"
+    return status not in {"matched", "target_only"}
 
 
 def _issue_rows(table) -> str:

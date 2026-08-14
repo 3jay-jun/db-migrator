@@ -150,7 +150,7 @@ class ValidationReport:
         if any(not artifact.success for artifact in self.execution_artifacts):
             return ValidationStatus.FAILED
         if any(table.status == ValidationStatus.MISMATCHED for table in self.tables) or any(
-            schema_object.status in {"missing", "mismatched", "manual_review", "target_only"} for schema_object in self.schema_objects
+            schema_object.status in {"missing", "mismatched", "manual_review"} for schema_object in self.schema_objects
         ):
             return ValidationStatus.MISMATCHED
         return ValidationStatus.MATCHED

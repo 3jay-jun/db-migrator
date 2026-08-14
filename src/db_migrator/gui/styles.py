@@ -54,7 +54,7 @@ def jigration_stylesheet() -> str:
         color: #6B7280;
         font-size: 11px;
         font-weight: 400;
-        margin-left: -6px;
+        padding-left: 1px;
     }
 
     QLabel#actionSeparator {
@@ -77,6 +77,12 @@ def jigration_stylesheet() -> str:
     }
 
     QLabel#tableHint {
+        color: #6B7280;
+        font-size: 11px;
+        font-weight: 400;
+    }
+
+    QLabel#subtleText {
         color: #6B7280;
         font-size: 11px;
         font-weight: 400;

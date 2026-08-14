@@ -165,14 +165,17 @@ class PostgresTargetAdapter:
 
     def count_rows(self, table: TableRef) -> int:
         table_sql = _qualified_postgres_table_ref(table)
+        sql = f"select count(*) as row_count from {table_sql}"
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(f"select count(*) as row_count from {table_sql}")
+                    cursor.execute(sql)
                     row = cursor.fetchone()
                     return int(row["row_count"] if isinstance(row, dict) else row[0])
         except Exception as exc:
-            raise PostgresAdapterError(f"PostgreSQL row count failed for table: {table.name}") from exc
+            raise PostgresAdapterError(
+                _postgres_validation_error_message(self._config, "row count", table, sql, exc)
+            ) from exc
 
     def begin_sync_keys(self, table_schema: TableSchema, keys: tuple[str, ...]) -> None:
         temp_table = _postgres_sync_temp_table_name(table_schema)
@@ -237,13 +240,26 @@ class PostgresTargetAdapter:
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
         table_sql = _qualified_postgres_table_ref(table)
         order_sql = _postgres_order_by_clause(order_by, position=position)
+        sql = f"select {column_sql} from {table_sql}{order_sql} limit %s"
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(f"select {column_sql} from {table_sql}{order_sql} limit %s", (sample_size,))
+                    cursor.execute(sql, (sample_size,))
                     return tuple(dict(row) for row in cursor.fetchall())
         except Exception as exc:
-            raise PostgresAdapterError(f"PostgreSQL sample rows failed for table: {table.name}") from exc
+            raise PostgresAdapterError(
+                _postgres_validation_error_message(
+                    self._config,
+                    "sample rows",
+                    table,
+                    sql,
+                    exc,
+                    columns=columns,
+                    sample_size=sample_size,
+                    order_by=order_by,
+                    position=position,
+                )
+            ) from exc
 
     def commit(self) -> None:
         if self._dml_connection is not None:
@@ -432,14 +448,17 @@ class PostgresSourceAdapter:
 
     def count_rows(self, table: TableRef) -> int:
         table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+        sql = f"select count(*) from {table_sql}"
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(f"select count(*) from {table_sql}")
+                    cursor.execute(sql)
                     row = cursor.fetchone()
                     return int(row["count"] if isinstance(row, dict) else row[0])
         except Exception as exc:
-            raise PostgresAdapterError(f"PostgreSQL row count failed for table: {table.name}") from exc
+            raise PostgresAdapterError(
+                _postgres_validation_error_message(self._config, "row count", table, sql, exc)
+            ) from exc
 
     def sample_rows(
         self,
@@ -453,14 +472,27 @@ class PostgresSourceAdapter:
             return ()
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
         table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+        order_sql = _postgres_order_by_clause(order_by, position=position)
+        sql = f"select {column_sql} from {table_sql}{order_sql} limit %s"
         try:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
-                    order_sql = _postgres_order_by_clause(order_by, position=position)
-                    cursor.execute(f"select {column_sql} from {table_sql}{order_sql} limit %s", (sample_size,))
+                    cursor.execute(sql, (sample_size,))
                     return tuple(dict(row) for row in cursor.fetchall())
         except Exception as exc:
-            raise PostgresAdapterError(f"PostgreSQL sample rows failed for table: {table.name}") from exc
+            raise PostgresAdapterError(
+                _postgres_validation_error_message(
+                    self._config,
+                    "sample rows",
+                    table,
+                    sql,
+                    exc,
+                    columns=columns,
+                    sample_size=sample_size,
+                    order_by=order_by,
+                    position=position,
+                )
+            ) from exc
 
     def read_incremental_rows(
         self,
@@ -931,6 +963,38 @@ def _compact_sql(sql: str) -> str:
     if len(compact) <= 500:
         return compact
     return compact[:497] + "..."
+
+
+def _postgres_validation_error_message(
+    config: SourceConfig | TargetConfig,
+    action: str,
+    table: TableRef,
+    sql: str,
+    exc: Exception,
+    *,
+    columns: tuple[str, ...] = (),
+    sample_size: int | None = None,
+    order_by: tuple[str, ...] = (),
+    position: SamplePosition | None = None,
+) -> str:
+    parts = [
+        f"PostgreSQL {action} failed for table: {table.schema}.{table.name}.",
+        f"host={config.host}",
+        f"port={config.port}",
+        f"database={config.database}",
+        f"user={config.user}",
+        f"sql={_compact_sql(sql)}",
+    ]
+    if columns:
+        parts.append(f"columns={','.join(columns)}")
+    if order_by:
+        parts.append(f"order_by={','.join(order_by)}")
+    if sample_size is not None:
+        parts.append(f"sample_size={sample_size}")
+    if position is not None:
+        parts.append(f"position={position.value}")
+    parts.append(f"detail={safe_error_detail(exc)}")
+    return " ".join(parts)
 
 
 def _first_row_value(row: Any) -> Any:

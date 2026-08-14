@@ -7,7 +7,7 @@ import pytest
 
 from db_migrator.adapters.postgres import PostgresAdapterError, PostgresSourceAdapter, PostgresTargetAdapter
 from db_migrator.config.models import SourceConfig, TargetConfig
-from db_migrator.schema.models import ColumnSchema, TableRef, TableSchema
+from db_migrator.schema.models import ColumnSchema, SamplePosition, TableRef, TableSchema
 from db_migrator.schema.type_mapping import postgres_type_to_common
 
 
@@ -40,6 +40,34 @@ class TupleConnection:
 
     def cursor(self) -> TupleCursor:
         return TupleCursor(self._rows)
+
+
+class FailingCursor:
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __enter__(self) -> "FailingCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def execute(self, _sql: str, _params: tuple | None = None) -> None:
+        raise RuntimeError(self._message)
+
+
+class FailingConnection:
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __enter__(self) -> "FailingConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def cursor(self) -> FailingCursor:
+        return FailingCursor(self._message)
 
 
 def _account_table() -> TableSchema:
@@ -153,3 +181,47 @@ def test_scan_schema_reports_metadata_query_context(monkeypatch: pytest.MonkeyPa
     assert "schema metadata query failed" in message
     assert "schema 'private'" in message
     assert "permission denied for information_schema" in message
+
+
+def test_source_count_rows_reports_validation_query_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresSourceAdapter(
+        SourceConfig(host="10.0.0.10", port=15432, database="legacy", user="readonly", password="secret")
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda: FailingConnection("server closed the connection unexpectedly"))
+
+    with pytest.raises(PostgresAdapterError) as exc_info:
+        adapter.count_rows(TableRef(schema="public", name="account"))
+
+    message = str(exc_info.value)
+    assert "PostgreSQL row count failed for table: public.account." in message
+    assert "host=10.0.0.10" in message
+    assert "port=15432" in message
+    assert "database=legacy" in message
+    assert "user=readonly" in message
+    assert 'sql=select count(*) from "public"."account"' in message
+    assert "detail=server closed the connection unexpectedly" in message
+    assert "secret" not in message
+
+
+def test_target_sample_rows_reports_validation_query_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PostgresTargetAdapter(
+        TargetConfig(host="10.0.0.11", port=15433, database="target", user="migration", password="secret")
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda: FailingConnection("permission denied for table account"))
+
+    with pytest.raises(PostgresAdapterError) as exc_info:
+        adapter.sample_rows(TableRef(schema="public", name="account"), ("id", "email"), 20, ("id",), SamplePosition.LAST)
+
+    message = str(exc_info.value)
+    assert "PostgreSQL sample rows failed for table: public.account." in message
+    assert "host=10.0.0.11" in message
+    assert "port=15433" in message
+    assert "database=target" in message
+    assert "user=migration" in message
+    assert 'sql=select "id", "email" from "public"."account" order by "id" desc limit %s' in message
+    assert "columns=id,email" in message
+    assert "order_by=id" in message
+    assert "sample_size=20" in message
+    assert "position=last" in message
+    assert "detail=permission denied for table account" in message
+    assert "secret" not in message

@@ -407,8 +407,14 @@ if Signal is not None:
             self.table_selected_count_value.setObjectName("selectedCountValue")
             self.table_selected_count_suffix = QLabel("/ 0 선택")
             self.table_selected_count_suffix.setObjectName("selectedCountSuffix")
-            search_row.addWidget(self.table_selected_count_value)
-            search_row.addWidget(self.table_selected_count_suffix)
+            selected_count_row = QWidget()
+            selected_count_row.setObjectName("transparentRow")
+            selected_count_layout = QHBoxLayout(selected_count_row)
+            selected_count_layout.setContentsMargins(0, 0, 0, 0)
+            selected_count_layout.setSpacing(0)
+            selected_count_layout.addWidget(self.table_selected_count_value)
+            selected_count_layout.addWidget(self.table_selected_count_suffix)
+            search_row.addWidget(selected_count_row)
             layout.addLayout(search_row)
             self.table_list = QTableWidget()
             self.table_list.setColumnCount(6)
@@ -490,6 +496,7 @@ if Signal is not None:
             layout.addWidget(self.incremental_enabled)
             layout.addSpacing(8)
             note = QLabel("테이블별 증분 기준 컬럼과 시작/종료 값은 각 테이블의 설정 창에서 지정합니다.")
+            note.setObjectName("subtleText")
             note.setWordWrap(True)
             layout.addWidget(_field_column("안내", note))
             layout.addStretch(1)
@@ -1464,6 +1471,7 @@ if Signal is not None:
             form = QFormLayout()
             target_schema = QLineEdit(current_schema)
             target_table = _target_table_combo(self._target_table_options, current_schema, current)
+            target_table.setMinimumWidth(360)
             table_status = QLabel(_target_table_status_label(self._target_table_options, current_schema, current, dry_run_table))
             comment = QLineEdit(str(item.data(TABLE_COMMENT_ROLE) or ""))
             source_only_actions = _parse_source_only_columns(str(item.data(SOURCE_ONLY_COLUMNS_ROLE) or ""))
@@ -2259,6 +2267,7 @@ if Signal is not None:
         if current_table and combo.findText(current_table) < 0:
             combo.addItem(current_table)
         combo.setCurrentText(current_table)
+        combo.setMinimumWidth(320)
         return combo
 
 
@@ -2484,7 +2493,14 @@ if Signal is not None:
                 if color is not None:
                     action_item.setBackground(QBrush(color))
                 table.setItem(row, 6, action_item)
-        table.resizeColumnsToContents()
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(0, 170)
+        table.setColumnWidth(1, 140)
+        table.setColumnWidth(2, 270)
+        table.setColumnWidth(3, 160)
+        table.setColumnWidth(4, 64)
+        table.setColumnWidth(5, 96)
+        table.setColumnWidth(6, 96)
         return table, {"target": target_combos, "type": type_edits, "action": action_combos}
 
 
@@ -2705,7 +2721,10 @@ if Signal is not None:
             column_lines.append(f"  PRIMARY KEY ({', '.join(primary_key_columns)})")
         if not column_lines:
             return ""
-        return f"CREATE TABLE {table_name} (\n" + ",\n".join(column_lines) + "\n);"
+        create_sql = f"CREATE TABLE {table_name} (\n" + ",\n".join(column_lines) + "\n)"
+        if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
+            return f"{create_sql} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
+        return f"{create_sql};"
 
 
     def _draft_mapped_column_change_candidates(
