@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from datetime import datetime
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import yaml
 
@@ -27,6 +28,7 @@ from db_migrator.config.models import (
 )
 from db_migrator.connection import SshConnectionTester, TunnelError
 from db_migrator.core.events import EventPublisher, FileEventPublisher, MigrationEvent
+from db_migrator.gui.styles import jigration_stylesheet
 from db_migrator.gui.state import GuiPathState, GuiStateStore
 from db_migrator.schema.common_types import CommonTypeKind
 from db_migrator.schema.type_mapping import common_type_to_mysql, common_type_to_postgres, mysql_type_to_common, postgres_type_to_common
@@ -39,6 +41,7 @@ def main() -> None:
         raise SystemExit("PySide6 is not installed. Install the GUI extra before running jigration-gui.") from exc
 
     app = QApplication(sys.argv)
+    app.setStyleSheet(jigration_stylesheet())
     app_icon = _app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
@@ -55,6 +58,7 @@ try:
     from PySide6.QtWidgets import (
         QCheckBox,
         QComboBox,
+        QAbstractItemView,
         QApplication,
         QDialog,
         QDialogButtonBox,
@@ -63,11 +67,10 @@ try:
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
+        QHeaderView,
         QInputDialog,
         QLabel,
         QLineEdit,
-        QListWidget,
-        QListWidgetItem,
         QMainWindow,
         QMessageBox,
         QPushButton,
@@ -183,14 +186,17 @@ if Signal is not None:
             app_icon = _app_icon()
             if not app_icon.isNull():
                 self.setWindowIcon(app_icon)
-            self.resize(1180, 820)
+            self.resize(1060, 1020)
             self._build_ui()
             self._load_config_into_form(show_errors=False)
             self._set_table_actions_enabled(False)
 
         def _build_ui(self) -> None:
             root = QWidget()
+            root.setObjectName("appRoot")
             layout = QVBoxLayout(root)
+            layout.setContentsMargins(16, 14, 16, 24)
+            layout.setSpacing(14)
 
             path_state = self._load_gui_path_state()
             self.config_path = QLineEdit(path_state.config_path)
@@ -198,6 +204,8 @@ if Signal is not None:
             self.output_dir = QLineEdit(path_state.output_dir)
             self.checkpoint_path = QLineEdit(path_state.checkpoint_path)
             top_bar = QHBoxLayout()
+            top_bar.setContentsMargins(0, 0, 0, 0)
+            top_bar.setSpacing(8)
             self.config_label = QLabel(f"설정 파일: {self.config_path.text()}")
             top_bar.addWidget(self.config_label, stretch=1)
             settings_button = QPushButton("설정")
@@ -206,38 +214,55 @@ if Signal is not None:
             layout.addLayout(top_bar)
 
             db_grid = QGridLayout()
+            db_grid.setContentsMargins(0, 0, 0, 0)
+            db_grid.setHorizontalSpacing(14)
+            db_grid.setVerticalSpacing(14)
             db_grid.addWidget(self._source_group(), 0, 0)
             db_grid.addWidget(self._target_group(), 0, 1)
             layout.addLayout(db_grid)
 
             body = QGridLayout()
+            body.setContentsMargins(0, 0, 0, 0)
+            body.setHorizontalSpacing(14)
+            body.setVerticalSpacing(14)
             body.addWidget(self._table_group(), 0, 0)
             body.addWidget(self._options_group(), 0, 1)
             layout.addLayout(body, stretch=1)
 
             actions = QHBoxLayout()
+            actions.setContentsMargins(0, 0, 0, 0)
+            actions.setSpacing(8)
             scan_button = QPushButton("테이블 불러오기")
+            scan_button.setFixedWidth(140)
             scan_button.clicked.connect(self._scan_tables)
             self._buttons.append(scan_button)
             actions.addWidget(scan_button)
             self.review_button = QPushButton("검토 실행")
+            self.review_button.setFixedWidth(96)
             self.review_button.clicked.connect(self._run_dry_run)
             self._buttons.append(self.review_button)
             self._table_actions.append(self.review_button)
             actions.addWidget(self.review_button)
-            self.migrate_button = QPushButton("실행")
+            actions.addStretch(1)
+            self.cancel_button = QPushButton("취소")
+            self.cancel_button.setObjectName("dangerButton")
+            self.cancel_button.setFixedWidth(64)
+            self.cancel_button.clicked.connect(self._cancel_running_command)
+            self.cancel_button.setEnabled(False)
+            actions.addWidget(self.cancel_button)
+            self.migrate_button = QPushButton("이관 실행")
+            self.migrate_button.setObjectName("primaryButton")
+            self.migrate_button.setFixedWidth(96)
             self.migrate_button.clicked.connect(self._run_migration_from_mode)
             self._buttons.append(self.migrate_button)
             self._table_actions.append(self.migrate_button)
             actions.addWidget(self.migrate_button)
-            self.cancel_button = QPushButton("취소")
-            self.cancel_button.clicked.connect(self._cancel_running_command)
-            self.cancel_button.setEnabled(False)
-            actions.addWidget(self.cancel_button)
             layout.addLayout(actions)
 
             self.recovery_group = QGroupBox("복구 작업")
             recovery_actions = QHBoxLayout(self.recovery_group)
+            recovery_actions.setContentsMargins(0, 0, 0, 0)
+            recovery_actions.setSpacing(8)
             resume_button = QPushButton("이어서 실행")
             resume_button.clicked.connect(self._run_resume)
             retry_button = QPushButton("실패 테이블 재시도")
@@ -249,16 +274,39 @@ if Signal is not None:
             self.recovery_group.setVisible(False)
             layout.addWidget(self.recovery_group)
 
-            self.status = QLabel("준비됨")
-            layout.addWidget(self.status)
+            self.status = QLabel()
+            self.status.setVisible(False)
+            log_panel = QGroupBox()
+            log_panel.setObjectName("contentPanel")
+            log_layout = QVBoxLayout(log_panel)
+            log_layout.setContentsMargins(0, 0, 0, 0)
+            log_layout.setSpacing(10)
+            log_header = QHBoxLayout()
+            log_header.setContentsMargins(0, 0, 0, 0)
+            log_header.setSpacing(8)
+            log_title = QLabel("실행 로그")
+            log_title.setObjectName("sectionTitle")
+            log_header.addWidget(log_title, stretch=1)
+            clear_log_button = QPushButton("로그 지우기")
+            clear_log_button.setObjectName("textButton")
+            clear_log_button.clicked.connect(self._clear_screen_log)
+            log_header.addWidget(clear_log_button)
+            log_layout.addLayout(log_header)
             self.log = QPlainTextEdit()
             self.log.setReadOnly(True)
-            layout.addWidget(self.log, stretch=1)
+            self.log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            self.log.setFixedHeight(150)
+            log_layout.addWidget(self.log)
+            layout.addWidget(log_panel)
             self.setCentralWidget(root)
 
         def _source_group(self) -> QGroupBox:
             group = QGroupBox("원본 DB")
-            form = QFormLayout(group)
+            group.setMinimumHeight(390)
+            grid = QGridLayout(group)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(14)
             self.source_dbms = _combo([dbms.value for dbms in Dbms])
             self.source_host = QLineEdit()
             self.source_port = _spin(1, 65535)
@@ -267,26 +315,30 @@ if Signal is not None:
             self.source_user = QLineEdit()
             self.source_password = QLineEdit()
             self.source_password.setEchoMode(QLineEdit.EchoMode.Password)
-            self.source_tunnel_enabled = QCheckBox("Use SSH Tunnel")
+            self.source_tunnel_enabled = QCheckBox("SSH 터널 사용")
             source_tunnel_button = QPushButton("SSH 터널 설정")
             source_tunnel_button.clicked.connect(lambda: self._open_tunnel_settings("source"))
             test_button = QPushButton("원본 연결 테스트")
             test_button.clicked.connect(self._test_source)
             self._buttons.extend([source_tunnel_button, test_button])
-            form.addRow("DBMS", self.source_dbms)
-            form.addRow("호스트", self.source_host)
-            form.addRow("포트", self.source_port)
-            form.addRow("데이터베이스", self.source_database)
-            form.addRow("스키마", self.source_schema)
-            form.addRow("사용자", self.source_user)
-            form.addRow("비밀번호", self.source_password)
-            form.addRow("SSH 터널", _inline_row(self.source_tunnel_enabled, source_tunnel_button))
-            form.addRow("", test_button)
+            grid.addWidget(_field_column("DBMS", self.source_dbms), 0, 0, 1, 2)
+            grid.addWidget(_field_column("Host", self.source_host), 1, 0)
+            grid.addWidget(_field_column("Port", self.source_port), 1, 1)
+            grid.addWidget(_field_column("Database", self.source_database), 2, 0)
+            grid.addWidget(_field_column("Schema", self.source_schema), 2, 1)
+            grid.addWidget(_field_column("User", self.source_user), 3, 0)
+            grid.addWidget(_field_column("Password", self.source_password), 3, 1)
+            grid.addWidget(_inline_row(self.source_tunnel_enabled, source_tunnel_button), 4, 0, 1, 2)
+            grid.addWidget(test_button, 5, 0, 1, 2)
             return group
 
         def _target_group(self) -> QGroupBox:
             group = QGroupBox("대상 DB")
-            form = QFormLayout(group)
+            group.setMinimumHeight(390)
+            grid = QGridLayout(group)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(14)
             self.target_dbms = _combo([dbms.value for dbms in Dbms])
             self.target_host = QLineEdit()
             self.target_port = _spin(1, 65535)
@@ -296,48 +348,125 @@ if Signal is not None:
             self.target_user = QLineEdit()
             self.target_password = QLineEdit()
             self.target_password.setEchoMode(QLineEdit.EchoMode.Password)
-            self.target_tunnel_enabled = QCheckBox("Use SSH Tunnel")
+            self.target_tunnel_enabled = QCheckBox("SSH 터널 사용")
             target_tunnel_button = QPushButton("SSH 터널 설정")
             target_tunnel_button.clicked.connect(lambda: self._open_tunnel_settings("target"))
             test_button = QPushButton("대상 연결 테스트")
             test_button.clicked.connect(self._test_target)
             self._buttons.extend([target_tunnel_button, test_button])
-            form.addRow("DBMS", self.target_dbms)
-            form.addRow("호스트", self.target_host)
-            form.addRow("포트", self.target_port)
-            form.addRow("데이터베이스", self.target_database)
-            form.addRow("기본 대상 스키마", self.target_schema)
-            form.addRow("사용자", self.target_user)
-            form.addRow("비밀번호", self.target_password)
-            form.addRow("SSH 터널", _inline_row(self.target_tunnel_enabled, target_tunnel_button))
-            form.addRow("", test_button)
+            grid.addWidget(_field_column("DBMS", self.target_dbms), 0, 0, 1, 2)
+            grid.addWidget(_field_column("Host", self.target_host), 1, 0)
+            grid.addWidget(_field_column("Port", self.target_port), 1, 1)
+            grid.addWidget(_field_column("Database", self.target_database), 2, 0)
+            grid.addWidget(_field_column("기본 대상 스키마", self.target_schema), 2, 1)
+            grid.addWidget(_field_column("User", self.target_user), 3, 0)
+            grid.addWidget(_field_column("Password", self.target_password), 3, 1)
+            grid.addWidget(_inline_row(self.target_tunnel_enabled, target_tunnel_button), 4, 0, 1, 2)
+            grid.addWidget(test_button, 5, 0, 1, 2)
             return group
 
         def _table_group(self) -> QGroupBox:
-            group = QGroupBox("이관 대상 테이블")
+            group = QGroupBox()
+            group.setObjectName("contentPanel")
+            group.setMinimumHeight(440)
             layout = QVBoxLayout(group)
-            controls = QHBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(10)
+            header = QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            header.setSpacing(8)
+            title = QLabel("이관 대상 테이블")
+            title.setObjectName("sectionTitle")
+            header.addWidget(title)
+            header.addStretch(1)
             select_all = QPushButton("전체 선택")
+            select_all.setObjectName("textButton")
             select_none = QPushButton("전체 해제")
+            select_none.setObjectName("mutedTextButton")
             select_all.clicked.connect(lambda: self._set_all_tables(True))
             select_none.clicked.connect(lambda: self._set_all_tables(False))
-            controls.addWidget(select_all)
-            controls.addWidget(select_none)
-            layout.addLayout(controls)
-            self.table_list = QListWidget()
+            header.addWidget(select_all)
+            separator = QLabel("|")
+            separator.setObjectName("actionSeparator")
+            header.addWidget(separator)
+            header.addWidget(select_none)
+            layout.addLayout(header)
+            search_row = QHBoxLayout()
+            search_row.setContentsMargins(0, 0, 0, 0)
+            search_row.setSpacing(8)
+            self.table_search = QLineEdit()
+            self.table_search.setPlaceholderText("테이블 검색...")
+            self.table_search.setFixedWidth(245)
+            self.table_search.textChanged.connect(self._filter_tables)
+            search_row.addWidget(self.table_search)
+            search_row.addStretch(1)
+            self.table_selected_count = QLabel("0 / 0 선택")
+            self.table_selected_count.setVisible(False)
+            self.table_selected_count.setObjectName("countText")
+            self.table_selected_count_value = QLabel("0")
+            self.table_selected_count_value.setObjectName("selectedCountValue")
+            self.table_selected_count_suffix = QLabel("/ 0 선택")
+            self.table_selected_count_suffix.setObjectName("selectedCountSuffix")
+            search_row.addWidget(self.table_selected_count_value)
+            search_row.addWidget(self.table_selected_count_suffix)
+            layout.addLayout(search_row)
+            self.table_list = QTableWidget()
+            self.table_list.setColumnCount(6)
+            self.table_list.setHorizontalHeaderLabels(["선택", "원본 테이블", "", "대상 테이블", "예상 행", "설정"])
+            self.table_list.verticalHeader().setVisible(False)
+            self.table_list.verticalHeader().setDefaultSectionSize(50)
+            self.table_list.verticalHeader().setMinimumSectionSize(50)
+            for column in range(self.table_list.columnCount()):
+                header_item = self.table_list.horizontalHeaderItem(column)
+                if header_item is not None:
+                    header_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_list.setAlternatingRowColors(False)
+            self.table_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.table_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table_list.setColumnWidth(0, 52)
+            self.table_list.setColumnWidth(2, 36)
+            self.table_list.setColumnWidth(4, 84)
+            self.table_list.setColumnWidth(5, 72)
+            self.table_list.setShowGrid(False)
+            self.table_list.horizontalHeader().setStretchLastSection(False)
+            self.table_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
             self.table_list.itemDoubleClicked.connect(self._edit_table_settings)
+            self.table_list.itemSelectionChanged.connect(self._refresh_table_focus_indicators)
+            self.table_list.currentCellChanged.connect(lambda _row, _column, _previous_row, _previous_column: self._refresh_table_focus_indicators())
             layout.addWidget(self.table_list, stretch=1)
+            self.table_summary_count = QLabel("")
+            self.table_summary_count.setObjectName("tableSummaryCount")
             self.table_summary = QLabel("원본 DB 연결 후 테이블을 불러오면 이관 대상을 선택할 수 있습니다.")
+            self.table_summary.setObjectName("tableSummary")
             self.table_summary.setWordWrap(True)
-            layout.addWidget(self.table_summary)
+            self.table_hint = QLabel("")
+            self.table_hint.setObjectName("tableHint")
+            summary_row = QHBoxLayout()
+            summary_row.setContentsMargins(0, 0, 0, 0)
+            summary_row.setSpacing(4)
+            summary_row.addWidget(self.table_summary_count)
+            summary_row.addWidget(self.table_summary, stretch=1)
+            summary_row.addWidget(self.table_hint)
+            layout.addLayout(summary_row)
             return group
 
         def _options_group(self) -> QGroupBox:
-            group = QGroupBox("이관 옵션")
-            form = QFormLayout(group)
+            group = QGroupBox()
+            group.setObjectName("contentPanel")
+            group.setMinimumHeight(440)
+            layout = QVBoxLayout(group)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(12)
+            layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            title = QLabel("이관 옵션")
+            title.setObjectName("sectionTitle")
+            layout.addWidget(title)
             self.migration_mode = _combo(list(GUI_MIGRATION_MODES_BY_LABEL))
             self.existing_table_policy = _policy_combo()
             self.apply_foreign_keys = QCheckBox("데이터 이관 후 외래키 적용")
+            self.apply_foreign_keys.setObjectName("switchOption")
             self.migration_mode.currentTextChanged.connect(self._sync_foreign_key_option)
             self.apply_foreign_keys.toggled.connect(self._remember_manual_foreign_key_option)
             self.batch_size = _spin(1, 10_000_000)
@@ -345,19 +474,25 @@ if Signal is not None:
             self.parallel_table_count = _spin(1, 64)
             self.throttle_sleep_ms = _spin(0, 60_000)
             self.generate_report = QCheckBox("리포트 생성 후 열기")
+            self.generate_report.setObjectName("switchOption")
             self.generate_report.setChecked(True)
             self.auto_validate = QCheckBox("자동 검증")
+            self.auto_validate.setObjectName("switchOption")
             self.auto_validate.setChecked(True)
             self.incremental_enabled = QCheckBox("증분 이관 사용")
-            form.addRow("실행 방식", self.migration_mode)
-            form.addRow("기존 테이블 처리", self.existing_table_policy)
-            form.addRow("", self.apply_foreign_keys)
-            form.addRow("", self.generate_report)
-            form.addRow("", self.auto_validate)
-            form.addRow("", self.incremental_enabled)
-            note = QLabel("배치 크기, checkpoint 경로, schema snapshot 등은 설정 화면에서 조정합니다.")
+            self.incremental_enabled.setObjectName("switchOption")
+            layout.addWidget(_field_column("실행 방식", self.migration_mode))
+            layout.addWidget(_field_column("기존 테이블 처리", self.existing_table_policy))
+            layout.addSpacing(4)
+            layout.addWidget(self.apply_foreign_keys)
+            layout.addWidget(self.generate_report)
+            layout.addWidget(self.auto_validate)
+            layout.addWidget(self.incremental_enabled)
+            layout.addSpacing(8)
+            note = QLabel("테이블별 증분 기준 컬럼과 시작/종료 값은 각 테이블의 설정 창에서 지정합니다.")
             note.setWordWrap(True)
-            form.addRow("안내", note)
+            layout.addWidget(_field_column("안내", note))
+            layout.addStretch(1)
             return group
 
         def _add_button(self, layout: QGridLayout, label: str, row: int, column: int, handler: Callable[[], None]) -> None:
@@ -791,7 +926,7 @@ if Signal is not None:
             self._set_running(True)
             self._cancel_requested = False
             self.status.setText(f"실행 중: {label}")
-            self.log.appendPlainText(f"> {label}")
+            self._append_log(f"> {label}")
             self._thread.start()
 
         def _cancel_running_command(self) -> None:
@@ -803,14 +938,14 @@ if Signal is not None:
             if self._is_immediate_cancel_command(self._running_label):
                 self.cancel_button.setText("취소 중")
                 self.status.setText(f"취소 중: {self._running_label or '작업'}")
-                self.log.appendPlainText("연결/테스트 작업을 즉시 취소합니다.")
+                self._append_log("연결/테스트 작업을 즉시 취소합니다.")
                 self._terminate_running_thread()
                 return
             if self._thread is not None:
                 self._thread.requestInterruption()
             self.cancel_button.setText("취소 요청됨")
             self.status.setText(f"취소 요청됨: {self._running_label or '작업'}")
-            self.log.appendPlainText("취소 요청됨. 현재 처리 중인 DB 호출이 끝나면 작업을 중단합니다.")
+            self._append_log("취소 요청됨. 현재 처리 중인 DB 호출이 끝나면 작업을 중단합니다.")
 
         def _is_immediate_cancel_command(self, label: str | None) -> bool:
             return bool(label and ("연결 테스트" in label or "테스트" in label))
@@ -832,21 +967,21 @@ if Signal is not None:
             self._running_label = None
             self._set_running(False)
             self.status.setText("취소됨")
-            self.log.appendPlainText(f"{label}이 취소되었습니다.")
+            self._append_log(f"{label}이 취소되었습니다.")
 
         @Slot(object)
         def _append_event(self, event: MigrationEvent) -> None:
             view = event_to_view(event)
             table = f" table={view.table}" if view.table else ""
             progress = f" progress={view.progress_label}" if view.progress_label else ""
-            self.log.appendPlainText(f"{view.level.upper()} {view.event_type}{table} {view.message}{progress}")
+            self._append_log(f"{view.level.upper()} {view.event_type}{table} {view.message}{progress}")
 
         @Slot(object)
         def _command_completed(self, result: CommandResult) -> None:
             label = self._running_label or "작업"
             self._set_running(False)
             self.status.setText("준비됨" if result.success else "실패")
-            self.log.appendPlainText(result.message)
+            self._append_log(result.message)
             if result.success and result.command == "scan-tables":
                 self._target_table_options = tuple(result.details.get("target_tables", ()))
                 self._last_dry_run_tables = {}
@@ -878,11 +1013,18 @@ if Signal is not None:
             self.cancel_button.setEnabled(running)
             self.cancel_button.setText("취소")
             if not running:
-                self._set_table_actions_enabled(self.table_list.count() > 0)
+                self._set_table_actions_enabled(self.table_list.rowCount() > 0)
 
         def _set_table_actions_enabled(self, enabled: bool) -> None:
             for button in self._table_actions:
                 button.setEnabled(enabled)
+
+        def _clear_screen_log(self) -> None:
+            self.log.clear()
+
+        def _append_log(self, message: str) -> None:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.log.appendPlainText(f"{timestamp}  {message}")
 
         def _open_manual_ddl_dialog(self, result: CommandResult) -> None:
             dialog = QDialog(self)
@@ -916,7 +1058,7 @@ if Signal is not None:
             try:
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                self.log.appendPlainText(f"dry-run 요약을 읽지 못했습니다: {exc}")
+                self._append_log(f"dry-run 요약을 읽지 못했습니다: {exc}")
                 return None
             self._last_dry_run_tables = {
                 f"{table.get('source_schema')}.{table.get('source_table')}": table
@@ -1058,9 +1200,9 @@ if Signal is not None:
                     )
                 )
             except OSError as exc:
-                self.log.appendPlainText(f"GUI 경로 기본값 저장 실패: {exc}")
+                self._append_log(f"GUI 경로 기본값 저장 실패: {exc}")
             except sqlite3.Error as exc:
-                self.log.appendPlainText(f"GUI 경로 기본값 저장 실패: {exc}")
+                self._append_log(f"GUI 경로 기본값 저장 실패: {exc}")
 
         def _load_gui_path_state(self) -> GuiPathState:
             defaults = _default_gui_path_state()
@@ -1119,57 +1261,60 @@ if Signal is not None:
             return False
 
         def _populate_tables(self, tables: tuple[TableSelection, ...]) -> None:
-            self.table_list.clear()
-            self.table_list.clearSelection()
-            self.table_list.setCurrentRow(-1)
+            self.table_list.setRowCount(0)
+            self.table_search.clear()
             config = self._current_form_config()
             for table in tables:
                 source_schema = table.identifier.rsplit(".", 1)[0]
                 default_target_schema = _default_target_schema_name(config, source_schema)
-                item = QListWidgetItem()
-                item.setData(TABLE_ID_ROLE, table.identifier)
-                item.setData(TARGET_TABLE_ROLE, table.table)
-                item.setData(TARGET_SCHEMA_ROLE, default_target_schema)
-                item.setData(WATERMARK_COLUMN_ROLE, "")
-                item.setData(WATERMARK_START_ROLE, "")
-                item.setData(WATERMARK_END_ROLE, "")
-                item.setData(COLUMN_COUNT_ROLE, table.column_count)
-                item.setData(ESTIMATED_ROWS_ROLE, table.estimated_rows)
-                item.setData(HAS_PRIMARY_KEY_ROLE, table.has_primary_key)
-                item.setData(TABLE_SELECTED_ROLE, True)
-                item.setData(SOURCE_ONLY_COLUMNS_ROLE, "")
-                item.setData(TABLE_COLUMNS_ROLE, table.columns)
-                item.setData(TABLE_COMMENT_ROLE, "")
-                item.setData(COLUMN_MAPPINGS_ROLE, {})
-                item.setData(TYPE_OVERRIDES_ROLE, {})
-                self.table_list.addItem(item)
-                row_widget = self._table_row_widget(table, item)
-                item.setSizeHint(row_widget.sizeHint())
-                self.table_list.setItemWidget(item, row_widget)
-            self.table_summary.setText(f"{len(tables)}개 테이블을 불러왔습니다. 이관하지 않을 테이블은 체크를 해제하세요.")
+                row = self.table_list.rowCount()
+                self.table_list.insertRow(row)
+                item = QTableWidgetItem()
+                self._set_initial_table_item_data(item, table, default_target_schema)
+                self.table_list.setItem(row, 0, item)
+                checkbox = QCheckBox()
+                checkbox.setChecked(True)
+                checkbox.toggled.connect(lambda checked, selected_item=item: self._set_table_selected(selected_item, checked))
+                self.table_list.setCellWidget(row, 0, _table_select_widget(checkbox, selected=True))
+                self.table_list.setItem(row, 1, _readonly_table_item(""))
+                arrow_item = _readonly_table_item("→")
+                arrow_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table_list.setItem(row, 2, arrow_item)
+                self.table_list.setItem(row, 3, _readonly_table_item(""))
+                self.table_list.setItem(row, 4, _readonly_table_item(""))
+                settings_button = QPushButton("설정")
+                settings_button.setObjectName("rowSettingsButton")
+                settings_button.setToolTip("이 테이블의 대상/컬럼/증분 설정을 변경합니다.")
+                settings_button.clicked.connect(lambda _checked=False, selected_item=item: self._edit_table_settings(selected_item))
+                self.table_list.setCellWidget(row, 5, _centered_widget(settings_button))
+                self.table_list.setRowHeight(row, 50)
+                self._refresh_table_item_label(item)
+            self.table_summary_count.setText(f"● {len(tables)}")
+            self.table_summary.setText("개 테이블을 불러왔습니다")
+            self.table_hint.setText("이관하지 않을 테이블은 체크를 해제하세요.")
             self._set_table_actions_enabled(bool(tables))
+            self._refresh_table_selected_count()
 
         def _set_all_tables(self, checked: bool) -> None:
-            for index in range(self.table_list.count()):
-                item = self.table_list.item(index)
-                item.setData(TABLE_SELECTED_ROLE, checked)
+            for item in self._iter_table_items():
+                self._set_table_selected(item, checked, sync_checkbox=False)
                 checkbox = self._row_checkbox(item)
                 if checkbox is not None:
                     checkbox.setChecked(checked)
+            self._refresh_table_selected_count()
 
         def _selected_tables(self) -> set[str] | None:
-            if self.table_list.count() == 0:
+            if self.table_list.rowCount() == 0:
                 return None
             selected = {
-                str(self.table_list.item(index).data(TABLE_ID_ROLE))
-                for index in range(self.table_list.count())
-                if bool(self.table_list.item(index).data(TABLE_SELECTED_ROLE))
+                str(item.data(TABLE_ID_ROLE))
+                for item in self._iter_table_items()
+                if bool(item.data(TABLE_SELECTED_ROLE))
             }
             return selected
 
         def _save_table_run_configs(self, config: AppConfig) -> None:
-            for index in range(self.table_list.count()):
-                item = self.table_list.item(index)
+            for item in self._iter_table_items():
                 identifier = str(item.data(TABLE_ID_ROLE))
                 source_schema, source_table = identifier.rsplit(".", 1)
                 default_target_schema = _default_target_schema_name(config, identifier.rsplit(".", 1)[0])
@@ -1200,7 +1345,25 @@ if Signal is not None:
                 _apply_column_mappings_to_config(table_config, tuple(item.data(TABLE_COLUMNS_ROLE) or ()), column_mappings, type_overrides)
                 config.tables[identifier] = table_config
 
-        def _table_item_label(self, table: TableSelection, item: QListWidgetItem) -> str:
+        def _set_initial_table_item_data(self, item: QTableWidgetItem, table: TableSelection, default_target_schema: str) -> None:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            item.setData(TABLE_ID_ROLE, table.identifier)
+            item.setData(TARGET_TABLE_ROLE, table.table)
+            item.setData(TARGET_SCHEMA_ROLE, default_target_schema)
+            item.setData(WATERMARK_COLUMN_ROLE, "")
+            item.setData(WATERMARK_START_ROLE, "")
+            item.setData(WATERMARK_END_ROLE, "")
+            item.setData(COLUMN_COUNT_ROLE, table.column_count)
+            item.setData(ESTIMATED_ROWS_ROLE, table.estimated_rows)
+            item.setData(HAS_PRIMARY_KEY_ROLE, table.has_primary_key)
+            item.setData(TABLE_SELECTED_ROLE, True)
+            item.setData(SOURCE_ONLY_COLUMNS_ROLE, "")
+            item.setData(TABLE_COLUMNS_ROLE, table.columns)
+            item.setData(TABLE_COMMENT_ROLE, "")
+            item.setData(COLUMN_MAPPINGS_ROLE, {})
+            item.setData(TYPE_OVERRIDES_ROLE, {})
+
+        def _table_item_label(self, table: TableSelection, item: QTableWidgetItem) -> str:
             source_schema = table.identifier.rsplit(".", 1)[0]
             target_schema = str(item.data(TARGET_SCHEMA_ROLE) or _default_target_schema_name(self._current_form_config(), source_schema))
             target_table = str(item.data(TARGET_TABLE_ROLE) or table.table)
@@ -1219,33 +1382,73 @@ if Signal is not None:
                 label += "  PK 없음"
             return label
 
-        def _table_row_widget(self, table: TableSelection, item: QListWidgetItem) -> QWidget:
-            row = QWidget()
-            layout = QHBoxLayout(row)
-            layout.setContentsMargins(4, 2, 4, 2)
-            checkbox = QCheckBox()
-            checkbox.setChecked(bool(item.data(TABLE_SELECTED_ROLE)))
-            checkbox.toggled.connect(lambda checked, selected_item=item: selected_item.setData(TABLE_SELECTED_ROLE, checked))
-            label = QLabel(self._table_item_label(table, item))
-            label.setObjectName("table_label")
-            label.setWordWrap(False)
-            settings_button = QPushButton("설정")
-            settings_button.setToolTip("이 테이블의 대상/컬럼/증분 설정을 변경합니다.")
-            settings_button.clicked.connect(lambda _checked=False, selected_item=item: self._edit_table_settings(selected_item))
-            layout.addWidget(checkbox)
-            layout.addWidget(label, stretch=1)
-            layout.addWidget(settings_button)
+        def _iter_table_items(self) -> Iterator[QTableWidgetItem]:
+            for row in range(self.table_list.rowCount()):
+                yield self._table_row_item(row)
+
+        def _table_row_item(self, row: int) -> QTableWidgetItem:
+            item = self.table_list.item(row, 0)
+            if item is None:
+                raise RuntimeError(f"테이블 목록 row={row}의 상태 item을 찾을 수 없습니다.")
+            return item
+
+        def _current_table_item(self) -> QTableWidgetItem | None:
+            row = self.table_list.currentRow()
+            if row < 0:
+                return None
+            return self._table_row_item(row)
+
+        def _table_item_row(self, item: QTableWidgetItem) -> int:
+            row = item.row()
+            if row < 0:
+                raise RuntimeError("테이블 목록 item이 유효한 row에 연결되어 있지 않습니다.")
             return row
 
-        def _row_checkbox(self, item: QListWidgetItem) -> QCheckBox | None:
-            widget = self.table_list.itemWidget(item)
+        def _row_checkbox(self, item: QTableWidgetItem) -> QCheckBox | None:
+            widget = self.table_list.cellWidget(self._table_item_row(item), 0)
             return widget.findChild(QCheckBox) if widget is not None else None
 
-        def _edit_table_settings(self, item: QListWidgetItem | None = None) -> None:
+        def _set_table_selected(self, item: QTableWidgetItem, checked: bool, *, sync_checkbox: bool = True) -> None:
+            item.setData(TABLE_SELECTED_ROLE, checked)
+            if sync_checkbox:
+                checkbox = self._row_checkbox(item)
+                if checkbox is not None and checkbox.isChecked() != checked:
+                    checkbox.setChecked(checked)
+            self._refresh_table_selected_count()
+
+        def _refresh_table_focus_indicators(self) -> None:
+            selected_rows = {index.row() for index in self.table_list.selectionModel().selectedRows()}
+            current_row = self.table_list.currentRow()
+            if current_row >= 0:
+                selected_rows.add(current_row)
+            for row in range(self.table_list.rowCount()):
+                selector = self.table_list.cellWidget(row, 0)
+                if selector is None:
+                    continue
+                selector.setProperty("focused", row in selected_rows)
+                selector.style().unpolish(selector)
+                selector.style().polish(selector)
+
+        def _refresh_table_selected_count(self) -> None:
+            total = self.table_list.rowCount()
+            selected = sum(1 for item in self._iter_table_items() if bool(item.data(TABLE_SELECTED_ROLE)))
+            self.table_selected_count.setText(f"{selected} / {total} 선택")
+            self.table_selected_count_value.setText(str(selected))
+            self.table_selected_count_suffix.setText(f"/ {total} 선택")
+
+        def _filter_tables(self, query: str) -> None:
+            normalized = query.strip().lower()
+            for row, item in enumerate(self._iter_table_items()):
+                identifier = str(item.data(TABLE_ID_ROLE)).lower()
+                self.table_list.setRowHidden(row, bool(normalized and normalized not in identifier))
+
+        def _edit_table_settings(self, item: QTableWidgetItem | None = None) -> None:
+            if item is not None:
+                item = self._table_row_item(item.row())
             self._edit_target_table_settings(item)
 
-        def _edit_target_table_settings(self, item: QListWidgetItem | None = None) -> None:
-            item = item or self.table_list.currentItem()
+        def _edit_target_table_settings(self, item: QTableWidgetItem | None = None) -> None:
+            item = item or self._current_table_item()
             if item is None:
                 QMessageBox.warning(self, "테이블 선택 필요", "대상 설정을 바꿀 테이블을 선택하세요.")
                 return
@@ -1473,10 +1676,10 @@ if Signal is not None:
                 return {"columns": (), "rows": (), "message": result.message}
             return result.details
 
-        def _edit_incremental_table_settings(self, item: QListWidgetItem | None = None) -> None:
+        def _edit_incremental_table_settings(self, item: QTableWidgetItem | None = None) -> None:
             self._edit_table_settings(item)
 
-        def _refresh_table_item_label(self, item: QListWidgetItem) -> None:
+        def _refresh_table_item_label(self, item: QTableWidgetItem) -> None:
             identifier = str(item.data(TABLE_ID_ROLE))
             source_table = identifier.rsplit(".", 1)[-1]
             table = TableSelection(
@@ -1487,13 +1690,26 @@ if Signal is not None:
                 estimated_rows=item.data(ESTIMATED_ROWS_ROLE),
                 has_primary_key=bool(item.data(HAS_PRIMARY_KEY_ROLE)),
             )
-            label_text = self._table_item_label(table, item)
-            widget = self.table_list.itemWidget(item)
-            if widget is not None:
-                label = widget.findChild(QLabel, "table_label")
-                if label is not None:
-                    label.setText(label_text)
-                item.setSizeHint(widget.sizeHint())
+            row = self._table_item_row(item)
+            source_schema = identifier.rsplit(".", 1)[0]
+            target_schema = str(item.data(TARGET_SCHEMA_ROLE) or _default_target_schema_name(self._current_form_config(), source_schema))
+            target_table = str(item.data(TARGET_TABLE_ROLE) or source_table)
+            source_label = self.table_list.item(row, 1)
+            target_label = self.table_list.item(row, 3)
+            row_count_label = self.table_list.item(row, 4)
+            if source_label is not None:
+                source_label.setText("")
+                source_label.setToolTip(self._table_item_label(table, item))
+                self.table_list.setCellWidget(row, 1, _table_name_widget(identifier, self.source_dbms.currentText()))
+            if target_label is not None:
+                target_identifier = f"{target_schema}.{target_table}"
+                target_status = f"{self.target_dbms.currentText()} · {_target_table_grid_status(self._target_table_options, target_schema, target_table)}"
+                target_label.setText("")
+                target_label.setToolTip(self._table_item_label(table, item))
+                self.table_list.setCellWidget(row, 3, _table_name_widget(target_identifier, target_status))
+            if row_count_label is not None:
+                row_count_label.setText(_format_estimated_rows(item.data(ESTIMATED_ROWS_ROLE)))
+                row_count_label.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         def _confirm_write_operation(self, operation: str) -> bool:
             if not self._ensure_tables_selected():
@@ -1557,8 +1773,7 @@ if Signal is not None:
         def _selected_existing_target_tables(self) -> tuple[str, ...]:
             selected: list[str] = []
             config = self._current_form_config()
-            for index in range(self.table_list.count()):
-                item = self.table_list.item(index)
+            for item in self._iter_table_items():
                 if not bool(item.data(TABLE_SELECTED_ROLE)):
                     continue
                 identifier = str(item.data(TABLE_ID_ROLE))
@@ -1570,7 +1785,7 @@ if Signal is not None:
             return tuple(sorted(selected))
 
         def _ensure_tables_selected(self) -> bool:
-            if self.table_list.count() > 0 and not self._selected_tables():
+            if self.table_list.rowCount() > 0 and not self._selected_tables():
                 QMessageBox.warning(self, "선택된 테이블 없음", "작업을 실행하기 전에 최소 한 개 이상의 테이블을 선택하세요.")
                 return False
             return True
@@ -1639,19 +1854,21 @@ if Signal is not None:
             self.remote_host = QLineEdit(config.remote_host or db_host)
             self.remote_port = _spin(1, 65535)
             self.remote_port.setValue(config.remote_port or db_port)
-            remote_form.addRow("실제 DB Host", self.remote_host)
-            remote_form.addRow("실제 DB Port", self.remote_port)
-            layout.addWidget(remote_group)
-
-            advanced_group = QGroupBox("옵션")
-            advanced_form = QFormLayout(advanced_group)
-            self.local_host = QLineEdit(config.local_host)
             self.local_port = _spin(0, 65535)
             self.local_port.setValue(config.local_port)
             self.local_port.setToolTip("0이면 실행 시 사용 가능한 로컬 포트를 자동 선택합니다.")
+            remote_form.addRow("실제 DB Host", self.remote_host)
+            remote_form.addRow("실제 DB Port", self.remote_port)
+            remote_form.addRow("터널 로컬 포트", self.local_port)
+            layout.addWidget(remote_group)
+
+            advanced_group = QGroupBox("고급 설정")
+            advanced_group.setCheckable(True)
+            advanced_group.setChecked(False)
+            advanced_form = QFormLayout(advanced_group)
+            self.local_host = QLineEdit(config.local_host)
             self.known_hosts = QLineEdit(config.known_hosts_path or str(Path.home() / ".ssh" / "known_hosts"))
             advanced_form.addRow("터널 로컬 호스트", self.local_host)
-            advanced_form.addRow("터널 로컬 포트", self.local_port)
             advanced_form.addRow("known_hosts", _path_row(self.known_hosts, self._choose_known_hosts, "찾기"))
             layout.addWidget(advanced_group)
 
@@ -1852,6 +2069,7 @@ if Signal is not None:
 
     def _path_row(line_edit: QLineEdit, handler: Callable[[], None], label: str) -> QWidget:
         row = QWidget()
+        row.setObjectName("transparentRow")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(line_edit, stretch=1)
@@ -1861,14 +2079,102 @@ if Signal is not None:
         return row
 
 
+    def _field_column(label: str, widget: QWidget) -> QWidget:
+        column = QWidget()
+        column.setObjectName("transparentRow")
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        title = QLabel(label)
+        title.setObjectName("fieldLabel")
+        title.setFixedHeight(17)
+        layout.addWidget(title)
+        layout.addWidget(widget)
+        return column
+
+
     def _inline_row(*widgets: QWidget) -> QWidget:
         row = QWidget()
+        row.setObjectName("transparentRow")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         for widget in widgets:
             layout.addWidget(widget)
         layout.addStretch(1)
         return row
+
+
+    def _centered_widget(widget: QWidget) -> QWidget:
+        row = QWidget()
+        row.setObjectName("transparentRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(widget)
+        layout.addStretch(1)
+        return row
+
+
+    def _table_select_widget(checkbox: QCheckBox, *, selected: bool) -> QWidget:
+        row = QWidget()
+        row.setObjectName("tableSelectCell")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(checkbox)
+        layout.addStretch(1)
+        return row
+
+
+    def _readonly_table_item(value: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(value)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return item
+
+
+    def _table_name_widget(table_name: str, metadata: str) -> QWidget:
+        widget = QWidget()
+        widget.setObjectName("transparentRow")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(1)
+        primary_label = QLabel(table_name)
+        primary_label.setObjectName("tableNamePrimary")
+        primary_label.setFixedHeight(18)
+        primary_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        primary_label.setTextFormat(Qt.TextFormat.PlainText)
+        primary_label.setToolTip(table_name)
+        primary_label.setWordWrap(False)
+        secondary_label = QLabel(metadata)
+        secondary_label.setObjectName("tableNameSecondary")
+        secondary_label.setFixedHeight(13)
+        secondary_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        secondary_label.setTextFormat(Qt.TextFormat.PlainText)
+        secondary_label.setToolTip(metadata)
+        secondary_label.setWordWrap(False)
+        layout.addWidget(primary_label)
+        layout.addWidget(secondary_label)
+        return widget
+
+
+    def _format_estimated_rows(value: object) -> str:
+        if value is None:
+            return "-"
+        try:
+            row_count = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if row_count < 0:
+            return "-"
+        return f"{row_count:,}"
+
+
+    def _target_table_grid_status(target_tables: tuple[TableSelection, ...], schema: str, table_name: str) -> str:
+        for target in target_tables:
+            if target.schema == schema and target.table == table_name:
+                return "동일"
+        return "신규"
 
 
     def _safe_disconnect(signal: object) -> None:
@@ -1895,6 +2201,7 @@ if Signal is not None:
     def _spin(minimum: int, maximum: int) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
+        spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         return spin
 
 
