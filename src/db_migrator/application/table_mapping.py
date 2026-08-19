@@ -49,6 +49,11 @@ class TargetMappingAdapter:
     def end_sync_keys(self, table_schema: TableSchema) -> None:
         self._target.end_sync_keys(self._resolver.target_schema_for(table_schema))
 
+    def close(self) -> None:
+        close = getattr(self._target, "close", None)
+        if callable(close):
+            close()
+
 
 class ColumnPlanTargetAdapter:
     def __init__(self, target: Any, column_plans: dict[TableRef, ColumnPlan]) -> None:
@@ -106,6 +111,11 @@ class ColumnPlanTargetAdapter:
 
     def commit(self) -> None:
         self._target.commit()
+
+    def close(self) -> None:
+        close = getattr(self._target, "close", None)
+        if callable(close):
+            close()
 
     def _plan_for(self, table_schema: TableSchema) -> ColumnPlan:
         try:

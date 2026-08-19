@@ -6,6 +6,7 @@ from typing import Callable, Protocol
 
 from db_migrator.config.models import IncrementalConfig, MigrationConfig, WatermarkConfig
 from db_migrator.schema.models import RowBatch, RowData, TableRef, TableSchema, WriteResult
+from db_migrator.schema.table_selection import key_columns_for_upsert, writable_columns
 
 
 class IncrementalSourceReader(Protocol):
@@ -98,7 +99,7 @@ def _migrate_one_incremental_table(
             message="Watermark column is not configured.",
         )
 
-    keys = _upsert_keys(table)
+    keys = key_columns_for_upsert(table)
     if not keys:
         return IncrementalTableResult(
             table=table.ref,
@@ -118,7 +119,7 @@ def _migrate_one_incremental_table(
     try:
         for batch in source.read_incremental_rows(
             table.ref,
-            _writable_columns(table),
+            writable_columns(table),
             watermark,
             migration_config.batch_size,
         ):
@@ -169,16 +170,3 @@ def _migrate_one_incremental_table(
         upsert_keys=keys,
         target_table=target_table,
     )
-
-
-def _upsert_keys(table: TableSchema) -> tuple[str, ...]:
-    if table.primary_key is not None and table.primary_key.columns:
-        return table.primary_key.columns
-    for index in table.indexes:
-        if index.unique:
-            return index.columns
-    return ()
-
-
-def _writable_columns(table: TableSchema) -> tuple[str, ...]:
-    return tuple(column.name for column in table.columns if not column.is_generated)

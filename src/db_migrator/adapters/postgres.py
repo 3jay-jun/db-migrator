@@ -12,8 +12,7 @@ from uuid import UUID
 from db_migrator.adapters.base import DdlResult, ExecutionResult
 from db_migrator.adapters.connection_reuse import ReusableConnection
 from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
-from db_migrator.config.models import WatermarkConfig
-from db_migrator.config.models import SourceConfig, TargetConfig
+from db_migrator.config.models import Dbms, SourceConfig, TargetConfig, WatermarkConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
 from db_migrator.schema.models import (
     ColumnSchema,
@@ -32,6 +31,8 @@ from db_migrator.schema.models import (
     TableSchema,
     WriteResult,
 )
+from db_migrator.schema.dialect import qualified_table_name, quote_postgres_identifier
+from db_migrator.schema.table_selection import writable_columns as schema_writable_columns
 from db_migrator.schema.type_mapping import common_type_to_postgres, postgres_type_to_common
 
 
@@ -106,7 +107,7 @@ class PostgresTargetAdapter:
         if not rows:
             return WriteResult(success=True, rows_written=0, message="No rows to write.")
 
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         placeholders = ", ".join(["%s"] * len(writable_columns))
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in writable_columns)
         table_sql = _qualified_postgres_table_name(table_schema)
@@ -129,7 +130,7 @@ class PostgresTargetAdapter:
         if not rows:
             return WriteResult(success=True, rows_written=0, message="No rows to upsert.")
 
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         placeholders = ", ".join(["%s"] * len(writable_columns))
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in writable_columns)
         table_sql = _qualified_postgres_table_name(table_schema)
@@ -155,7 +156,7 @@ class PostgresTargetAdapter:
     def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> dict[tuple[object, ...], RowData]:
         if not rows:
             return {}
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         table_sql = _qualified_postgres_table_name(table_schema)
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in writable_columns)
         where_sql, params = _postgres_key_lookup_predicate(keys, rows)
@@ -444,7 +445,7 @@ class PostgresSourceAdapter:
                 with connection.cursor(name=f"db_migrator_{table.name}") as server_cursor:
                     server_cursor.itersize = batch_size
                     column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
-                    table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+                    table_sql = _qualified_postgres_table_ref(table)
                     order_sql = _postgres_order_by_clause(order_by)
                     where_sql, params = _postgres_keyset_where_clause(start_cursor)
                     offset_sql = "" if start_cursor.strategy is CursorStrategy.KEYSET else " offset %s"
@@ -471,7 +472,7 @@ class PostgresSourceAdapter:
             raise PostgresAdapterError(f"PostgreSQL row streaming failed for table: {table.name}") from exc
 
     def count_rows(self, table: TableRef) -> int:
-        table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+        table_sql = _qualified_postgres_table_ref(table)
         sql = f"select count(*) from {table_sql}"
         for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
             try:
@@ -502,7 +503,7 @@ class PostgresSourceAdapter:
         if sample_size <= 0:
             return ()
         column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
-        table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+        table_sql = _qualified_postgres_table_ref(table)
         order_sql = _postgres_order_by_clause(order_by, position=position)
         sql = f"select {column_sql} from {table_sql}{order_sql} limit %s"
         for attempt in range(1, _POSTGRES_VALIDATION_MAX_ATTEMPTS + 1):
@@ -548,7 +549,7 @@ class PostgresSourceAdapter:
                 with connection.cursor(name=f"db_migrator_inc_{table.name}") as server_cursor:
                     server_cursor.itersize = batch_size
                     column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
-                    table_sql = f"{_quote_postgres_identifier(table.schema)}.{_quote_postgres_identifier(table.name)}"
+                    table_sql = _qualified_postgres_table_ref(table)
                     where_sql, params = _watermark_where_clause(watermark)
                     server_cursor.execute(
                         f"select {column_sql} from {table_sql} {where_sql} order by {_quote_postgres_identifier(watermark.column)}",
@@ -872,12 +873,7 @@ def _format_source_type(row: dict[str, Any]) -> str:
     return data_type
 
 
-def _quote_postgres_identifier(identifier: str) -> str:
-    return quote_postgres_identifier(identifier)
-
-
-def quote_postgres_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
+_quote_postgres_identifier = quote_postgres_identifier
 
 
 def _qualified_postgres_table_name(table_schema: TableSchema) -> str:
@@ -885,12 +881,7 @@ def _qualified_postgres_table_name(table_schema: TableSchema) -> str:
 
 
 def _qualified_postgres_table_ref(table: TableRef) -> str:
-    return ".".join(
-        [
-            _quote_postgres_identifier(table.schema),
-            _quote_postgres_identifier(table.name),
-        ]
-    )
+    return qualified_table_name(Dbms.POSTGRESQL, table.schema, table.name)
 
 
 def _postgres_order_by_clause(columns: tuple[str, ...], *, position: SamplePosition = SamplePosition.FIRST) -> str:

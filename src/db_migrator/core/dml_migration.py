@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep
-from typing import Protocol
+from typing import Callable, Protocol
 
 from db_migrator.config.models import ExistingTablePolicy, MigrationConfig
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.events import EventLevel, EventPublisher, EventType, MigrationEvent, ProgressSnapshot
 from db_migrator.schema.column_plan import ColumnPlan
 from db_migrator.schema.models import ReadCursor, RowBatch, RowData, TableRef, TableSchema, WriteResult
+from db_migrator.schema.table_selection import (
+    key_columns_for_resume,
+    stable_order_columns,
+    writable_columns,
+)
 
 
 class SourceRowReader(Protocol):
@@ -128,6 +134,7 @@ def migrate_tables(
     resume_plan: ResumePlan | None = None,
     column_plans: dict[TableRef, ColumnPlan] | None = None,
     data_execution_report: Path | None = None,
+    target_factory: Callable[[], TargetBatchWriter] | None = None,
 ) -> DmlMigrationResult:
     work_items: list[TableSchema | TableMigrationResult] = []
     selected_tables = set(resume_plan.selected_tables) if resume_plan and resume_plan.selected_tables is not None else None
@@ -160,6 +167,7 @@ def migrate_tables(
                 start_cursor=_start_cursor_for_table(resume_plan, item),
                 target_lock=target_lock,
                 column_plan=(column_plans or {}).get(item.ref),
+                close_target=False,
             )
             for item in work_items
         ]
@@ -173,13 +181,14 @@ def migrate_tables(
                     job_id=job_id,
                     table=table,
                     source=source,
-                    target=target,
+                    target=target_factory() if target_factory is not None else target,
                     checkpoint_store=checkpoint_store,
                     event_publisher=event_publisher,
                     migration_config=migration_config,
                     start_cursor=_start_cursor_for_table(resume_plan, table),
-                    target_lock=target_lock,
+                    target_lock=None if target_factory is not None else target_lock,
                     column_plan=(column_plans or {}).get(table.ref),
+                    close_target=target_factory is not None,
                 )
                 for table in pending_tables
             ]
@@ -200,14 +209,46 @@ def _migrate_one_table(
     event_publisher: EventPublisher,
     migration_config: MigrationConfig,
     start_cursor: ReadCursor | None,
-    target_lock: Lock,
+    target_lock: Lock | None,
     column_plan: ColumnPlan | None = None,
+    close_target: bool = False,
+) -> TableMigrationResult:
+    try:
+        return _migrate_one_table_with_target(
+            job_id=job_id,
+            table=table,
+            source=source,
+            target=target,
+            checkpoint_store=checkpoint_store,
+            event_publisher=event_publisher,
+            migration_config=migration_config,
+            start_cursor=start_cursor,
+            target_lock=target_lock,
+            column_plan=column_plan,
+        )
+    finally:
+        if close_target:
+            _close_target(target)
+
+
+def _migrate_one_table_with_target(
+    *,
+    job_id: str,
+    table: TableSchema,
+    source: SourceRowReader,
+    target: TargetBatchWriter,
+    checkpoint_store: CheckpointStore,
+    event_publisher: EventPublisher,
+    migration_config: MigrationConfig,
+    start_cursor: ReadCursor | None,
+    target_lock: Lock | None,
+    column_plan: ColumnPlan | None,
 ) -> TableMigrationResult:
     batch_size = _effective_batch_size(table, migration_config)
-    columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else _writable_columns(table)
+    columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else writable_columns(table)
     order_by = stable_order_columns(table, columns)
     effective_start_cursor = start_cursor or _initial_cursor_for_table(table, order_by)
-    sync_keys = resume_key_columns(table, order_by) if migration_config.existing_table_policy is ExistingTablePolicy.SYNC else ()
+    sync_keys = key_columns_for_resume(table, order_by) if migration_config.existing_table_policy is ExistingTablePolicy.SYNC else ()
     if migration_config.existing_table_policy is ExistingTablePolicy.SYNC and not sync_keys:
         message = "Sync requires primary key or unique index columns."
         event_publisher.publish(_table_failed_event(job_id, table, message))
@@ -234,11 +275,11 @@ def _migrate_one_table(
 
     try:
         if sync_keys:
-            with target_lock:
+            with _target_lock(target_lock):
                 target.begin_sync_keys(table, sync_keys)
         for batch in source.read_rows(table.ref, columns, effective_start_cursor, batch_size, order_by):
             try:
-                with target_lock:
+                with _target_lock(target_lock):
                     if sync_keys:
                         inserts, updates, unchanged = _classify_sync_rows(target, table, batch.rows, sync_keys, columns)
                         changed_rows = inserts + updates
@@ -279,7 +320,7 @@ def _migrate_one_table(
             latest_cursor = batch.next_cursor or latest_cursor
             pending_batches.append(_PendingBatch(batch=batch, write_result=write_result))
             if uncommitted_rows >= migration_config.commit_interval:
-                with target_lock:
+                with _target_lock(target_lock):
                     target.commit()
                 _save_committed_batches(
                     _CommitContext(
@@ -334,7 +375,7 @@ def _migrate_one_table(
         )
 
     if uncommitted_rows > 0:
-        with target_lock:
+        with _target_lock(target_lock):
             target.commit()
         _save_committed_batches(
             _CommitContext(
@@ -352,7 +393,7 @@ def _migrate_one_table(
 
     rows_deleted = 0
     if sync_keys:
-        with target_lock:
+        with _target_lock(target_lock):
             rows_deleted = target.delete_rows_not_in_sync_keys(table, sync_keys)
             target.commit()
             target.end_sync_keys(table)
@@ -461,7 +502,7 @@ def build_resume_plan(job_id: str, tables: tuple[TableSchema, ...], checkpoint_s
     for table in tables:
         checkpoint = checkpoint_store.latest_checkpoint_for_table(job_id, table.ref)
         if checkpoint is None:
-            table_cursors[table.ref] = _initial_cursor_for_table(table, stable_order_columns(table, _writable_columns(table)))
+            table_cursors[table.ref] = _initial_cursor_for_table(table, stable_order_columns(table, writable_columns(table)))
             selected_tables.append(table.ref)
             continue
         if checkpoint.status == "table_completed":
@@ -484,30 +525,11 @@ def build_retry_failed_plan(job_id: str, checkpoint_store: CheckpointStore) -> R
     return ResumePlan(mode="retry_failed", table_cursors=table_cursors, selected_tables=failed_tables)
 
 
-def _writable_columns(table: TableSchema) -> tuple[str, ...]:
-    return tuple(column.name for column in table.columns if not column.is_generated)
-
-
-def stable_order_columns(table: TableSchema, columns: tuple[str, ...]) -> tuple[str, ...]:
-    if table.primary_key is not None and table.primary_key.columns:
-        return tuple(column for column in table.primary_key.columns if column in columns)
-    return columns
-
-
 def _initial_cursor_for_table(table: TableSchema, order_by: tuple[str, ...]) -> ReadCursor:
-    key_columns = resume_key_columns(table, order_by)
+    key_columns = key_columns_for_resume(table, order_by)
     if key_columns:
         return ReadCursor.keyset_cursor(key_columns=key_columns)
     return ReadCursor.offset_cursor()
-
-
-def resume_key_columns(table: TableSchema, order_by: tuple[str, ...]) -> tuple[str, ...]:
-    if table.primary_key is not None and table.primary_key.columns:
-        return tuple(column for column in table.primary_key.columns if column in order_by)
-    for index in table.indexes:
-        if index.unique:
-            return tuple(column for column in index.columns if column in order_by)
-    return ()
 
 
 def _start_cursor_for_table(resume_plan: ResumePlan | None, table: TableSchema) -> ReadCursor | None:
@@ -617,8 +639,8 @@ def _preflight_table_result(
             return TableMigrationResult(table=table.ref, status="blocked", rows_written=0, batches_written=0, message=message)
 
     if column_plan is not None and migration_config.existing_table_policy is ExistingTablePolicy.SYNC:
-        columns = column_plan.read_columns if column_plan.read_columns else _writable_columns(table)
-        source_sync_keys = resume_key_columns(table, stable_order_columns(table, columns))
+        columns = column_plan.read_columns if column_plan.read_columns else writable_columns(table)
+        source_sync_keys = key_columns_for_resume(table, stable_order_columns(table, columns))
         if source_sync_keys and not column_plan.target_key_columns_for(source_sync_keys):
             message = "Sync blocked because source key columns cannot be mapped to target write columns: " + ", ".join(
                 source_sync_keys
@@ -663,6 +685,16 @@ def _target_row_count(target: TargetBatchWriter, table: TableRef) -> int | None:
     if not callable(count_rows):
         return None
     return int(count_rows(table))
+
+
+def _target_lock(target_lock: Lock | None):
+    return target_lock if target_lock is not None else nullcontext()
+
+
+def _close_target(target: TargetBatchWriter) -> None:
+    close = getattr(target, "close", None)
+    if callable(close):
+        close()
 
 
 def _checkpoint_stale_event(job_id: str, table: TableSchema, message: str) -> MigrationEvent:

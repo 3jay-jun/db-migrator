@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from db_migrator.config.models import Dbms
+from db_migrator.schema.dialect import qualified_table_name, quote_identifier
 from db_migrator.schema.models import ColumnSchema, ForeignKeySchema, IndexSchema, SchemaObjectKind, SchemaObjectSummary, SchemaSnapshot, TableRef, TableSchema
 
 
@@ -425,10 +426,10 @@ def create_index_ddl(
     target_dbms: Dbms,
     target_database: str | None = None,
 ) -> str:
-    quote = _mysql_quote if target_dbms in {Dbms.MYSQL, Dbms.MARIADB} else _postgres_quote
+    quote = lambda value: quote_identifier(target_dbms, value)
     unique = "UNIQUE " if index.unique else ""
     schema_or_database = target_database if target_dbms in {Dbms.MYSQL, Dbms.MARIADB} and target_database else table.schema
-    table_name = f"{quote(schema_or_database)}.{quote(table.name)}"
+    table_name = qualified_table_name(target_dbms, schema_or_database, table.name)
     columns = ", ".join(quote(column) for column in index.columns)
     return f"CREATE {unique}INDEX {quote(index.name)} ON {table_name} ({columns});"
 
@@ -514,10 +515,3 @@ def _object_type_label(kind: SchemaObjectKind) -> str:
         SchemaObjectKind.TRIGGER: "트리거",
     }[kind]
 
-
-def _mysql_quote(identifier: str) -> str:
-    return f"`{identifier.replace('`', '``')}`"
-
-
-def _postgres_quote(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'

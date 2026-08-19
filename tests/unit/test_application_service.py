@@ -571,6 +571,39 @@ def test_service_migrate_data_publishes_events_and_returns_rows(tmp_path: Path) 
     assert event_queue.qsize() > 0
 
 
+def test_service_parallel_migrate_data_uses_worker_target_adapters(tmp_path: Path) -> None:
+    registry = FakeRegistry()
+    registry.worker_targets = [FakeAdapter(), FakeAdapter()]
+    service = MigrationApplicationService(registry)
+    config_path = _write_config(
+        tmp_path,
+        """
+migration:
+  parallel_table_count: 2
+""",
+    )
+
+    result = service.run_migrate_data(
+        config=config_path,
+        checkpoint_db=tmp_path / "checkpoint.sqlite",
+        event_publisher=QueueEventPublisher(Queue()),
+    )
+
+    written_tables = [
+        table
+        for worker_target in registry.created_worker_targets
+        for table in worker_target.written_tables
+    ]
+    assert result.success is True
+    assert result.rows_written == 2
+    assert sorted(written_tables, key=lambda table: table.name) == [
+        TableRef(schema="target_db", name="orders"),
+        TableRef(schema="target_db", name="users"),
+    ]
+    assert registry.target.written_tables == []
+    assert all(worker_target.closed for worker_target in registry.created_worker_targets)
+
+
 def test_service_manual_ddl_uses_target_table_mapping_without_executing_target(tmp_path: Path) -> None:
     registry = FakeRegistry()
     service = MigrationApplicationService(registry)
@@ -922,6 +955,8 @@ class FakeRegistry:
         self.source = FakeAdapter()
         self.target = FakeAdapter()
         self.target_schema_source = FakeAdapter()
+        self.worker_targets: list[FakeAdapter] = []
+        self.created_worker_targets: list[FakeAdapter] = []
         self.source_configs = []
         self.target_configs = []
 
@@ -933,6 +968,10 @@ class FakeRegistry:
 
     def create_target(self, _config):
         self.target_configs.append(_config)
+        if len(self.target_configs) > 1 and self.worker_targets:
+            target = self.worker_targets.pop(0)
+            self.created_worker_targets.append(target)
+            return target
         return self.target
 
     def create_ddl_generator(self, _dbms, *, target_database: str | None = None):

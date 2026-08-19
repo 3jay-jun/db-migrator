@@ -3,10 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from db_migrator.adapters.mysql import quote_mysql_identifier
-from db_migrator.adapters.postgres import quote_postgres_identifier
 from db_migrator.config.models import AppConfig, Dbms, SourceOnlyColumnAction
 from db_migrator.schema.common_types import CommonTypeKind
+from db_migrator.schema.dialect import qualified_table_name, quote_identifier
 from db_migrator.schema.models import ColumnSchema, RowData, TableSchema
 from db_migrator.schema.table_mapping import table_key
 from db_migrator.schema.type_mapping import common_type_to_mysql, common_type_to_postgres, mysql_type_to_common, postgres_type_to_common
@@ -299,24 +298,24 @@ def _source_only_column_plan(
 
 
 def _alter_table_add_column_ddl(target_dbms: Dbms, target_table: TableSchema, column: ColumnSchema) -> str:
-    quote = _quote_identifier(target_dbms)
+    quote = lambda value: quote_identifier(target_dbms, value)
     target_type = _target_type(target_dbms, column)
-    table_name = f"{quote(target_table.ref.schema)}.{quote(target_table.ref.name)}"
+    table_name = qualified_table_name(target_dbms, target_table.ref.schema, target_table.ref.name)
     nullable_sql = "" if column.nullable else " NOT NULL"
     default_sql = f" DEFAULT {column.default}" if column.default is not None else ""
     return f"ALTER TABLE {table_name} ADD COLUMN {quote(column.name)} {target_type}{default_sql}{nullable_sql};"
 
 
 def _alter_table_rename_column_ddl(target_dbms: Dbms, target_table: TableSchema, source_column: str, target_column: str) -> str:
-    quote = _quote_identifier(target_dbms)
-    table_name = f"{quote(target_table.ref.schema)}.{quote(target_table.ref.name)}"
+    quote = lambda value: quote_identifier(target_dbms, value)
+    table_name = qualified_table_name(target_dbms, target_table.ref.schema, target_table.ref.name)
     return f"ALTER TABLE {table_name} RENAME COLUMN {quote(source_column)} TO {quote(target_column)};"
 
 
 def _alter_table_change_type_ddl(target_dbms: Dbms, target_table: TableSchema, target_column: str, source_column: ColumnSchema, target_type_override: str | None) -> str:
-    quote = _quote_identifier(target_dbms)
+    quote = lambda value: quote_identifier(target_dbms, value)
     target_type = target_type_override or _target_type(target_dbms, source_column)
-    table_name = f"{quote(target_table.ref.schema)}.{quote(target_table.ref.name)}"
+    table_name = qualified_table_name(target_dbms, target_table.ref.schema, target_table.ref.name)
     if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
         nullable_sql = "" if source_column.nullable else " NOT NULL"
         default_sql = f" DEFAULT {source_column.default}" if source_column.default is not None else ""
@@ -362,12 +361,6 @@ def _rename_primary_key(primary_key, rename_columns: dict[str, str]):
     if primary_key is None:
         return None
     return replace(primary_key, columns=tuple(rename_columns.get(column, column) for column in primary_key.columns))
-
-
-def _quote_identifier(target_dbms: Dbms):
-    if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
-        return quote_mysql_identifier
-    return quote_postgres_identifier
 
 
 def _target_type(target_dbms: Dbms, column: ColumnSchema) -> str:

@@ -10,7 +10,7 @@ from uuid import UUID
 from db_migrator.adapters.base import DdlResult, ExecutionResult
 from db_migrator.adapters.connection_reuse import ReusableConnection
 from db_migrator.adapters.error_detail import connection_test_failure_message, safe_error_detail
-from db_migrator.config.models import SourceConfig, TargetConfig, WatermarkConfig
+from db_migrator.config.models import Dbms, SourceConfig, TargetConfig, WatermarkConfig
 from db_migrator.schema.common_types import CommonType, CommonTypeKind
 from db_migrator.schema.models import (
     ColumnSchema,
@@ -29,6 +29,8 @@ from db_migrator.schema.models import (
     TableSchema,
     WriteResult,
 )
+from db_migrator.schema.dialect import qualified_table_name, quote_mysql_identifier
+from db_migrator.schema.table_selection import writable_columns as schema_writable_columns
 from db_migrator.schema.type_mapping import common_type_to_mysql, mysql_type_to_common
 
 
@@ -504,7 +506,7 @@ class MySqlTargetAdapter:
         if not rows:
             return WriteResult(success=True, rows_written=0, message="No rows to write.")
 
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         placeholders = ", ".join(["%s"] * len(writable_columns))
         column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
         table_sql = self._qualified_table_name(table_schema)
@@ -527,7 +529,7 @@ class MySqlTargetAdapter:
         if not rows:
             return WriteResult(success=True, rows_written=0, message="No rows to upsert.")
 
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         placeholders = ", ".join(["%s"] * len(writable_columns))
         column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
         table_sql = self._qualified_table_name(table_schema)
@@ -549,7 +551,7 @@ class MySqlTargetAdapter:
     def fetch_rows_by_keys(self, table_schema: TableSchema, keys: tuple[str, ...], rows: tuple[RowData, ...]) -> dict[tuple[object, ...], RowData]:
         if not rows:
             return {}
-        writable_columns = tuple(column.name for column in table_schema.columns if not column.is_generated)
+        writable_columns = schema_writable_columns(table_schema)
         table_sql = self._qualified_table_name(table_schema)
         column_sql = ", ".join(quote_mysql_identifier(column) for column in writable_columns)
         where_sql, params = _mysql_key_lookup_predicate(keys, rows)
@@ -737,17 +739,7 @@ def qualify_mysql_table_name(table_schema: TableSchema, *, target_database: str 
 
 def qualify_mysql_table_ref(table: TableRef, *, target_database: str | None = None) -> str:
     database_name = target_database or table.schema
-    return ".".join(
-        [
-            quote_mysql_identifier(database_name),
-            quote_mysql_identifier(table.name),
-        ]
-    )
-
-
-def quote_mysql_identifier(identifier: str) -> str:
-    escaped_identifier = identifier.replace("`", "``")
-    return f"`{escaped_identifier}`"
+    return qualified_table_name(Dbms.MYSQL, database_name, table.name)
 
 
 def _mysql_index_manual_review_reason(*, columns: tuple[str, ...], index_type: str) -> str | None:

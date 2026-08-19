@@ -17,7 +17,7 @@ from db_migrator.config.models import AppConfig, ColumnTransformConfig, Dbms, In
 from db_migrator.connection import ResolvedAppConfig, TunnelError, TunnelFactory, TunnelManager
 from db_migrator.core.checkpoint import CheckpointStore
 from db_migrator.core.ddl_execution import DdlExecutionBlocked, execute_schema_ddl
-from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables, stable_order_columns
+from db_migrator.core.dml_migration import build_resume_plan, build_retry_failed_plan, migrate_tables
 from db_migrator.core.engine import MigrationEngine
 from db_migrator.core.events import EventPublisher, MigrationEvent, QueueEventPublisher
 from db_migrator.core.existing_table_policy import build_existing_table_execution_plan
@@ -39,6 +39,7 @@ from db_migrator.schema.models import SamplePosition, SchemaSnapshot, TableRef, 
 from db_migrator.schema.schema_pair import SchemaPairPlan, SchemaPairResolver
 from db_migrator.schema.snapshot_io import SchemaSnapshotLoadError, load_schema_snapshot_from_json
 from db_migrator.schema.table_mapping import TableMappingResolver
+from db_migrator.schema.table_selection import stable_order_columns
 
 
 @dataclass(frozen=True)
@@ -657,6 +658,12 @@ class MigrationApplicationService:
                     include_target_only_sync=selected_tables is None,
                 )
                 target = ColumnPlanTargetAdapter(runtime.target, execution_plan.column_plans)
+                target_factory = None
+                if original_config.migration.parallel_table_count > 1:
+                    target_factory = lambda: ColumnPlanTargetAdapter(
+                        self._registry.create_target(app_config.target),
+                        execution_plan.column_plans,
+                    )
                 resume_plan = None
                 if retry_failed_only is not None:
                     resume_plan = (
@@ -675,6 +682,7 @@ class MigrationApplicationService:
                     resume_plan=resume_plan,
                     column_plans=execution_plan.column_plans,
                     data_execution_report=(output_dir / "data-sync-execution.json") if output_dir is not None else None,
+                    target_factory=target_factory,
                 )
             return CommandResult(
                 command=command,

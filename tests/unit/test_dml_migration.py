@@ -82,6 +82,7 @@ class FakeTargetWriter:
         self.sync_keys: list[tuple[str, tuple]] = []
         self.deleted_sync_tables: list[str] = []
         self.commit_count = 0
+        self.closed = False
 
     def write_batch(self, table_schema: TableSchema, rows: tuple[dict, ...]) -> WriteResult:
         if table_schema.ref.name == self.raise_on_table:
@@ -117,6 +118,9 @@ class FakeTargetWriter:
 
     def end_sync_keys(self, table_schema: TableSchema) -> None:
         self.sync_keys.append((table_schema.ref.name, ("end",)))
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_migrate_tables_streams_batches_writes_checkpoint_and_events(tmp_path) -> None:
@@ -556,3 +560,40 @@ def test_parallel_table_count_runs_table_workers_without_reordering_table_batche
     assert {table.status for table in result.tables} == {"completed"}
     assert rows_by_table["users"] == [1, 2]
     assert rows_by_table["orders"] == [1, 2]
+
+
+def test_parallel_table_count_uses_worker_target_factory_when_provided(tmp_path) -> None:
+    snapshot = load_schema_snapshot_from_json(Path("tests/fixtures/schema_snapshot.json"))
+    source = FakeSourceReader(
+        {
+            "users": [{"id": 1, "email": "a@example.com", "profile": {}, "created_at": "2026-01-01"}],
+            "orders": [{"id": 1, "total_amount": "10.00"}],
+        }
+    )
+    available_worker_targets = [FakeTargetWriter(), FakeTargetWriter()]
+    created_worker_targets: list[FakeTargetWriter] = []
+
+    def target_factory() -> FakeTargetWriter:
+        target = available_worker_targets.pop(0)
+        created_worker_targets.append(target)
+        return target
+
+    result = migrate_tables(
+        job_id="job-1",
+        tables=snapshot.tables,
+        source=source,
+        target=FakeTargetWriter(),
+        target_factory=target_factory,
+        checkpoint_store=CheckpointStore(tmp_path / "checkpoint.sqlite"),
+        event_publisher=QueueEventPublisher(Queue()),
+        migration_config=MigrationConfig(batch_size=1, commit_interval=1, parallel_table_count=2),
+    )
+
+    written_tables = [
+        table_name
+        for worker_target in created_worker_targets
+        for table_name, _rows in worker_target.written_batches
+    ]
+    assert {table.status for table in result.tables} == {"completed"}
+    assert sorted(written_tables) == ["orders", "users"]
+    assert all(worker_target.closed for worker_target in created_worker_targets)

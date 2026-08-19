@@ -31,6 +31,7 @@ from db_migrator.core.events import EventPublisher, FileEventPublisher, Migratio
 from db_migrator.gui.styles import jigration_stylesheet
 from db_migrator.gui.state import GuiPathState, GuiStateStore
 from db_migrator.schema.common_types import CommonTypeKind
+from db_migrator.schema.dialect import qualified_table_name, quote_identifier
 from db_migrator.schema.type_mapping import common_type_to_mysql, common_type_to_postgres, mysql_type_to_common, postgres_type_to_common
 
 
@@ -2837,14 +2838,11 @@ if Signal is not None:
 
 
     def _qualified_table_name(target_dbms: Dbms, schema: str, table: str) -> str:
-        quote = _quote_identifier_for
-        return f"{quote(target_dbms, schema)}.{quote(target_dbms, table)}"
+        return qualified_table_name(target_dbms, schema, table)
 
 
     def _quote_identifier_for(target_dbms: Dbms, value: str) -> str:
-        if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
-            return "`" + value.replace("`", "``") + "`"
-        return '"' + value.replace('"', '""') + '"'
+        return quote_identifier(target_dbms, value)
 
 
     def _preview_value(value: object) -> str:

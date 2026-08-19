@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Protocol
 
 from db_migrator.config.models import Dbms, MigrationConfig
-from db_migrator.core.dml_migration import stable_order_columns
 from db_migrator.schema.column_plan import ColumnPlan
+from db_migrator.schema.dialect import qualified_table_name, quote_identifier
 from db_migrator.schema.models import ReadCursor, RowBatch, RowData, TableRef, TableSchema
+from db_migrator.schema.table_selection import stable_order_columns, writable_columns
 
 
 class ManualSourceReader(Protocol):
@@ -66,7 +67,7 @@ def export_manual_migration_files(
     load_statements: list[str] = []
     for source_table, target_table in zip(source_tables, target_tables, strict=True):
         column_plan = (column_plans or {}).get(source_table.ref)
-        read_columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else _writable_columns(source_table)
+        read_columns = column_plan.read_columns if column_plan is not None and column_plan.read_columns else writable_columns(source_table)
         write_columns = column_plan.write_columns if column_plan is not None else read_columns
         csv_file = data_dir / f"{target_table.ref.schema}.{target_table.ref.name}.csv"
         rows_exported = _write_table_csv(
@@ -119,17 +120,12 @@ def _write_table_csv(
 def _csv_row(row: RowData, columns: tuple[str, ...]) -> dict[str, object | None]:
     return {column: row.get(column) for column in columns}
 
-
-def _writable_columns(table: TableSchema) -> tuple[str, ...]:
-    return tuple(column.name for column in table.columns if not column.is_generated)
-
-
 def _load_statement(table: TableSchema, columns: tuple[str, ...], csv_file: Path, target_dbms: Dbms, target_database: str) -> str:
     if target_dbms in {Dbms.MYSQL, Dbms.MARIADB}:
-        column_sql = ", ".join(_quote_mysql_identifier(column) for column in columns)
+        column_sql = ", ".join(quote_identifier(target_dbms, column) for column in columns)
         return (
             f"LOAD DATA LOCAL INFILE '{_sql_path(csv_file)}'\n"
-            f"INTO TABLE {_mysql_table_name(table, target_database)}\n"
+            f"INTO TABLE {qualified_table_name(target_dbms, target_database, table.ref.name)}\n"
             "CHARACTER SET utf8mb4\n"
             "FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'\n"
             "LINES TERMINATED BY '\\n'\n"
@@ -137,26 +133,11 @@ def _load_statement(table: TableSchema, columns: tuple[str, ...], csv_file: Path
             f"({column_sql});"
         )
     if target_dbms is Dbms.POSTGRESQL:
-        column_sql = ", ".join(_quote_postgres_identifier(column) for column in columns)
-        return f"\\copy {_postgres_table_name(table)} ({column_sql}) FROM '{_sql_path(csv_file)}' WITH (FORMAT csv, HEADER true);"
+        column_sql = ", ".join(quote_identifier(target_dbms, column) for column in columns)
+        return f"\\copy {qualified_table_name(target_dbms, table.ref.schema, table.ref.name)} ({column_sql}) FROM '{_sql_path(csv_file)}' WITH (FORMAT csv, HEADER true);"
     raise ValueError(f"Unsupported target DBMS for manual migration export: {target_dbms.value}")
 
 
 def _sql_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/").replace("'", "''")
 
-
-def _mysql_table_name(table: TableSchema, target_database: str) -> str:
-    return f"{_quote_mysql_identifier(target_database)}.{_quote_mysql_identifier(table.ref.name)}"
-
-
-def _postgres_table_name(table: TableSchema) -> str:
-    return f"{_quote_postgres_identifier(table.ref.schema)}.{_quote_postgres_identifier(table.ref.name)}"
-
-
-def _quote_mysql_identifier(value: str) -> str:
-    return f"`{value.replace('`', '``')}`"
-
-
-def _quote_postgres_identifier(value: str) -> str:
-    return f'"{value.replace(chr(34), chr(34) + chr(34))}"'

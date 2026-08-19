@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
-from db_migrator.adapters.mysql import ExecutionResult, quote_mysql_identifier
-from db_migrator.adapters.postgres import quote_postgres_identifier
+from db_migrator.adapters.mysql import ExecutionResult
 from db_migrator.config.models import Dbms
+from db_migrator.schema.dialect import qualified_table_name, quote_identifier
 from db_migrator.schema.models import ForeignKeySchema, SchemaSnapshot, TableSchema
 
 
@@ -31,7 +30,7 @@ class ForeignKeyExecutor:
 
 def generate_mysql_foreign_key_ddls(snapshot: SchemaSnapshot) -> tuple[ForeignKeyDdl, ...]:
     return tuple(
-        _foreign_key_ddl(table, foreign_key, quote_identifier=quote_mysql_identifier)
+        _foreign_key_ddl(table, foreign_key, target_dbms=Dbms.MYSQL)
         for table in snapshot.tables
         for foreign_key in table.foreign_keys
     )
@@ -39,7 +38,7 @@ def generate_mysql_foreign_key_ddls(snapshot: SchemaSnapshot) -> tuple[ForeignKe
 
 def generate_postgres_foreign_key_ddls(snapshot: SchemaSnapshot) -> tuple[ForeignKeyDdl, ...]:
     return tuple(
-        _foreign_key_ddl(table, foreign_key, quote_identifier=quote_postgres_identifier)
+        _foreign_key_ddl(table, foreign_key, target_dbms=Dbms.POSTGRESQL)
         for table in snapshot.tables
         for foreign_key in table.foreign_keys
     )
@@ -86,16 +85,13 @@ def _foreign_key_ddl(
     table: TableSchema,
     foreign_key: ForeignKeySchema,
     *,
-    quote_identifier: Callable[[str], str],
+    target_dbms: Dbms,
 ) -> ForeignKeyDdl:
-    table_name = f"{quote_identifier(table.ref.schema)}.{quote_identifier(table.ref.name)}"
-    columns = ", ".join(quote_identifier(column) for column in foreign_key.columns)
-    referenced_table = (
-        f"{quote_identifier(foreign_key.referenced_table.schema)}."
-        f"{quote_identifier(foreign_key.referenced_table.name)}"
-    )
-    referenced_columns = ", ".join(quote_identifier(column) for column in foreign_key.referenced_columns)
-    constraint_name = quote_identifier(foreign_key.name)
+    table_name = qualified_table_name(target_dbms, table.ref.schema, table.ref.name)
+    columns = ", ".join(quote_identifier(target_dbms, column) for column in foreign_key.columns)
+    referenced_table = qualified_table_name(target_dbms, foreign_key.referenced_table.schema, foreign_key.referenced_table.name)
+    referenced_columns = ", ".join(quote_identifier(target_dbms, column) for column in foreign_key.referenced_columns)
+    constraint_name = quote_identifier(target_dbms, foreign_key.name)
     ddl = (
         f"ALTER TABLE {table_name} ADD CONSTRAINT {constraint_name} "
         f"FOREIGN KEY ({columns}) REFERENCES {referenced_table} ({referenced_columns});"

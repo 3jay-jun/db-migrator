@@ -565,7 +565,7 @@ Python 기반으로 작성한다.
 - MySQL/MariaDB: pymysql 또는 mysqlclient
 - CLI: typer 또는 argparse
 - 로그: logging, rich
-- 설정: pydantic-settings 또는 yaml/json config
+- 설정: pydantic 기반 YAML/JSON config
 - 리포트: CSV, Excel, HTML
 
 대안:

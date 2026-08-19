@@ -59,7 +59,7 @@ v1은 실무 적용 가능성과 구현 난이도를 고려해 `PostgreSQL -> Ma
 - Project manager: `uv`
 - CLI: `typer`
 - Console/log UI: `rich`
-- Config validation: `pydantic`, `pydantic-settings`
+- Config validation: `pydantic`, `PyYAML`
 - PostgreSQL driver: `psycopg`
 - MariaDB/MySQL driver: `pymysql` 기본, 성능 필요 시 `mysqlclient` 선택 지원
 - Checkpoint DB: SQLite
